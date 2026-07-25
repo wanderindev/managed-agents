@@ -15,7 +15,11 @@ from orchestrator.migrate import apply_all
 
 @pytest.fixture(scope="session")
 def postgres_container():
-    with PostgresContainer("postgres:16") as postgres:
+    # Pinned to the managed cluster's major version. The append-only triggers are
+    # plpgsql and the open-subject index is a partial unique index, so a version
+    # skew between here and production would be exactly the kind of thing the
+    # suite is supposed to catch rather than introduce.
+    with PostgresContainer("postgres:17") as postgres:
         yield postgres
 
 
