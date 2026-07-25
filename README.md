@@ -30,13 +30,25 @@ human. Nothing merges without a person.
 ```
 migrations/          numbered plain SQL, applied in filename order
 orchestrator/
-  config.py          environment, four values
+  config.py          environment, read once
   db.py              psycopg3 connection helper
   enums.py           run statuses and event types
   log.py             the append-only log and the status fold
+  loop.py            the stateless loop: reconcile, then dispatch
   migrate.py         migration runner
+  queue.py           queue reads and the lease write
+  runner.py          Runner protocol, the seam to container mechanics
+docker/sandbox/      the disposable sandbox image
+scripts/             host provisioning, sandbox launch
+docs/runbook.md      how the host and database were built, and what bit
 tests/               real PostgreSQL via testcontainers
 ```
+
+The loop keeps nothing between ticks and nothing between processes. A sandbox
+handle lives in its `sandbox_started` event payload rather than in memory, so a
+restarted orchestrator finds its containers by reading the log. There is no boot
+path: a tick is idempotent and self-healing, so the first tick after a restart
+reconciles whatever it inherits.
 
 ## Deliberate non-choices
 

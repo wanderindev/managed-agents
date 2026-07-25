@@ -198,6 +198,33 @@ def verify_replay(conn: psycopg.Connection, run_id: int) -> bool:
     return replay_status(load_events(conn, run_id)) == stored_status(conn, run_id)
 
 
+def latest_event(
+    conn: psycopg.Connection, run_id: int, event_type: EventType
+) -> Event | None:
+    """The most recent event of a given type, if any.
+
+    How a restarted orchestrator finds the container it lost: the sandbox handle
+    lives in the latest ``sandbox_started`` payload, because a stateless process
+    cannot keep it in memory.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT seq, type, payload, created_at FROM agent_events"
+            " WHERE run_id = %s AND type = %s"
+            " ORDER BY seq DESC LIMIT 1",
+            (run_id, event_type.value),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return Event(
+        seq=row["seq"],
+        type=EventType(row["type"]),
+        payload=row["payload"],
+        created_at=row["created_at"],
+    )
+
+
 def last_completed_stage(
     conn: psycopg.Connection, run_id: int
 ) -> dict[str, Any] | None:
