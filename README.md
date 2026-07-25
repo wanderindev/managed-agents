@@ -34,10 +34,13 @@ orchestrator/
   db.py              psycopg3 connection helper
   enums.py           run statuses and event types
   log.py             the append-only log and the status fold
+  jobs.py            registry mapping a run's kind to a job spec
   loop.py            the stateless loop: reconcile, then dispatch
+  main.py            entry point
   migrate.py         migration runner
   queue.py           queue reads and the lease write
   runner.py          Runner protocol, the seam to container mechanics
+  sandbox.py         the Docker runner
 docker/sandbox/      the disposable sandbox image
 scripts/             host provisioning, sandbox launch
 docs/runbook.md      how the host and database were built, and what bit

@@ -43,4 +43,13 @@ args=(
 [ -n "${AGENT_MAX_TURNS:-}" ] && args+=(--max-turns "$AGENT_MAX_TURNS")
 [ -n "${AGENT_FALLBACK_MODEL:-}" ] && args+=(--fallback-model "$AGENT_FALLBACK_MODEL")
 
+# The sandbox bounds its own wall clock rather than relying on a watchdog on the
+# host. A container that limits itself cannot be orphaned by an orchestrator that
+# died, and `timeout` exits 124 so the outcome is identifiable rather than just
+# "failed". Wall clock, never an event count: a healthy long run can emit very
+# few events and a stuck one can emit thousands.
+if [ -n "${AGENT_TIMEOUT_SECONDS:-}" ]; then
+    exec timeout -s TERM "$AGENT_TIMEOUT_SECONDS" claude "${args[@]}"
+fi
+
 exec claude "${args[@]}"
