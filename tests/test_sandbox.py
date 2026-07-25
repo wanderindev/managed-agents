@@ -332,3 +332,45 @@ def test_a_worktree_is_deregistered_from_its_parent_repo(roots):
     runner.finish(run, "ma-run-1-1")
 
     assert commands.commands("worktree", "remove")
+
+
+# --- GitHub token injection (#11) --------------------------------------------
+
+
+def test_a_job_that_needs_github_gets_a_freshly_minted_token(roots):
+    minted = []
+
+    def token():
+        minted.append(1)
+        return f"ghs_token_{len(minted)}"
+
+    commands = FakeCommands()
+    runner = make_runner(
+        roots,
+        commands,
+        spec=JobSpec(prompt="p", needs_github=True),
+        github_token=token,
+    )
+    runner.start(make_run())
+
+    assert "GH_TOKEN=ghs_token_1" in commands.commands("run")[0]
+    assert len(minted) == 1, "minted at launch, so the sandbox gets the full hour"
+
+
+def test_a_job_that_does_not_need_github_gets_no_credential(roots):
+    """Opt-in: a job with no business pushing never receives a token at all."""
+    commands = FakeCommands()
+    runner = make_runner(
+        roots, commands, spec=JobSpec(prompt="p"), github_token=lambda: "ghs_x"
+    )
+    runner.start(make_run())
+
+    assert not any("GH_TOKEN" in arg for arg in commands.commands("run")[0])
+
+
+def test_needing_github_without_an_app_fails_loudly(roots):
+    commands = FakeCommands()
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", needs_github=True))
+
+    with pytest.raises(RuntimeError, match="no App is configured"):
+        runner.start(make_run())

@@ -72,3 +72,28 @@ SANDBOX_WITH_DOCKER = os.environ.get("ORCHESTRATOR_SANDBOX_WITH_DOCKER", "0") ==
 #: Ceiling on one event's payload. One runaway tool result must not be able to
 #: bloat the log, and nothing downstream reads a 2MB payload usefully anyway.
 MAX_PAYLOAD_BYTES = int(os.environ.get("ORCHESTRATOR_MAX_PAYLOAD_BYTES", "16384"))
+
+# --- github app (#11) --------------------------------------------------------
+
+#: Numeric App ID from the App's settings page.
+GITHUB_APP_ID = os.environ.get("ORCHESTRATOR_GITHUB_APP_ID", "")
+
+#: PEM private key, on disk rather than in the environment: it is multi-line, and
+#: a file can be chmod 600 while an env var is visible to anything that can read
+#: /proc for the process.
+GITHUB_APP_PRIVATE_KEY_PATH = os.environ.get(
+    "ORCHESTRATOR_GITHUB_APP_PRIVATE_KEY_PATH", "/srv/secrets/github-app.pem"
+)
+
+#: Which installation to mint tokens for. Discover it with
+#: `python -m orchestrator.github`.
+GITHUB_APP_INSTALLATION_ID = int(
+    os.environ.get("ORCHESTRATOR_GITHUB_APP_INSTALLATION_ID", "0")
+)
+
+#: What the App is supposed to be able to reach. Used only to warn when setup
+#: granted more than intended; nothing enforces it here, GitHub does.
+GITHUB_EXPECTED_REPOS = (
+    "wanderindev/feliu-dev",
+    "wanderindev/panama-in-context",
+)
