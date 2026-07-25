@@ -140,6 +140,9 @@ class PollReport:
     """
 
     seen: int = 0
+    #: The lookback the poll used. Reported because an issue older than this is
+    #: invisible to it, and a silent scope limit reads as "there was nothing".
+    window: str = ""
     enqueued: list[str] = field(default_factory=list)
     dropped: dict[str, int] = field(default_factory=dict)
 
@@ -167,12 +170,23 @@ class SentryClient:
         self.base_url = base_url.rstrip("/")
         self._open = opener
 
-    def unresolved_issues(self, project: str, limit: int = 25) -> list[SentryIssue]:
+    def unresolved_issues(
+        self, project: str, limit: int = 25, stats_period: str = "14d"
+    ) -> list[SentryIssue]:
+        """Unresolved issues *active within ``stats_period``*.
+
+        That window is a real scope limit, not a detail: an issue whose last
+        event is older than it simply does not come back, however real it is. At
+        14d the live poll returned 16 of the 25 unresolved issues in the org, and
+        the 9 it left out included a genuine missing-column error last seen 23
+        days ago. Widen it with ORCHESTRATOR_SENTRY_STATS_PERIOD to reach back
+        further; the cap and the dedup both still hold.
+        """
         params = urllib.parse.urlencode(
             {
                 "query": "is:unresolved",
                 "project": project,
-                "statsPeriod": "14d",
+                "statsPeriod": stats_period,
                 "limit": limit,
             }
         )
@@ -229,6 +243,7 @@ def poll(
     projects: list[str] | None = None,
     filters: Filters | None = None,
     dry_run: bool = False,
+    stats_period: str = "14d",
 ) -> PollReport:
     """Fetch, filter, and enqueue. Returns what happened.
 
@@ -242,12 +257,12 @@ def poll(
     """
     filters = filters or Filters()
     projects = projects if projects is not None else list(PROJECT_REPOS)
-    report = PollReport()
+    report = PollReport(window=stats_period)
     cooldown = timedelta(days=filters.cooldown_days)
 
     for project in projects:
         try:
-            issues = client.unresolved_issues(project)
+            issues = client.unresolved_issues(project, stats_period=stats_period)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             # One unreachable project must not lose the others. The next poll
             # retries; there is no state to corrupt.

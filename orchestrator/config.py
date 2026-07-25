@@ -89,3 +89,8 @@ SENTRY_BASE_URL = os.environ.get("ORCHESTRATOR_SENTRY_BASE_URL", "https://us.sen
 SENTRY_MIN_EVENTS = int(os.environ.get("ORCHESTRATOR_SENTRY_MIN_EVENTS", "1"))
 SENTRY_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_SENTRY_MAX_PER_POLL", "5"))
 SENTRY_COOLDOWN_DAYS = int(os.environ.get("ORCHESTRATOR_SENTRY_COOLDOWN_DAYS", "7"))
+
+#: Lookback for the issue query. An issue whose last event is older than this is
+#: invisible to the poll, however real it is, so this is a scope decision rather
+#: than a tuning knob.
+SENTRY_STATS_PERIOD = os.environ.get("ORCHESTRATOR_SENTRY_STATS_PERIOD", "14d")

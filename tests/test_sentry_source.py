@@ -48,7 +48,7 @@ class FakeSentry(SentryClient):
         self.fail = set(fail)
         self.asked = []
 
-    def unresolved_issues(self, project, limit=25):
+    def unresolved_issues(self, project, limit=25, stats_period="14d"):
         self.asked.append(project)
         if project in self.fail:
             raise urllib.error.URLError("connection reset")
@@ -382,3 +382,33 @@ def test_a_dry_run_reports_without_enqueuing(conn):
 
     assert report.enqueued == ["sentry:PIC-PYTHON-FASTAPI-1Q"]
     assert queued_count(conn) == 0, "nothing was actually queued"
+
+
+def test_the_lookback_window_is_reported(conn):
+    """A silent scope limit reads as "there was nothing to find"."""
+    client = FakeSentry({"pic-python-fastapi": [issue()]})
+    report = poll(conn, client, projects=["pic-python-fastapi"], stats_period="90d")
+    assert report.window == "90d"
+
+
+def test_the_lookback_window_reaches_the_client():
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps([]).encode()
+
+    def opener(request, timeout=None):
+        captured["url"] = request.full_url
+        return FakeResponse()
+
+    SentryClient("t", "javier-feliu", opener=opener).unresolved_issues(
+        "pic-python-fastapi", stats_period="90d"
+    )
+    assert "statsPeriod=90d" in captured["url"]

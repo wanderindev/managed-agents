@@ -48,7 +48,13 @@ def main(argv: list[str] | None = None) -> int:
         cooldown_days=config.SENTRY_COOLDOWN_DAYS,
     )
     with connect() as conn:
-        report = sentry.poll(conn, client, filters=filters, dry_run=args.dry_run)
+        report = sentry.poll(
+            conn,
+            client,
+            filters=filters,
+            dry_run=args.dry_run,
+            stats_period=config.SENTRY_STATS_PERIOD,
+        )
     # Exit code carries nothing about how many were enqueued: a poll that finds
     # nothing is a completely normal outcome and must not look like a failure to
     # whatever timer runs this.
