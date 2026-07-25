@@ -161,6 +161,53 @@ The prompt lives outside the repo on purpose, so a job cannot commit its own
 instructions. A workspace with no commits is deleted when the run finishes; one
 with commits is kept, because #7 still has to push that branch.
 
+## Sentry work source
+
+```bash
+python -m orchestrator.poll            # fetch, filter, enqueue
+python -m orchestrator.poll --dry-run  # same, but enqueue nothing
+```
+
+A separate command from the loop rather than a step inside a tick, so scheduling
+is the operating system's job and there is no "when did I last poll" state to
+keep anywhere. Hourly is the intended cadence. Running it twice by accident is
+harmless: the dedup and the unique index both hold.
+
+### The token is a manual step
+
+Create a Sentry auth token by hand (there is no API for minting one) with
+**`event:read`** and **`org:read`**, and add it to `/srv/orchestrator.env`:
+
+```
+ORCHESTRATOR_SENTRY_TOKEN=...
+```
+
+The org is `javier-feliu` and it lives in the **US region**, so the base URL is
+`https://us.sentry.io`, not `sentry.io`. Sending to the wrong region fails.
+
+### Which projects, and which are deliberately excluded
+
+| Sentry project | Repo |
+|---|---|
+| `trd-python`, `trd-javascript-react` | `feliu-dev` |
+| `pic-python-fastapi`, `pic-javascript-react` | `panama-in-context` |
+
+`atelier-loyalty-app` and `pic-cert-watcher` are real projects in the same org
+and are deliberately absent: there is no clone of either here, so an agent could
+only ever report that it cannot help.
+
+### Tuning the filters
+
+`--dry-run` prints the same drop tally without enqueuing, which is how a filter
+change gets evaluated before anyone lives with it. Every drop is counted **by
+reason**, because a source that filters silently reads as "nothing was wrong"
+when it actually means "I decided none of this was worth your time".
+
+The `min_events` floor is the one to watch. At the default of 2 it drops genuine
+one-off bugs, and it did so the first time it ran: `PIC-PYTHON-FASTAPI-1H`, a
+real missing-column error, has a single event. Lower it with
+`ORCHESTRATOR_SENTRY_MIN_EVENTS` once the loop has earned some trust.
+
 ## Log database
 
 Managed cluster `d699bab0-c322-4b58-b90b-98bae0632b30`, PostgreSQL **17.10**,
