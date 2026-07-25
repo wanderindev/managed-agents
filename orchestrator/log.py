@@ -58,6 +58,10 @@ def apply_event(
             # A dead lease normally goes back in the queue. Past the attempts
             # ceiling the reconcile pass (#4) sets requeued=False and the run
             # stops here, which also frees its (kind, subject) slot.
+            #
+            # A *missing* key therefore means terminal, not requeued. That is the
+            # safe default (it cannot cause a retry loop) but it is a silent one,
+            # so #4 must always write the flag explicitly.
             return RunStatus.QUEUED if payload.get("requeued") else RunStatus.ABANDONED
         case EventType.RUN_FAILED:
             return RunStatus.FAILED
