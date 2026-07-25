@@ -1,0 +1,3 @@
+# Runtime dependencies for the orchestrator. Kept deliberately short: this
+# process has to stay small enough to be obviously correct.
+psycopg[binary]>=3.2,<4

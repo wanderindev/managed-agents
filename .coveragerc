@@ -1,0 +1,21 @@
+[run]
+source = orchestrator
+branch = True
+omit =
+    */__pycache__/*
+
+[report]
+show_missing = True
+skip_covered = False
+precision = 1
+# Ratchet, same convention as feliu-dev. Raise as the suite grows; the point is
+# to catch a regression, not to hit a number.
+fail_under = 90
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    if __name__ == .__main__.:
+
+[html]
+directory = htmlcov
