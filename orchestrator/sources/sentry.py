@@ -78,7 +78,17 @@ IGNORE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
         re.compile(r"GET /\.env", re.IGNORECASE),
         "bot probing for secrets; there is nothing to fix",
     ),
+    (
+        re.compile(
+            r"TypeError: Load failed|NetworkError when attempting to fetch",
+            re.IGNORECASE,
+        ),
+        "browser-side network failure, usually a visitor losing connectivity",
+    ),
 )
+
+#: Titles Sentry emits when it could not group the error into anything.
+UNUSABLE_TITLES = frozenset({"", "<unknown>", "unknown"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,10 +116,12 @@ class SentryIssue:
 
 @dataclass(frozen=True, slots=True)
 class Filters:
-    #: A single occurrence is noise until it repeats. This does drop real
-    #: one-off bugs; the trade is deliberate and the drop is logged, so the
-    #: number can be lowered once the loop has earned some trust.
-    min_events: int = 2
+    #: These are low-traffic personal sites, not a service with real volume, so
+    #: a single occurrence is already signal rather than noise. Raising this
+    #: would trade away real bugs: on the day this was written, a floor of 2
+    #: dropped 10 of 25 issues, and among them a genuine missing-column error
+    #: (PIC-PYTHON-FASTAPI-1H) that had happened exactly once.
+    min_events: int = 1
     #: A Sentry storm during an incident must not be able to spawn a fleet.
     max_per_poll: int = 5
     #: How long a finished run suppresses its subject. Long enough that a merged
@@ -198,6 +210,11 @@ def classify(issue: SentryIssue, filters: Filters) -> str | None:
         return f"project {issue.project!r} has no repo here"
     if issue.count < filters.min_events:
         return f"only {issue.count} event(s), below the {filters.min_events} floor"
+    if issue.title.strip().lower() in UNUSABLE_TITLES and not issue.culprit.strip():
+        # Sentry could not group this into anything. With no title and no
+        # culprit there is no starting point, so an agent would burn a run to
+        # conclude the same thing. Matters much more at min_events=1.
+        return "no title or culprit; nothing for an agent to start from"
     haystack = f"{issue.title}\n{issue.culprit}"
     for pattern, reason in filters.ignore_patterns:
         if pattern.search(haystack):

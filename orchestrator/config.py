@@ -84,6 +84,8 @@ SENTRY_ORG = os.environ.get("ORCHESTRATOR_SENTRY_ORG", "javier-feliu")
 #: a request sent to the wrong one.
 SENTRY_BASE_URL = os.environ.get("ORCHESTRATOR_SENTRY_BASE_URL", "https://us.sentry.io")
 
-SENTRY_MIN_EVENTS = int(os.environ.get("ORCHESTRATOR_SENTRY_MIN_EVENTS", "2"))
+#: 1, not 2: these are low-traffic personal sites where a single occurrence
+#: is already signal. See Filters.min_events.
+SENTRY_MIN_EVENTS = int(os.environ.get("ORCHESTRATOR_SENTRY_MIN_EVENTS", "1"))
 SENTRY_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_SENTRY_MAX_PER_POLL", "5"))
 SENTRY_COOLDOWN_DAYS = int(os.environ.get("ORCHESTRATOR_SENTRY_COOLDOWN_DAYS", "7"))

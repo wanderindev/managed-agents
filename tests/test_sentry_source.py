@@ -119,6 +119,14 @@ def test_a_real_backend_bug_is_kept():
             {"title": "Error: [object Object]", "culprit": "GET /.env"},
             "bot probing",
         ),
+        (
+            {
+                "title": "TypeError: Load failed",
+                "culprit": "https://panamaincontext.com/excursiones-academicas",
+                "project": {"slug": "pic-javascript-react"},
+            },
+            "browser-side network failure",
+        ),
     ],
 )
 def test_known_noise_is_dropped_with_a_reason(overrides, expected):
@@ -135,15 +143,39 @@ def test_a_project_without_a_repo_here_is_dropped():
     assert "no repo here" in reason
 
 
-def test_a_single_occurrence_is_below_the_floor():
-    reason = classify(sentry._to_issue(issue(count=1)), Filters())
+def test_a_single_occurrence_is_kept_by_default():
+    """These are low-traffic personal sites; one occurrence is already signal.
+
+    PIC-PYTHON-FASTAPI-1H is the case that settled this: a genuine
+    missing-column error that had happened exactly once. A floor of 2 threw it
+    away along with 9 others.
+    """
+    assert classify(sentry._to_issue(issue(count=1)), Filters()) is None
+
+
+def test_the_floor_is_still_configurable_upward():
+    reason = classify(sentry._to_issue(issue(count=1)), Filters(min_events=2))
     assert "below the 2 floor" in reason
 
 
-def test_the_floor_is_configurable_because_it_does_drop_real_bugs():
-    """PIC-PYTHON-FASTAPI-1H is a genuine missing-column bug with 1 event."""
-    one_off = sentry._to_issue(issue(count=1))
-    assert classify(one_off, Filters(min_events=1)) is None
+def test_an_issue_with_no_title_and_no_culprit_is_dropped():
+    """PIC-JAVASCRIPT-REACT-Q. Sentry could not group it into anything.
+
+    Matters much more at min_events=1: without this, every ungroupable one-off
+    becomes a run that can only conclude there was nothing to work from.
+    """
+    reason = classify(
+        sentry._to_issue(issue(title="<unknown>", culprit="", count=1)), Filters()
+    )
+    assert "nothing for an agent to start from" in reason
+
+
+def test_a_missing_title_is_survivable_when_there_is_a_culprit():
+    """A stack location is a starting point even without a good title."""
+    parsed = sentry._to_issue(
+        issue(title="<unknown>", culprit="app.services.foo in bar", count=1)
+    )
+    assert classify(parsed, Filters()) is None
 
 
 # --- polling -----------------------------------------------------------------

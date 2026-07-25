@@ -203,10 +203,23 @@ change gets evaluated before anyone lives with it. Every drop is counted **by
 reason**, because a source that filters silently reads as "nothing was wrong"
 when it actually means "I decided none of this was worth your time".
 
-The `min_events` floor is the one to watch. At the default of 2 it drops genuine
-one-off bugs, and it did so the first time it ran: `PIC-PYTHON-FASTAPI-1H`, a
-real missing-column error, has a single event. Lower it with
-`ORCHESTRATOR_SENTRY_MIN_EVENTS` once the loop has earned some trust.
+`min_events` defaults to **1**, not 2. These are low-traffic personal sites, so a
+single occurrence is already signal rather than noise. A floor of 2 was tried
+first and threw away 10 of 25 issues, including `PIC-PYTHON-FASTAPI-1H`, a real
+missing-column error that had happened exactly once. Raise it with
+`ORCHESTRATOR_SENTRY_MIN_EVENTS` if the volume ever justifies it.
+
+At a floor of 1 the ungroupable-issue filter starts earning its keep: an issue
+with no usable title *and* no culprit gives an agent nothing to start from, so
+it is dropped rather than turned into a run that can only conclude the same.
+
+### Closing the loop back to Sentry
+
+The GitHub integration is installed, which means a commit message containing
+`Fixes PIC-PYTHON-FASTAPI-1Q` **resolves that issue automatically when the PR
+merges**. #7 should put the short id in every commit it writes. The orchestrator
+therefore never needs write access to Sentry: resolution is a side effect of a
+human merging, which is exactly where the decision belongs.
 
 ## Log database
 
