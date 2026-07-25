@@ -16,6 +16,9 @@ exclude_lines =
     if TYPE_CHECKING:
     raise NotImplementedError
     if __name__ == .__main__.:
+    # Protocol method bodies. Never executed by design: the whole point is that
+    # something else implements them.
+    ^\s*\.\.\.$
 
 [html]
 directory = htmlcov
