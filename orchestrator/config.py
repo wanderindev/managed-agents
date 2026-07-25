@@ -37,3 +37,38 @@ TICK_SECONDS = int(os.environ.get("ORCHESTRATOR_TICK_SECONDS", "15"))
 #: three times is an infrastructure problem, and retrying it a fourth time just
 #: burns tokens on the same failure.
 MAX_ATTEMPTS = int(os.environ.get("ORCHESTRATOR_MAX_ATTEMPTS", "3"))
+
+# --- sandbox -----------------------------------------------------------------
+
+SANDBOX_IMAGE = os.environ.get(
+    "ORCHESTRATOR_SANDBOX_IMAGE", "managed-agents/sandbox:latest"
+)
+
+#: Host clones live here; each job gets a git worktree off one of them.
+REPOS_ROOT = os.environ.get("ORCHESTRATOR_REPOS_ROOT", "/srv/repos")
+WORKTREES_ROOT = os.environ.get("ORCHESTRATOR_WORKTREES_ROOT", "/srv/worktrees")
+
+#: Per-job scratch, mounted at /work. The prompt goes here rather than into the
+#: repo, so a job cannot accidentally commit its own instructions.
+JOBS_ROOT = os.environ.get("ORCHESTRATOR_JOBS_ROOT", "/srv/jobs")
+
+CLAUDE_CREDENTIALS = os.environ.get(
+    "ORCHESTRATOR_CLAUDE_CREDENTIALS", "/home/wanderindev/.claude/.credentials.json"
+)
+
+#: Wall clock, enforced inside the container. Never an event count: a healthy
+#: long research run emits few events, and a stuck one can emit thousands.
+SANDBOX_TIMEOUT_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_SANDBOX_TIMEOUT_SECONDS", "1800")
+)
+
+SANDBOX_MEMORY = os.environ.get("ORCHESTRATOR_SANDBOX_MEMORY", "3g")
+SANDBOX_MEMORY_SWAP = os.environ.get("ORCHESTRATOR_SANDBOX_MEMORY_SWAP", "4g")
+
+#: Hands the job the host's Docker daemon so it can run testcontainers suites.
+#: Off by default: with it on the container stops being a security boundary.
+SANDBOX_WITH_DOCKER = os.environ.get("ORCHESTRATOR_SANDBOX_WITH_DOCKER", "0") == "1"
+
+#: Ceiling on one event's payload. One runaway tool result must not be able to
+#: bloat the log, and nothing downstream reads a 2MB payload usefully anyway.
+MAX_PAYLOAD_BYTES = int(os.environ.get("ORCHESTRATOR_MAX_PAYLOAD_BYTES", "16384"))

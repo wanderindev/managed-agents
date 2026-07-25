@@ -9,6 +9,7 @@ that can drift.
 Everything here assumes it is running inside a caller-owned transaction.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
+from orchestrator import config
 from orchestrator.enums import EventType, RunStatus
 
 #: Columns :func:`append` will write on ``agent_runs`` alongside the status.
@@ -29,6 +31,31 @@ class Event:
     type: EventType
     payload: dict[str, Any]
     created_at: datetime
+
+
+def truncate_payload(
+    payload: dict[str, Any], max_bytes: int | None = None
+) -> dict[str, Any]:
+    """Cap one payload's serialized size.
+
+    Applied inside :func:`append` rather than at the call sites, so no caller can
+    forget. A single runaway tool result must not be able to bloat a log that is
+    meant to be read, and nothing downstream gets value from a 2MB payload.
+
+    The replacement keeps the fields you actually navigate by (``type``, ``name``)
+    plus a preview, so a truncated event is still identifiable rather than a hole.
+    """
+    limit = config.MAX_PAYLOAD_BYTES if max_bytes is None else max_bytes
+    encoded = json.dumps(payload, default=str)
+    if len(encoded) <= limit:
+        return payload
+    return {
+        "_truncated": True,
+        "_original_bytes": len(encoded),
+        "type": payload.get("type"),
+        "name": payload.get("name"),
+        "preview": encoded[: max(limit // 4, 0)],
+    }
 
 
 def apply_event(
@@ -143,7 +170,12 @@ def append(
             " SELECT %s, coalesce(max(seq), 0) + 1, %s, %s"
             " FROM agent_events WHERE run_id = %s"
             " RETURNING seq",
-            (run_id, event_type.value, Jsonb(payload or {}), run_id),
+            (
+                run_id,
+                event_type.value,
+                Jsonb(truncate_payload(payload or {})),
+                run_id,
+            ),
         )
         seq = cur.fetchone()["seq"]
 
@@ -196,6 +228,21 @@ def verify_replay(conn: psycopg.Connection, run_id: int) -> bool:
     returns False in production, the cache is wrong and the log wins.
     """
     return replay_status(load_events(conn, run_id)) == stored_status(conn, run_id)
+
+
+def count_events(conn: psycopg.Connection, run_id: int, event_type: EventType) -> int:
+    """How many events of a type a run already has.
+
+    Draining a transcript uses this as its resume point: the sandbox hands back
+    every event from the beginning, and the loop skips the ones already stored.
+    That makes the drain idempotent, so a crash part way through costs nothing.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM agent_events WHERE run_id = %s AND type = %s",
+            (run_id, event_type.value),
+        )
+        return cur.fetchone()["n"]
 
 
 def latest_event(

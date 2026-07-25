@@ -8,7 +8,7 @@ from orchestrator.enums import EventType, RunStatus
 from orchestrator.log import append, create_run, load_events, verify_replay
 from orchestrator.loop import Orchestrator, TickResult
 from orchestrator.queue import get_run
-from tests.fakes import FakeRunner
+from tests.fakes import FakeRunner, VanishingRunner
 
 WORKER = "orchestrator-test"
 
@@ -16,6 +16,28 @@ WORKER = "orchestrator-test"
 @pytest.fixture()
 def runner():
     return FakeRunner()
+
+
+@pytest.fixture()
+def lost_runner():
+    """A runner whose containers vanish rather than finish.
+
+    Since #5 the loop distinguishes a sandbox that *completed* from one that was
+    *lost*, so a test about abandonment has to say which it means. Killing a
+    container that then reports SUCCEEDED is a finished run, not a lost one.
+    """
+    return VanishingRunner()
+
+
+@pytest.fixture()
+def lost(lost_runner):
+    return Orchestrator(
+        lost_runner,
+        worker_id=WORKER,
+        max_concurrent=1,
+        lease_seconds=300,
+        max_attempts=3,
+    )
 
 
 @pytest.fixture()
@@ -190,13 +212,13 @@ def test_a_live_sandbox_gets_its_lease_extended(conn, orchestrator):
 # --- reconcile ---------------------------------------------------------------
 
 
-def test_a_dead_sandbox_is_requeued(conn, runner):
+def test_a_lost_sandbox_is_requeued(conn, lost_runner):
     """Reconcile in isolation, via a cap of 0. Also how you drain the host."""
     run_id = create_run(conn, "sentry_triage", "sentry:R-1")
-    Orchestrator(runner, worker_id=WORKER, max_concurrent=1).tick(conn)
-    runner.kill_all()
+    Orchestrator(lost_runner, worker_id=WORKER, max_concurrent=1).tick(conn)
+    lost_runner.kill_all()
 
-    draining = Orchestrator(runner, worker_id=WORKER, max_concurrent=0)
+    draining = Orchestrator(lost_runner, worker_id=WORKER, max_concurrent=0)
     result = draining.tick(conn)
 
     assert run_id in result.abandoned
@@ -208,31 +230,31 @@ def test_a_dead_sandbox_is_requeued(conn, runner):
     assert verify_replay(conn, run_id)
 
 
-def test_a_dead_sandbox_is_replaced_in_the_same_tick(conn, orchestrator, runner):
+def test_a_lost_sandbox_is_replaced_in_the_same_tick(conn, lost, lost_runner):
     run_id = create_run(conn, "sentry_triage", "sentry:R-1b")
-    orchestrator.tick(conn)
-    first_handle = runner.alive.pop()
-    runner.kill_all()
+    lost.tick(conn)
+    first_handle = lost_runner.alive.pop()
+    lost_runner.kill_all()
 
-    result = orchestrator.tick(conn)
+    result = lost.tick(conn)
 
     assert result.abandoned == [run_id]
     assert result.leased == [run_id]
     run = get_run(conn, run_id)
     assert run.status is RunStatus.RUNNING
     assert run.attempts == 2
-    assert runner.alive and first_handle not in runner.alive, "a fresh container"
+    assert lost_runner.alive and first_handle not in lost_runner.alive, (
+        "a fresh container"
+    )
     assert verify_replay(conn, run_id)
 
 
-def test_the_abandon_event_always_states_requeued_explicitly(
-    conn, orchestrator, runner
-):
+def test_the_abandon_event_always_states_requeued_explicitly(conn, lost, lost_runner):
     """A missing flag folds to terminal, which would strand a retryable run."""
     run_id = create_run(conn, "sentry_triage", "sentry:R-2")
-    orchestrator.tick(conn)
-    runner.kill_all()
-    orchestrator.tick(conn)
+    lost.tick(conn)
+    lost_runner.kill_all()
+    lost.tick(conn)
 
     abandoned = [
         e for e in load_events(conn, run_id) if e.type is EventType.RUN_ABANDONED
@@ -322,20 +344,22 @@ def test_a_restarted_orchestrator_reattaches_to_a_live_sandbox(conn, runner):
     assert get_run(conn, run_id).status is RunStatus.RUNNING
 
 
-def test_a_restarted_orchestrator_requeues_a_dead_sandbox_exactly_once(conn, runner):
+def test_a_restarted_orchestrator_requeues_a_lost_sandbox_exactly_once(
+    conn, lost_runner
+):
     """The no-double-PR guarantee: one retry, not one per tick."""
     run_id = create_run(conn, "sentry_triage", "sentry:RESTART-2")
-    first = Orchestrator(runner, worker_id=WORKER, max_concurrent=1)
+    first = Orchestrator(lost_runner, worker_id=WORKER, max_concurrent=1)
     first.tick(conn)
-    runner.kill_all()  # the sandbox dies with the orchestrator
+    lost_runner.kill_all()  # the sandbox is lost with the orchestrator
     del first
 
-    reborn = Orchestrator(runner, worker_id=WORKER, max_concurrent=1)
+    reborn = Orchestrator(lost_runner, worker_id=WORKER, max_concurrent=1)
     recovery = reborn.tick(conn)
 
     assert run_id in recovery.abandoned
     assert recovery.leased == [run_id], "recovered in the same tick that freed it"
-    assert runner.started == [run_id, run_id]
+    assert lost_runner.started == [run_id, run_id]
     run = get_run(conn, run_id)
     assert run.attempts == 2
     assert run.status is RunStatus.RUNNING
@@ -347,14 +371,14 @@ def test_a_restarted_orchestrator_requeues_a_dead_sandbox_exactly_once(conn, run
     assert len(abandons) == 1, "requeued once, not once per tick"
 
 
-def test_a_run_survives_the_full_kill_and_resume_cycle(conn, runner):
+def test_a_run_survives_the_full_kill_and_resume_cycle(conn, lost_runner):
     """The #12 shape, driven entirely by the loop."""
     run_id = create_run(conn, "sentry_triage", "sentry:RESUME-1")
-    orchestrator = Orchestrator(runner, worker_id=WORKER, max_concurrent=1)
+    orchestrator = Orchestrator(lost_runner, worker_id=WORKER, max_concurrent=1)
 
     orchestrator.tick(conn)
     append(conn, run_id, EventType.STAGE_COMPLETED, {"stage": "investigate"})
-    runner.kill_all()
+    lost_runner.kill_all()
     orchestrator.tick(conn)  # abandons, requeues, and re-leases
     append(conn, run_id, EventType.RUN_DONE)
 

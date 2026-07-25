@@ -107,6 +107,60 @@ but it means "sandbox" is a slight overclaim and the flag should stay opt-in.
 Runtime limits are set in `scripts/run-sandbox.sh`: 3g memory, 4g with swap,
 512 pids, `--init` so the CLI's child processes get reaped.
 
+## Running the orchestrator
+
+```bash
+ssh wanderindev@159.223.174.185
+cd /srv/orchestrator
+set -a; . /srv/orchestrator.env; set +a
+.venv/bin/python -m orchestrator.main
+```
+
+`SIGTERM` and `SIGINT` ask it to stop after the current tick. Killing it outright
+is also safe: the loop is built to be resumed, and the first tick of the next
+process reconciles whatever it inherits.
+
+Enqueue an end-to-end check:
+
+```python
+from orchestrator.db import connect
+from orchestrator.log import create_run
+
+with connect() as conn:
+    create_run(conn, "smoke", "smoke:1")
+    conn.commit()
+```
+
+A finished run's `agent_events` are meant to be enough on their own:
+
+```sql
+SELECT seq, type, left(payload::text, 90) FROM agent_events WHERE run_id = 2 ORDER BY seq;
+```
+
+```
+ 1 | run_queued      | {"why": "issue #5 end to end"}
+ 2 | run_leased      | {"attempt": 1, "worker_id": "agents-1"}
+ 3 | sandbox_started | {"container": "ma-run-2-1"}
+ 4 | claude_event    | {"cwd": "/workspace", "type": "system", ...
+ …
+ 8 | claude_event    | {"type": "rate_limit_event", ...
+10 | claude_event    | {"type": "result", ...
+11 | stage_completed | {"result": {"ok": true, "checked": "sandbox"}, "outcome": "SUCCEEDED", ...
+12 | run_done        | {"exit_code": 0}
+```
+
+### Where a job's pieces live
+
+| Path | Contents |
+|---|---|
+| `/srv/repos/<repo>` | host clone; each job gets a `git worktree` off it |
+| `/srv/worktrees/ma-run-<id>-<attempt>` | the job's checkout, mounted at `/workspace` |
+| `/srv/jobs/ma-run-<id>-<attempt>` | `prompt.txt` in, `result.json` out, mounted at `/work` |
+
+The prompt lives outside the repo on purpose, so a job cannot commit its own
+instructions. A workspace with no commits is deleted when the run finishes; one
+with commits is kept, because #7 still has to push that branch.
+
 ## Log database
 
 Managed cluster `d699bab0-c322-4b58-b90b-98bae0632b30`, PostgreSQL **17.10**,

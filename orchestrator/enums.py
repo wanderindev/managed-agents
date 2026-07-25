@@ -25,6 +25,19 @@ class RunStatus(StrEnum):
 TERMINAL_STATUSES = frozenset({RunStatus.DONE, RunStatus.FAILED, RunStatus.ABANDONED})
 
 
+class Outcome(StrEnum):
+    """How a sandbox ended, as distinct from why a run ended.
+
+    ``FAILED`` and ``GONE`` are both "the container is not running any more", but
+    they mean opposite things: FAILED is a verdict from the work, GONE is the
+    infrastructure losing the work. Only the second one deserves a retry.
+    """
+
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    GONE = "GONE"
+
+
 class EventType(StrEnum):
     """Everything that can be appended to a run's history.
 
