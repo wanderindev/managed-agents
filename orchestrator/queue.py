@@ -15,7 +15,9 @@ from orchestrator.enums import TERMINAL_STATUSES, RunStatus
 #: Statuses where a sandbox is supposed to exist.
 ACTIVE_STATUSES = (RunStatus.LEASED.value, RunStatus.RUNNING.value)
 
-_COLUMNS = "id, kind, subject, status, attempts, worker_id, lease_expires_at"
+_COLUMNS = (
+    "id, kind, subject, status, attempts, worker_id, lease_expires_at, not_before"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +29,9 @@ class Run:
     attempts: int
     worker_id: str | None
     lease_expires_at: datetime | None
+    #: NOT NULL in the schema; optional here only so hand-built Runs in tests
+    #: need not care. Rows read from the database always carry a value.
+    not_before: datetime | None = None
 
     def lease_expired(self, now: datetime) -> bool:
         """A missing lease counts as expired: it means nobody is holding this."""
@@ -42,7 +47,21 @@ def _to_run(row: dict) -> Run:
         attempts=row["attempts"],
         worker_id=row["worker_id"],
         lease_expires_at=row["lease_expires_at"],
+        not_before=row["not_before"],
     )
+
+
+def db_now(conn: psycopg.Connection) -> datetime:
+    """The database's transaction clock.
+
+    Backoff windows are compared against ``now()`` in SQL by
+    :func:`claim_next_queued`, so they have to be *computed* from that same
+    clock. Using the host's clock instead would let a skew between droplet and
+    managed Postgres silently stretch or shrink every window.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT now() AS now")
+        return cur.fetchone()["now"]
 
 
 def claim_next_queued(conn: psycopg.Connection) -> Run | None:
@@ -52,11 +71,16 @@ def claim_next_queued(conn: psycopg.Connection) -> Run | None:
     take different rows instead of fighting over one. The lock is held until the
     caller's transaction ends, so the caller must append ``run_leased`` inside
     that same transaction or the claim means nothing.
+
+    A run inside its backoff window (``not_before`` in the future, set by
+    ``loop.Orchestrator._abandon``) is invisible here, which is the entire
+    mechanism of #20: it keeps its queue position but yields its turn to newer
+    work until the window passes.
     """
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT {_COLUMNS} FROM agent_runs"
-            " WHERE status = %s"
+            " WHERE status = %s AND not_before <= now()"
             " ORDER BY created_at, id"
             " LIMIT 1"
             " FOR UPDATE SKIP LOCKED",

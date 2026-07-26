@@ -18,6 +18,9 @@ WORKER = "orchestrator-test"
 
 def orchestrate(runner, **kwargs):
     kwargs.setdefault("max_concurrent", 1)
+    # Zero backoff so a requeued run is claimable in the same tick; the backoff
+    # window itself (#20) is covered in test_backoff.py.
+    kwargs.setdefault("backoff_base_seconds", 0)
     return Orchestrator(runner, worker_id=WORKER, **kwargs)
 
 

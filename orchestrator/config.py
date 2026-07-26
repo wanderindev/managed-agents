@@ -38,6 +38,18 @@ TICK_SECONDS = int(os.environ.get("ORCHESTRATOR_TICK_SECONDS", "15"))
 #: burns tokens on the same failure.
 MAX_ATTEMPTS = int(os.environ.get("ORCHESTRATOR_MAX_ATTEMPTS", "3"))
 
+#: Base delay before a requeued run may be claimed again, doubling per attempt.
+#: Without it, three 15-second ticks exhaust every attempt in ~45 seconds, which
+#: turns transient problems (a daemon mid-restart, a Postgres failover) into
+#: permanent give-ups. See ``loop.backoff_delay``.
+BACKOFF_BASE_SECONDS = int(os.environ.get("ORCHESTRATOR_BACKOFF_BASE_SECONDS", "60"))
+
+#: Ceiling on the computed backoff. A known-better wait (a rate limit's reset
+#: time) is passed explicitly and is not subject to this.
+BACKOFF_CEILING_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_BACKOFF_CEILING_SECONDS", "3600")
+)
+
 # --- sandbox -----------------------------------------------------------------
 
 SANDBOX_IMAGE = os.environ.get(

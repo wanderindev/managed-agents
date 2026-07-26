@@ -21,8 +21,10 @@ from orchestrator import config
 from orchestrator.enums import EventType, RunStatus
 
 #: Columns :func:`append` will write on ``agent_runs`` alongside the status.
-#: A whitelist, because the keys are interpolated into SQL.
-_RUN_FIELDS = frozenset({"worker_id", "lease_expires_at", "attempts"})
+#: A whitelist, because the keys are interpolated into SQL. ``not_before`` is
+#: here so a backoff lands in the same statement as its ``run_abandoned`` event
+#: rather than as a second write that can be interrupted.
+_RUN_FIELDS = frozenset({"worker_id", "lease_expires_at", "attempts", "not_before"})
 
 
 @dataclass(frozen=True, slots=True)
