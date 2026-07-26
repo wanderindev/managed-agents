@@ -33,7 +33,9 @@ args=(
 # host's Docker daemon, which is how it can run testcontainers suites and also
 # why the container stops being a real security boundary.
 if [ "${AGENT_WITH_DOCKER:-0}" = "1" ]; then
-    args+=(--volume /var/run/docker.sock:/var/run/docker.sock --group-add "$(getent group docker | cut -d: -f3)")
+    # Group id from the socket itself, not the `docker` group name — neither
+    # the name nor the number is stable across hosts. Mirrors DockerRunner.
+    args+=(--volume /var/run/docker.sock:/var/run/docker.sock --group-add "$(stat -c %g /var/run/docker.sock)")
 fi
 
 for var in AGENT_MODEL AGENT_MAX_TURNS AGENT_PERMISSION_MODE AGENT_FALLBACK_MODEL GH_TOKEN; do

@@ -11,6 +11,7 @@ loop appends it, which is why the sandbox never needs the log database's passwor
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -34,6 +35,8 @@ PROMPT_FILENAME = "prompt.txt"
 #: `timeout` exits 124 when it fires. Worth naming: otherwise a timed-out run
 #: looks like an arbitrary failure.
 TIMEOUT_EXIT_CODE = 124
+
+DOCKER_SOCKET = "/var/run/docker.sock"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +90,7 @@ class DockerRunner:
         git_bin: str = "git",
         run_command: CommandRunner = _run_command,
         github_token: Callable[[], str] | None = None,
+        docker_socket: str = DOCKER_SOCKET,
     ) -> None:
         self.job_spec = job_spec
         self.image = image or config.SANDBOX_IMAGE
@@ -108,6 +112,7 @@ class DockerRunner:
         self.git_bin = git_bin
         self._run = run_command
         self._github_token = github_token
+        self.docker_socket = docker_socket
 
     # --- naming --------------------------------------------------------------
 
@@ -237,9 +242,29 @@ class DockerRunner:
             # than the remains of a token minted at planning time.
             argv += ["--env", f"GH_TOKEN={self._github_token()}"]
         if spec.needs_docker or self.with_docker:
-            argv += ["--volume", "/var/run/docker.sock:/var/run/docker.sock"]
+            argv += ["--volume", f"{self.docker_socket}:{self.docker_socket}"]
+            # The mount alone is not enough (#26): the socket is root:docker
+            # mode 660 and the container's `agent` user is uid 1000 with no
+            # supplementary groups, so without the group the mount is present
+            # but unusable and every testcontainers suite falls over. Resolved
+            # from the socket itself rather than the `docker` group name,
+            # because neither the name nor the number is stable across hosts.
+            gid = self._socket_gid()
+            if gid is not None:
+                argv += ["--group-add", str(gid)]
         argv.append(self.image)
         return argv
+
+    def _socket_gid(self) -> int | None:
+        """The docker socket's group id, or None when the socket is missing.
+
+        Resolved at launch, per run, so a daemon restart that recreates the
+        socket with a different gid is picked up without restarting anything.
+        """
+        try:
+            return os.stat(self.docker_socket).st_gid
+        except OSError:
+            return None
 
     def _collect_logs(self, handle: str) -> tuple[list[dict], str]:
         """Split the container's two output channels.
