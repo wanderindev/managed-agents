@@ -103,13 +103,42 @@ def test_the_docker_socket_is_opt_in(roots):
     assert "/var/run/docker.sock" in " ".join(commands.commands("run")[0])
 
 
-def test_a_job_that_needs_docker_gets_the_socket(roots):
+def test_a_job_that_needs_docker_gets_the_socket_and_its_group(roots, tmp_path):
     """Per-job opt-in (#7): a triage run gets the socket for its testcontainers
-    suite without flipping the runner-wide default."""
+    suite without flipping the runner-wide default. The group flag is #26: the
+    socket is root:docker mode 660 and the agent user is uid 1000, so a mount
+    without the group is present but unusable."""
+    import os
+
+    socket = tmp_path / "docker.sock"
+    socket.write_text("")
     commands = FakeCommands()
     spec = JobSpec(prompt="triage", needs_docker=True)
-    make_runner(roots, commands, spec=spec, with_docker=False).start(make_run())
-    assert "/var/run/docker.sock" in " ".join(commands.commands("run")[0])
+    make_runner(
+        roots, commands, spec=spec, with_docker=False, docker_socket=str(socket)
+    ).start(make_run())
+
+    argv = commands.commands("run")[0]
+    assert f"{socket}:{socket}" in argv
+    gid = argv[argv.index("--group-add") + 1]
+    assert gid == str(os.stat(socket).st_gid)
+
+
+def test_a_missing_socket_skips_the_group_but_keeps_the_mount(roots, tmp_path):
+    """A daemon that is down should fail as "docker run failed", not as a
+    stat crash inside the orchestrator."""
+    commands = FakeCommands()
+    spec = JobSpec(prompt="triage", needs_docker=True)
+    make_runner(
+        roots,
+        commands,
+        spec=spec,
+        docker_socket=str(tmp_path / "nope.sock"),
+    ).start(make_run())
+
+    argv = commands.commands("run")[0]
+    assert "--group-add" not in argv
+    assert any("nope.sock" in a for a in argv)
 
 
 def test_a_failed_docker_run_cleans_up_and_raises(roots):
