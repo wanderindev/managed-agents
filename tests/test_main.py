@@ -53,3 +53,18 @@ def test_a_signal_asks_for_a_clean_stop_rather_than_killing_a_tick(monkeypatch):
     main_module.main()
 
     assert stops == [False, True]
+
+
+def test_an_unconfigured_github_app_warns_rather_than_stopping_the_loop(
+    monkeypatch, caplog
+):
+    """Kinds that never touch GitHub must still run."""
+    from orchestrator import github
+
+    def boom():
+        raise github.GitHubAppError("ORCHESTRATOR_GITHUB_APP_ID is not set")
+
+    monkeypatch.setattr(main_module.github, "from_config", boom)
+    with caplog.at_level("WARNING", logger="orchestrator.main"):
+        assert main_module._github_token() is None
+    assert "github jobs will fail" in caplog.text

@@ -220,6 +220,70 @@ The GitHub integration is installed, which means a commit message containing
 merges**. #7 should put the short id in every commit it writes. The orchestrator
 therefore never needs write access to Sentry: resolution is a side effect of a
 human merging, which is exactly where the decision belongs.
+## GitHub App (#11)
+
+A GitHub App, not a personal access token. Per job the orchestrator mints an
+**installation token**: one hour, scoped to the two installed repos, limited to
+the two permissions granted. A PAT would carry the whole account and never
+expire; a Claude connector would not help at all, because `git clone` and
+`git push` need a credential in the git transport rather than an API tool.
+
+### Creating it, by hand
+
+There is no API for creating an App, so this part is a browser job.
+
+1. github.com/settings/apps → **New GitHub App**.
+2. Name it something recognisable in a PR author line, e.g. `wanderindev-agents`.
+   Homepage URL can be the repo. Uncheck **Webhook → Active**; nothing listens.
+3. Repository permissions, and nothing else:
+   - **Contents: Read and write** (push a branch)
+   - **Pull requests: Read and write** (open and update a PR)
+4. Create, then **Generate a private key**. A `.pem` downloads once.
+5. **Install App** → *Only select repositories* → `feliu-dev` and
+   `panama-in-context`. Not "All repositories".
+
+### Putting it on the droplet
+
+The key goes in a file rather than an environment variable: it is multi-line, and
+a file can be `chmod 600` while an env var is readable by anything that can see
+`/proc` for the process.
+
+```bash
+ssh root@159.223.174.185 'install -d -o wanderindev -g wanderindev -m 700 /srv/secrets'
+scp your-app.private-key.pem wanderindev@159.223.174.185:/srv/secrets/github-app.pem
+ssh wanderindev@159.223.174.185 'chmod 600 /srv/secrets/github-app.pem'
+```
+
+Then add the App id to `/srv/orchestrator.env`:
+
+```
+ORCHESTRATOR_GITHUB_APP_ID=<from the App settings page>
+```
+
+### Finding the installation id, and checking the blast radius
+
+```bash
+python -m orchestrator.github
+```
+
+Prints every installation with its id and whether it is scoped to `selected` or
+`all` repositories. Add the id as `ORCHESTRATOR_GITHUB_APP_INSTALLATION_ID` and
+run it again: it then lists the repositories the App can actually reach and
+**warns if that is more than the intended two**. Installing on "all repositories"
+is one careless click during setup and it would hand every sandbox far more reach
+than this is meant to give.
+
+### How the token reaches the work
+
+`JobSpec.needs_github` is opt-in, so a job with no business pushing never
+receives a credential at all. When set, the runner mints a token at container
+launch (so the sandbox gets the full hour, not the remains of an earlier one) and
+injects it as `GH_TOKEN`.
+
+Inside the container the entrypoint configures a git credential helper that reads
+`GH_TOKEN` from the environment, rather than writing it into a remote URL. That
+matters because a worktree with commits is kept after the run, and a token baked
+into `.git/config` would outlive the container that was supposed to contain it.
 
 ## Log database
 

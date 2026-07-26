@@ -51,6 +51,10 @@ class JobSpec:
     branch: str = ""
     env: dict[str, str] = field(default_factory=dict)
     model: str | None = None
+    #: Whether this job needs to talk to GitHub. When set, the runner mints a
+    #: fresh installation token (#11) and injects it as GH_TOKEN. Opt-in, so a
+    #: job that has no business pushing never receives a credential at all.
+    needs_github: bool = False
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess]
@@ -77,6 +81,7 @@ class DockerRunner:
         docker_bin: str = "docker",
         git_bin: str = "git",
         run_command: CommandRunner = _run_command,
+        github_token: Callable[[], str] | None = None,
     ) -> None:
         self.job_spec = job_spec
         self.image = image or config.SANDBOX_IMAGE
@@ -97,6 +102,7 @@ class DockerRunner:
         self.docker_bin = docker_bin
         self.git_bin = git_bin
         self._run = run_command
+        self._github_token = github_token
 
     # --- naming --------------------------------------------------------------
 
@@ -216,6 +222,15 @@ class DockerRunner:
             argv += ["--env", f"AGENT_MODEL={spec.model}"]
         for key, value in spec.env.items():
             argv += ["--env", f"{key}={value}"]
+        if spec.needs_github:
+            if self._github_token is None:
+                raise RuntimeError(
+                    f"run {run.id} needs GitHub but no App is configured; "
+                    "see docs/runbook.md"
+                )
+            # Minted here, at launch, so the sandbox gets the full hour rather
+            # than the remains of a token minted at planning time.
+            argv += ["--env", f"GH_TOKEN={self._github_token()}"]
         if self.with_docker:
             argv += ["--volume", "/var/run/docker.sock:/var/run/docker.sock"]
         argv.append(self.image)

@@ -10,7 +10,7 @@ import signal
 import sys
 from types import FrameType
 
-from orchestrator import jobs
+from orchestrator import github, jobs
 from orchestrator.loop import Orchestrator
 from orchestrator.sandbox import DockerRunner
 
@@ -30,6 +30,21 @@ def _request_stop(signum: int, _frame: FrameType | None) -> None:
     _stopping = True
 
 
+def _github_token():
+    """A callable that mints an installation token, or None if unconfigured.
+
+    Absent rather than fatal: the loop runs perfectly well for kinds that never
+    touch GitHub, and a job that does need it fails loudly at launch with a
+    message pointing at the runbook.
+    """
+    try:
+        auth = github.from_config()
+    except github.GitHubAppError as exc:
+        logger.warning("GitHub App not configured (%s); github jobs will fail", exc)
+        return None
+    return auth.installation_token
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -38,7 +53,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _request_stop)
     signal.signal(signal.SIGINT, _request_stop)
 
-    runner = DockerRunner(jobs.build_spec)
+    runner = DockerRunner(jobs.build_spec, github_token=_github_token())
     orchestrator = Orchestrator(runner)
     logger.info(
         "orchestrator %s starting: image=%s max_concurrent=%s tick=%ss",

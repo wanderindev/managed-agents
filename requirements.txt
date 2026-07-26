@@ -1,3 +1,7 @@
 # Runtime dependencies for the orchestrator. Kept deliberately short: this
 # process has to stay small enough to be obviously correct.
 psycopg[binary]>=3.2,<4
+
+# GitHub App auth (#11) needs RS256, which means a real crypto backend. Signing
+# a JWT by hand is a bad idea in security-adjacent code.
+PyJWT[crypto]>=2.8

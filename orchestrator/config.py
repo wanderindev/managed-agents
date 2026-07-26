@@ -94,3 +94,28 @@ SENTRY_COOLDOWN_DAYS = int(os.environ.get("ORCHESTRATOR_SENTRY_COOLDOWN_DAYS", "
 #: invisible to the poll, however real it is, so this is a scope decision rather
 #: than a tuning knob.
 SENTRY_STATS_PERIOD = os.environ.get("ORCHESTRATOR_SENTRY_STATS_PERIOD", "14d")
+
+# --- github app (#11) --------------------------------------------------------
+
+#: Numeric App ID from the App's settings page.
+GITHUB_APP_ID = os.environ.get("ORCHESTRATOR_GITHUB_APP_ID", "")
+
+#: PEM private key, on disk rather than in the environment: it is multi-line, and
+#: a file can be chmod 600 while an env var is visible to anything that can read
+#: /proc for the process.
+GITHUB_APP_PRIVATE_KEY_PATH = os.environ.get(
+    "ORCHESTRATOR_GITHUB_APP_PRIVATE_KEY_PATH", "/srv/secrets/github-app.pem"
+)
+
+#: Which installation to mint tokens for. Discover it with
+#: `python -m orchestrator.github`.
+GITHUB_APP_INSTALLATION_ID = int(
+    os.environ.get("ORCHESTRATOR_GITHUB_APP_INSTALLATION_ID", "0")
+)
+
+#: What the App is supposed to be able to reach. Used only to warn when setup
+#: granted more than intended; nothing enforces it here, GitHub does.
+GITHUB_EXPECTED_REPOS = (
+    "wanderindev/feliu-dev",
+    "wanderindev/panama-in-context",
+)

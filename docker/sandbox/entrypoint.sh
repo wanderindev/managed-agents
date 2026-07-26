@@ -20,6 +20,20 @@ if [ ! -f "${HOME}/.claude.json" ]; then
     printf '{"hasCompletedOnboarding":true}\n' > "${HOME}/.claude.json"
 fi
 
+# GitHub App installation token (#11), when the job was given one. The token is
+# read from the environment by a credential helper rather than written into a
+# remote URL, so it never lands in .git/config on a worktree that outlives the
+# container. `gh` picks up GH_TOKEN by itself.
+if [ -n "${GH_TOKEN:-}" ]; then
+    git config --global credential.helper \
+        '!f() { echo "username=x-access-token"; echo "password=${GH_TOKEN}"; }; f'
+    # Commits are authored by the App, which is what lets #10 tell its own pull
+    # requests apart from a human's and refuse to touch the latter.
+    git config --global user.name "${GIT_AUTHOR_NAME:-managed-agents[bot]}"
+    git config --global user.email \
+        "${GIT_AUTHOR_EMAIL:-managed-agents[bot]@users.noreply.github.com}"
+fi
+
 PROMPT="${1:-${AGENT_PROMPT:-}}"
 if [ -z "$PROMPT" ] && [ -f /work/prompt.txt ]; then
     PROMPT="$(cat /work/prompt.txt)"
