@@ -160,8 +160,10 @@ def _body(cand: _Candidate, result: dict, gate: dict) -> str:
     pr_url = gate.get("pr_url") or result.get("pr_url") or payload.get("pr_url")
     lines = [
         f"Repository:  {payload.get('repo', '?')}",
-        f"Sentry:      {payload.get('short_id', cand.subject)}"
-        f"  ({payload.get('title', '')})",
+        (
+            f"Sentry:      {payload.get('short_id', cand.subject)}"
+            f"  ({payload.get('title', '')})"
+        ),
         f"Permalink:   {payload.get('permalink', '?')}",
         f"Pull request: {pr_url or '(no pull request)'}",
         "",
@@ -183,16 +185,20 @@ def _body(cand: _Candidate, result: dict, gate: dict) -> str:
     if result.get("test"):
         lines += [f"Covered by: {result['test']}", ""]
     lines += [
-        f"(run {cand.run_id}, kind {cand.kind}, status {cand.status}."
-        " Full history: agent_events in the orchestrator database.)",
+        (
+            f"(run {cand.run_id}, kind {cand.kind}, status {cand.status}."
+            " Full history: agent_events in the orchestrator database.)"
+        ),
     ]
     return "\n".join(lines)
 
 
 def _digest_body(remaining: list[tuple[_Candidate, str]]) -> str:
     lines = [
-        f"The daily email cap ({config.NOTIFY_DAILY_CAP}) is reached."
-        f" {len(remaining)} more run(s) need attention:",
+        (
+            f"The daily email cap ({config.NOTIFY_DAILY_CAP}) is reached."
+            f" {len(remaining)} more run(s) need attention:"
+        ),
         "",
     ]
     for cand, headline in remaining:
@@ -282,8 +288,9 @@ def pass_once(
     if overflow:
         digest = Email(
             to=to,
-            subject=f"[managed-agents] digest: {len(overflow)} more run(s)"
-            " need attention",
+            subject=(
+                f"[managed-agents] digest: {len(overflow)} more run(s) need attention"
+            ),
             body=_digest_body(overflow),
         )
         try:
