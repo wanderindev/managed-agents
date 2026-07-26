@@ -103,6 +103,15 @@ def test_the_docker_socket_is_opt_in(roots):
     assert "/var/run/docker.sock" in " ".join(commands.commands("run")[0])
 
 
+def test_a_job_that_needs_docker_gets_the_socket(roots):
+    """Per-job opt-in (#7): a triage run gets the socket for its testcontainers
+    suite without flipping the runner-wide default."""
+    commands = FakeCommands()
+    spec = JobSpec(prompt="triage", needs_docker=True)
+    make_runner(roots, commands, spec=spec, with_docker=False).start(make_run())
+    assert "/var/run/docker.sock" in " ".join(commands.commands("run")[0])
+
+
 def test_a_failed_docker_run_cleans_up_and_raises(roots):
     commands = FakeCommands({("run",): (125, "", "port is already allocated")})
     runner = make_runner(roots, commands)

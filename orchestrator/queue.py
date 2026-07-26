@@ -15,8 +15,15 @@ from orchestrator.enums import TERMINAL_STATUSES, RunStatus
 #: Statuses where a sandbox is supposed to exist.
 ACTIVE_STATUSES = (RunStatus.LEASED.value, RunStatus.RUNNING.value)
 
+#: The scalar subquery pulls the opening ``run_queued`` payload along with the
+#: row. That payload is the job's input (#6 writes it, #7 reads it), and having
+#: it on the Run is what lets a spec builder work from the Run alone — the
+#: runner layer stays free of database access.
 _COLUMNS = (
-    "id, kind, subject, status, attempts, worker_id, lease_expires_at, not_before"
+    "id, kind, subject, status, attempts, worker_id, lease_expires_at, not_before,"
+    " (SELECT e.payload FROM agent_events e"
+    "   WHERE e.run_id = agent_runs.id AND e.type = 'run_queued'"
+    "   ORDER BY e.seq LIMIT 1) AS payload"
 )
 
 
@@ -32,6 +39,9 @@ class Run:
     #: NOT NULL in the schema; optional here only so hand-built Runs in tests
     #: need not care. Rows read from the database always carry a value.
     not_before: datetime | None = None
+    #: The ``run_queued`` event's payload: what the work source knew when it
+    #: enqueued this. None only for hand-built Runs in tests.
+    payload: dict | None = None
 
     def lease_expired(self, now: datetime) -> bool:
         """A missing lease counts as expired: it means nobody is holding this."""
@@ -48,6 +58,7 @@ def _to_run(row: dict) -> Run:
         worker_id=row["worker_id"],
         lease_expires_at=row["lease_expires_at"],
         not_before=row["not_before"],
+        payload=row["payload"],
     )
 
 

@@ -170,6 +170,17 @@ class SentryClient:
         self.base_url = base_url.rstrip("/")
         self._open = opener
 
+    def _get(self, url: str) -> dict | list:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+            },
+        )
+        with self._open(request, timeout=30) as response:
+            return json.loads(response.read().decode())
+
     def unresolved_issues(
         self, project: str, limit: int = 25, stats_period: str = "14d"
     ) -> list[SentryIssue]:
@@ -190,17 +201,22 @@ class SentryClient:
                 "limit": limit,
             }
         )
-        url = f"{self.base_url}/api/0/organizations/{self.org}/issues/?{params}"
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-            },
+        payload = self._get(
+            f"{self.base_url}/api/0/organizations/{self.org}/issues/?{params}"
         )
-        with self._open(request, timeout=30) as response:
-            payload = json.loads(response.read().decode())
         return [_to_issue(raw) for raw in payload]
+
+    def latest_event(self, issue_id: str) -> dict:
+        """The issue's most recent event: stack trace, breadcrumbs, tags.
+
+        Fetched by the orchestrator at spec-build time (#7) and embedded in the
+        prompt, so the Sentry token never has to enter a sandbox and the prompt
+        stays a durable, self-contained record of what the agent was told.
+        """
+        return self._get(
+            f"{self.base_url}/api/0/organizations/{self.org}"
+            f"/issues/{issue_id}/events/latest/"
+        )
 
 
 def _to_issue(raw: dict) -> SentryIssue:
@@ -316,6 +332,79 @@ def _payload(issue: SentryIssue) -> dict:
         "last_seen": issue.last_seen,
         "permalink": issue.permalink,
     }
+
+
+#: Caps for format_event_detail. The point is the app frames and the last few
+#: breadcrumbs; a full event can run to hundreds of KB of minified-JS frames
+#: that would bury the signal and bloat the prompt.
+_MAX_FRAMES = 12
+_MAX_BREADCRUMBS = 15
+
+
+def format_event_detail(event: dict) -> str:
+    """Compress a Sentry event into the prompt-sized facts an agent starts from.
+
+    Defensive on every access: event payloads vary wildly by SDK and platform,
+    and a malformed one must degrade to "(no event detail available)" rather
+    than fail the launch.
+    """
+    sections: list[str] = []
+    for entry in event.get("entries") or []:
+        kind = entry.get("type")
+        data = entry.get("data") or {}
+        if kind == "exception":
+            for value in data.get("values") or []:
+                sections.append(_format_exception(value))
+        elif kind == "message":
+            formatted = data.get("formatted")
+            if formatted:
+                sections.append(f"## Message\n  {str(formatted)[:500]}")
+        elif kind == "breadcrumbs":
+            crumbs = _format_breadcrumbs(data.get("values") or [])
+            if crumbs:
+                sections.append(crumbs)
+        elif kind == "request" and data.get("url"):
+            method = data.get("method") or ""
+            sections.append(f"## Request\n  {method} {data['url']}".rstrip())
+    tags = event.get("tags") or []
+    if tags:
+        lines = [f"  {t.get('key')}: {t.get('value')}" for t in tags]
+        sections.append("## Tags\n" + "\n".join(lines))
+    return "\n\n".join(s for s in sections if s) or "(no event detail available)"
+
+
+def _format_exception(value: dict) -> str:
+    lines = [f"{value.get('type') or 'Error'}: {value.get('value') or ''}".rstrip()]
+    frames = (value.get("stacktrace") or {}).get("frames") or []
+    # In-app frames are the ones an agent can act on; vendored/minified frames
+    # only matter when there is nothing else.
+    app_frames = [f for f in frames if f.get("inApp")] or frames
+    for frame in app_frames[-_MAX_FRAMES:]:
+        lines.append(
+            f"  {frame.get('filename')}:{frame.get('lineNo')}"
+            f" in {frame.get('function')}"
+        )
+        for pair in frame.get("context") or []:
+            if (
+                isinstance(pair, (list, tuple))
+                and len(pair) == 2
+                and pair[0] == frame.get("lineNo")
+            ):
+                lines.append(f"    > {str(pair[1]).strip()}")
+    return "## Exception (innermost frames last)\n" + "\n".join(lines)
+
+
+def _format_breadcrumbs(crumbs: list[dict]) -> str:
+    lines = []
+    for crumb in crumbs[-_MAX_BREADCRUMBS:]:
+        message = crumb.get("message") or crumb.get("data") or ""
+        lines.append(
+            f"  [{crumb.get('level') or 'info'}]"
+            f" {crumb.get('category') or ''}: {str(message)[:200]}"
+        )
+    if not lines:
+        return ""
+    return "## Breadcrumbs (most recent last)\n" + "\n".join(lines)
 
 
 def _report(report: PollReport) -> None:
