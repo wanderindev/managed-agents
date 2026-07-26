@@ -55,3 +55,7 @@ class EventType(StrEnum):
     RUN_ABANDONED = "run_abandoned"
     RUN_FAILED = "run_failed"
     RUN_DONE = "run_done"
+    #: Narrative marker (#9): this run's outcome has been emailed (or the
+    #: payload says why it deliberately was not). One per run, ever — it is
+    #: what makes the notifier idempotent.
+    EMAIL_SENT = "email_sent"

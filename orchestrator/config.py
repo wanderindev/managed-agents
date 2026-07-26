@@ -107,6 +107,30 @@ SENTRY_COOLDOWN_DAYS = int(os.environ.get("ORCHESTRATOR_SENTRY_COOLDOWN_DAYS", "
 #: than a tuning knob.
 SENTRY_STATS_PERIOD = os.environ.get("ORCHESTRATOR_SENTRY_STATS_PERIOD", "14d")
 
+# --- outcome email (#9) ------------------------------------------------------
+
+#: Where outcome emails go. Empty disables the notifier entirely (with one
+#: warning), which is the right dev default: a test loop must not email anyone.
+NOTIFY_TO = os.environ.get("ORCHESTRATOR_NOTIFY_TO", "")
+
+#: The From address. Must be a sender the SMTP relay accepts for its domain.
+NOTIFY_FROM = os.environ.get("ORCHESTRATOR_NOTIFY_FROM", "")
+
+#: Same transport PIC's email_sender.py uses: Google Workspace SMTP relay,
+#: STARTTLS, no auth — the relay trusts allowlisted droplet IPs. Reused per #9
+#: rather than adding a provider; the agents droplet's IP must be in the
+#: Workspace admin allowlist or the relay refuses.
+NOTIFY_SMTP_HOST = os.environ.get(
+    "ORCHESTRATOR_NOTIFY_SMTP_HOST", "smtp-relay.gmail.com"
+)
+NOTIFY_SMTP_PORT = int(os.environ.get("ORCHESTRATOR_NOTIFY_SMTP_PORT", "587"))
+NOTIFY_SMTP_TIMEOUT = int(os.environ.get("ORCHESTRATOR_NOTIFY_SMTP_TIMEOUT", "10"))
+
+#: Individual emails per day before the notifier switches to a single digest.
+#: Digest, not firehose — and the digest means the cap never suppresses
+#: silently.
+NOTIFY_DAILY_CAP = int(os.environ.get("ORCHESTRATOR_NOTIFY_DAILY_CAP", "10"))
+
 # --- github app (#11) --------------------------------------------------------
 
 #: Numeric App ID from the App's settings page.
