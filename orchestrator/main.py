@@ -54,7 +54,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _request_stop)
 
     runner = DockerRunner(jobs.build_spec, github_token=_github_token())
-    orchestrator = Orchestrator(runner)
+    orchestrator = Orchestrator(runner, followups=jobs.followups)
     logger.info(
         "orchestrator %s starting: image=%s max_concurrent=%s tick=%ss",
         orchestrator.worker_id,
