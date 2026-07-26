@@ -87,6 +87,7 @@ class Orchestrator:
         backoff_base_seconds: int | None = None,
         backoff_ceiling_seconds: int | None = None,
         jitter: Callable[[], float] = random.random,
+        followups: Callable[[Run, dict[str, Any] | None], Any] | None = None,
     ) -> None:
         self.runner = runner
         self.worker_id = worker_id or config.WORKER_ID
@@ -113,6 +114,10 @@ class Orchestrator:
             else backoff_ceiling_seconds
         )
         self.jitter = jitter
+        #: Called after a run completes successfully to decide what happens
+        #: next (jobs.followups is the production one). The loop applies the
+        #: decision but knows nothing about what any kind of run means.
+        self.followups = followups
 
     # --- one tick ------------------------------------------------------------
 
@@ -209,6 +214,54 @@ class Orchestrator:
         logger.info(
             "run %s finished: %s (exit %s)", run.id, sandbox.outcome, sandbox.exit_code
         )
+        if succeeded:
+            self._apply_followups(conn, run, sandbox.result)
+
+    def _apply_followups(
+        self, conn: psycopg.Connection, run: Run, job_result: dict[str, Any] | None
+    ) -> None:
+        """Apply the chain decision for a completed run.
+
+        Guarded: the run's own completion is already committed, so a follow-up
+        failure must not fail the tick — but it does stall the chain, so it is
+        logged at exception level where an operator will see it.
+        """
+        if self.followups is None:
+            return
+        try:
+            decision = self.followups(run, job_result)
+            for new_run in decision.enqueue:
+                try:
+                    with conn.transaction():
+                        created = log.create_run(
+                            conn, new_run.kind, new_run.subject, new_run.payload
+                        )
+                    logger.info(
+                        "run %s chained: %s %s -> run %s",
+                        run.id,
+                        new_run.kind,
+                        new_run.subject,
+                        created,
+                    )
+                except psycopg.errors.UniqueViolation:
+                    # An open run for this (kind, subject) already exists. The
+                    # partial unique index is doing its job; nothing to do.
+                    logger.info(
+                        "run %s: %s %s already open, not chaining",
+                        run.id,
+                        new_run.kind,
+                        new_run.subject,
+                    )
+            if decision.human_gate is not None:
+                with conn.transaction():
+                    log.append(conn, run.id, EventType.HUMAN_GATE, decision.human_gate)
+                logger.info(
+                    "run %s parked for a human: %s",
+                    run.id,
+                    decision.human_gate.get("why"),
+                )
+        except Exception:
+            logger.exception("run %s: follow-up failed; the chain is stalled", run.id)
 
     def _drain(
         self, conn: psycopg.Connection, run: Run, events: list[dict[str, Any]]

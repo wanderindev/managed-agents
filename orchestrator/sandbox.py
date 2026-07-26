@@ -63,6 +63,11 @@ class JobSpec:
     #: with the socket mounted the container stops being a security boundary,
     #: so only a job that runs a suite should carry that reach.
     needs_docker: bool = False
+    #: Check out the existing ``branch`` instead of resetting it (#8). A fix
+    #: run creates its branch fresh off HEAD; the review and revision runs that
+    #: follow must see the fixer's commits, and the default ``-B`` would reset
+    #: the branch to HEAD and silently erase them.
+    reuse_branch: bool = False
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess]
@@ -182,7 +187,11 @@ class DockerRunner:
 
         outcome = Outcome.SUCCEEDED if exit_code == 0 else Outcome.FAILED
         self._run([self.docker_bin, "rm", "-f", handle])
-        self._cleanup(run, keep_workspace=self._workspace_has_work(run))
+        # The workspace always goes. Committed work lives on the branch ref in
+        # the parent repo and pushed work on origin, so removal loses nothing —
+        # while a kept worktree pins its branch as "checked out" and blocks the
+        # review/revision runs (#8) that need to check it out next.
+        self._cleanup(run, keep_workspace=False)
 
         return SandboxResult(
             outcome=outcome,
@@ -317,11 +326,30 @@ class DockerRunner:
 
         branch = spec.branch or f"agent/run-{run.id}"
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Clear any stale registrations first (a crashed cleanup leaves a
+        # missing-but-registered worktree, and `worktree add` refuses over one).
+        self._run([self.git_bin, "-C", str(repo), "worktree", "prune"])
         # A worktree rather than a clone: same object store, so this is cheap even
         # for a large repo, and concurrent jobs cannot collide on a branch.
-        result = self._run(
-            [self.git_bin, "-C", str(repo), "worktree", "add", "-B", branch, str(path)]
-        )
+        #
+        # -B creates-or-resets the branch at HEAD, which is right for a fresh fix
+        # and catastrophic for a review or revision (#8): those must see the
+        # fixer's commits, so reuse_branch checks the existing branch out as-is
+        # and fails loudly if it does not exist.
+        if spec.reuse_branch:
+            argv = [self.git_bin, "-C", str(repo), "worktree", "add", str(path), branch]
+        else:
+            argv = [
+                self.git_bin,
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-B",
+                branch,
+                str(path),
+            ]
+        result = self._run(argv)
         if result.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {result.stderr.strip()}")
         return path
@@ -345,43 +373,44 @@ class DockerRunner:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def _workspace_has_work(self, run: Run) -> bool:
-        """Whether the worktree holds commits worth keeping.
-
-        A job that produced nothing leaves nothing behind. One that committed
-        keeps its worktree, because #7 still has to push that branch.
-        """
-        path = self.workspace_path(run)
-        if not (path / ".git").exists():
-            return False
-        result = self._run(
-            [self.git_bin, "-C", str(path), "status", "--porcelain", "--branch"]
-        )
-        if result.returncode != 0:
-            return True  # cannot tell; keeping it is the safe direction
-        return "[ahead " in result.stdout or any(
-            line and not line.startswith("##") for line in result.stdout.splitlines()
-        )
-
     def _cleanup(self, run: Run, *, keep_workspace: bool) -> None:
         self._remove_paths(self.job_path(run))
         if not keep_workspace:
             workspace = self.workspace_path(run)
-            if (workspace / ".git").exists():
-                # Let git forget the worktree too, or the parent repo accumulates
-                # stale administrative entries that break later `worktree add`.
+            repo = self._parent_repo(workspace)
+            if repo is not None:
+                # Deregister from the parent repo, or the branch stays pinned
+                # as "checked out" and later runs cannot check it out. Run 3
+                # taught the sharp edge here: `git -C <worktree> worktree
+                # remove .` refuses to remove the worktree it is standing in,
+                # so the command must run from the parent repo.
                 self._run(
                     [
                         self.git_bin,
                         "-C",
-                        str(workspace),
+                        str(repo),
                         "worktree",
                         "remove",
                         "--force",
-                        ".",
+                        str(workspace),
                     ]
                 )
             self._remove_paths(workspace)
+
+    def _parent_repo(self, workspace: Path) -> Path | None:
+        """The clone a worktree belongs to, read from its .git link file.
+
+        The link says ``gitdir: <repo>/.git/worktrees/<name>``; three parents
+        up is the repo. Read from disk rather than remembered, because finish()
+        can run in a different process than start().
+        """
+        gitfile = workspace / ".git"
+        if not gitfile.is_file():
+            return None
+        gitdir = gitfile.read_text().partition("gitdir:")[2].strip()
+        if not gitdir:
+            return None
+        return Path(gitdir).parents[2]
 
     @staticmethod
     def _remove_paths(*paths: Path) -> None:
