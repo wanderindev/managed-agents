@@ -72,3 +72,25 @@ SANDBOX_WITH_DOCKER = os.environ.get("ORCHESTRATOR_SANDBOX_WITH_DOCKER", "0") ==
 #: Ceiling on one event's payload. One runaway tool result must not be able to
 #: bloat the log, and nothing downstream reads a 2MB payload usefully anyway.
 MAX_PAYLOAD_BYTES = int(os.environ.get("ORCHESTRATOR_MAX_PAYLOAD_BYTES", "16384"))
+
+# --- sentry work source (#6) -------------------------------------------------
+
+#: A Sentry auth token with event:read and org:read. Created by hand in the
+#: Sentry UI; there is no API for minting one.
+SENTRY_TOKEN = os.environ.get("ORCHESTRATOR_SENTRY_TOKEN", "")
+SENTRY_ORG = os.environ.get("ORCHESTRATOR_SENTRY_ORG", "javier-feliu")
+
+#: Region URL, not sentry.io. The org lives in the US region and the API rejects
+#: a request sent to the wrong one.
+SENTRY_BASE_URL = os.environ.get("ORCHESTRATOR_SENTRY_BASE_URL", "https://us.sentry.io")
+
+#: 1, not 2: these are low-traffic personal sites where a single occurrence
+#: is already signal. See Filters.min_events.
+SENTRY_MIN_EVENTS = int(os.environ.get("ORCHESTRATOR_SENTRY_MIN_EVENTS", "1"))
+SENTRY_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_SENTRY_MAX_PER_POLL", "5"))
+SENTRY_COOLDOWN_DAYS = int(os.environ.get("ORCHESTRATOR_SENTRY_COOLDOWN_DAYS", "7"))
+
+#: Lookback for the issue query. An issue whose last event is older than this is
+#: invisible to the poll, however real it is, so this is a scope decision rather
+#: than a tuning knob.
+SENTRY_STATS_PERIOD = os.environ.get("ORCHESTRATOR_SENTRY_STATS_PERIOD", "14d")
