@@ -117,3 +117,12 @@ def test_extend_lease_will_not_resurrect_a_terminal_run(conn):
 def test_get_run_raises_for_an_unknown_id(conn):
     with pytest.raises(LookupError):
         get_run(conn, 999_999)
+
+
+def test_runs_carry_their_opening_payload(conn):
+    """#7's spec builder works from the Run alone, so the run_queued payload
+    rides along on every queue read rather than needing a second lookup."""
+    run_id = create_run(conn, "sentry_triage", "sentry:P-1", {"repo": "feliu-dev"})
+    assert get_run(conn, run_id).payload == {"repo": "feliu-dev"}
+    claimed = claim_next_queued(conn)
+    assert claimed is not None and claimed.payload == {"repo": "feliu-dev"}

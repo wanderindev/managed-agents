@@ -55,6 +55,11 @@ class JobSpec:
     #: fresh installation token (#11) and injects it as GH_TOKEN. Opt-in, so a
     #: job that has no business pushing never receives a credential at all.
     needs_github: bool = False
+    #: Whether this job needs the host's Docker daemon (both repos' test suites
+    #: spawn testcontainers). Per-job and opt-in for the same reason as GitHub:
+    #: with the socket mounted the container stops being a security boundary,
+    #: so only a job that runs a suite should carry that reach.
+    needs_docker: bool = False
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess]
@@ -231,7 +236,7 @@ class DockerRunner:
             # Minted here, at launch, so the sandbox gets the full hour rather
             # than the remains of a token minted at planning time.
             argv += ["--env", f"GH_TOKEN={self._github_token()}"]
-        if self.with_docker:
+        if spec.needs_docker or self.with_docker:
             argv += ["--volume", "/var/run/docker.sock:/var/run/docker.sock"]
         argv.append(self.image)
         return argv
