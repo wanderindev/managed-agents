@@ -363,10 +363,9 @@ def format_event_detail(event: dict) -> str:
             crumbs = _format_breadcrumbs(data.get("values") or [])
             if crumbs:
                 sections.append(crumbs)
-        elif kind == "request":
-            if data.get("url"):
-                method = data.get("method") or ""
-                sections.append(f"## Request\n  {method} {data['url']}".rstrip())
+        elif kind == "request" and data.get("url"):
+            method = data.get("method") or ""
+            sections.append(f"## Request\n  {method} {data['url']}".rstrip())
     tags = event.get("tags") or []
     if tags:
         lines = [f"  {t.get('key')}: {t.get('value')}" for t in tags]
