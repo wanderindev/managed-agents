@@ -161,6 +161,65 @@ The prompt lives outside the repo on purpose, so a job cannot commit its own
 instructions. A workspace with no commits is deleted when the run finishes; one
 with commits is kept, because #7 still has to push that branch.
 
+## Sentry work source
+
+```bash
+python -m orchestrator.poll            # fetch, filter, enqueue
+python -m orchestrator.poll --dry-run  # same, but enqueue nothing
+```
+
+A separate command from the loop rather than a step inside a tick, so scheduling
+is the operating system's job and there is no "when did I last poll" state to
+keep anywhere. Hourly is the intended cadence. Running it twice by accident is
+harmless: the dedup and the unique index both hold.
+
+### The token is a manual step
+
+Create a Sentry auth token by hand (there is no API for minting one) with
+**`event:read`** and **`org:read`**, and add it to `/srv/orchestrator.env`:
+
+```
+ORCHESTRATOR_SENTRY_TOKEN=...
+```
+
+The org is `javier-feliu` and it lives in the **US region**, so the base URL is
+`https://us.sentry.io`, not `sentry.io`. Sending to the wrong region fails.
+
+### Which projects, and which are deliberately excluded
+
+| Sentry project | Repo |
+|---|---|
+| `trd-python`, `trd-javascript-react` | `feliu-dev` |
+| `pic-python-fastapi`, `pic-javascript-react` | `panama-in-context` |
+
+`atelier-loyalty-app` and `pic-cert-watcher` are real projects in the same org
+and are deliberately absent: there is no clone of either here, so an agent could
+only ever report that it cannot help.
+
+### Tuning the filters
+
+`--dry-run` prints the same drop tally without enqueuing, which is how a filter
+change gets evaluated before anyone lives with it. Every drop is counted **by
+reason**, because a source that filters silently reads as "nothing was wrong"
+when it actually means "I decided none of this was worth your time".
+
+`min_events` defaults to **1**, not 2. These are low-traffic personal sites, so a
+single occurrence is already signal rather than noise. A floor of 2 was tried
+first and threw away 10 of 25 issues, including `PIC-PYTHON-FASTAPI-1H`, a real
+missing-column error that had happened exactly once. Raise it with
+`ORCHESTRATOR_SENTRY_MIN_EVENTS` if the volume ever justifies it.
+
+At a floor of 1 the ungroupable-issue filter starts earning its keep: an issue
+with no usable title *and* no culprit gives an agent nothing to start from, so
+it is dropped rather than turned into a run that can only conclude the same.
+
+### Closing the loop back to Sentry
+
+The GitHub integration is installed, which means a commit message containing
+`Fixes PIC-PYTHON-FASTAPI-1Q` **resolves that issue automatically when the PR
+merges**. #7 should put the short id in every commit it writes. The orchestrator
+therefore never needs write access to Sentry: resolution is a side effect of a
+human merging, which is exactly where the decision belongs.
 ## GitHub App (#11)
 
 A GitHub App, not a personal access token. Per job the orchestrator mints an

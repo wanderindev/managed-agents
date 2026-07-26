@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 
-from orchestrator.enums import RunStatus
+from orchestrator.enums import TERMINAL_STATUSES, RunStatus
 
 #: Statuses where a sandbox is supposed to exist.
 ACTIVE_STATUSES = (RunStatus.LEASED.value, RunStatus.RUNNING.value)
@@ -119,3 +119,33 @@ def queued_count(conn: psycopg.Connection) -> int:
             (RunStatus.QUEUED.value,),
         )
         return cur.fetchone()["n"]
+
+
+def has_recent_run(
+    conn: psycopg.Connection, kind: str, subject: str, cooldown: timedelta
+) -> bool:
+    """Whether this subject is already queued, running, or recently finished.
+
+    Two questions in one, because a work source needs both and they have the same
+    answer: do not enqueue this. A non-terminal run means it is in flight. A
+    terminal one inside the cooldown means a fix may already be on its way and
+    the errors have not had time to stop.
+
+    The partial unique index on ``(kind, subject)`` is the backstop if this is
+    ever wrong; this exists so the normal path does not rely on catching an
+    integrity error.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM agent_runs"
+            " WHERE kind = %s AND subject = %s"
+            "   AND (status <> ALL(%s) OR updated_at > now() - %s::interval)"
+            " LIMIT 1",
+            (
+                kind,
+                subject,
+                [s.value for s in TERMINAL_STATUSES],
+                f"{int(cooldown.total_seconds())} seconds",
+            ),
+        )
+        return cur.fetchone() is not None

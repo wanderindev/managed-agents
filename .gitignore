@@ -12,3 +12,6 @@ htmlcov/
 # Local-only telemetry, same convention as agent-ready's report skill: store
 # only what GitHub cannot reconstruct.
 events.jsonl
+
+# PyCharm
+.idea/
