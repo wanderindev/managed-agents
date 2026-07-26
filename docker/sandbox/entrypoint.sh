@@ -16,14 +16,20 @@ fi
 # Claude Code will not run non-interactively until onboarding is marked done.
 # Written here rather than mounted, so the host's ~/.claude.json (machine id,
 # feature caches, and every project it has ever opened) never enters a sandbox.
+# /workspace is marked trusted (#31): without it every run's stderr warns
+# "Ignoring N permissions.allow entries ... workspace has not been trusted" and
+# the repo's own .claude/settings.json allow rules would silently not apply if
+# the permission mode were ever tightened past bypassPermissions.
 if [ ! -f "${HOME}/.claude.json" ]; then
-    printf '{"hasCompletedOnboarding":true}\n' > "${HOME}/.claude.json"
+    printf '%s\n' \
+        '{"hasCompletedOnboarding":true,"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' \
+        > "${HOME}/.claude.json"
 fi
 
 # GitHub App installation token (#11), when the job was given one. The token is
 # read from the environment by a credential helper rather than written into a
-# remote URL, so it never lands in .git/config on a worktree that outlives the
-# container. `gh` picks up GH_TOKEN by itself.
+# remote URL, so it never lands in the clone's .git/config, which lives on the
+# host and outlives the container. `gh` picks up GH_TOKEN by itself.
 if [ -n "${GH_TOKEN:-}" ]; then
     git config --global credential.helper \
         '!f() { echo "username=x-access-token"; echo "password=${GH_TOKEN}"; }; f'
@@ -44,7 +50,7 @@ if [ -z "$PROMPT" ]; then
 fi
 
 # bypassPermissions is the right default *here* and nowhere else: the container
-# is disposable, holds one repo worktree, and an interactive approval prompt in
+# is disposable, holds one job's clone, and an interactive approval prompt in
 # an unattended job just deadlocks. Note the honest caveat in docs/runbook.md
 # about what mounting the Docker socket does to that boundary.
 args=(

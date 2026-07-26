@@ -1,6 +1,6 @@
 # Disposable sandbox: one container per run. See issues #2 and #5.
 #
-# Holds the tooling a triage job needs and nothing else. The repo worktree, the
+# Holds the tooling a triage job needs and nothing else. The repo clone, the
 # Claude credential, and any job-scoped secrets are mounted or injected at run
 # time, never baked in.
 FROM node:22-bookworm-slim
@@ -46,7 +46,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
-# uid 1000 matches the host's `wanderindev`, so a bind-mounted worktree stays
+# uid 1000 matches the host's `wanderindev`, so a bind-mounted workspace stays
 # writable without chown dances. The base image ships its own uid-1000 user.
 RUN userdel -r node \
     && useradd --create-home --uid 1000 --shell /bin/bash agent \
