@@ -10,7 +10,7 @@ import signal
 import sys
 from types import FrameType
 
-from orchestrator import github, jobs
+from orchestrator import github, jobs, notify
 from orchestrator.loop import Orchestrator
 from orchestrator.sandbox import DockerRunner
 
@@ -54,7 +54,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, _request_stop)
 
     runner = DockerRunner(jobs.build_spec, github_token=_github_token())
-    orchestrator = Orchestrator(runner, followups=jobs.followups)
+    orchestrator = Orchestrator(
+        runner, followups=jobs.followups, notify=notify.pass_once
+    )
     logger.info(
         "orchestrator %s starting: image=%s max_concurrent=%s tick=%ss",
         orchestrator.worker_id,

@@ -88,6 +88,7 @@ class Orchestrator:
         backoff_ceiling_seconds: int | None = None,
         jitter: Callable[[], float] = random.random,
         followups: Callable[[Run, dict[str, Any] | None], Any] | None = None,
+        notify: Callable[[psycopg.Connection], int] | None = None,
     ) -> None:
         self.runner = runner
         self.worker_id = worker_id or config.WORKER_ID
@@ -118,6 +119,10 @@ class Orchestrator:
         #: next (jobs.followups is the production one). The loop applies the
         #: decision but knows nothing about what any kind of run means.
         self.followups = followups
+        #: Called at the end of every tick (notify.pass_once in production) so
+        #: outcome emails go out promptly. Guarded like followups: a mail
+        #: outage must never cost a tick.
+        self.notify = notify
 
     # --- one tick ------------------------------------------------------------
 
@@ -131,6 +136,11 @@ class Orchestrator:
         result = TickResult()
         self._reconcile(conn, result)
         self._dispatch(conn, result)
+        if self.notify is not None:
+            try:
+                self.notify(conn)
+            except Exception:  # a mail outage must never cost a tick
+                logger.exception("notify pass failed; retrying next tick")
         return result
 
     # --- reconcile -----------------------------------------------------------
