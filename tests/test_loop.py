@@ -31,19 +31,28 @@ def lost_runner():
 
 @pytest.fixture()
 def lost(lost_runner):
+    # Zero backoff so an abandoned run is claimable again in the same tick.
+    # These tests exercise the lease/reconcile machinery; the backoff window
+    # itself (#20) has its own suite in test_backoff.py.
     return Orchestrator(
         lost_runner,
         worker_id=WORKER,
         max_concurrent=1,
         lease_seconds=300,
         max_attempts=3,
+        backoff_base_seconds=0,
     )
 
 
 @pytest.fixture()
 def orchestrator(runner):
     return Orchestrator(
-        runner, worker_id=WORKER, max_concurrent=1, lease_seconds=300, max_attempts=3
+        runner,
+        worker_id=WORKER,
+        max_concurrent=1,
+        lease_seconds=300,
+        max_attempts=3,
+        backoff_base_seconds=0,
     )
 
 
@@ -141,9 +150,10 @@ def test_a_stale_lease_is_freed_and_the_slot_reused_in_one_tick(conn, orchestrat
     result = orchestrator.tick(conn)
 
     assert result.abandoned == [stale]
-    # Requeueing keeps a run's original queue position, so the reclaimed run is
-    # still the oldest and goes first. A run that keeps dying therefore retries
-    # ahead of newer work, which max_attempts bounds.
+    # Requeueing keeps a run's original queue position, so with this fixture's
+    # zero backoff the reclaimed run is still the oldest and goes first. Under a
+    # real backoff window it would yield its turn to newer work instead; see
+    # test_backoff.py.
     assert result.leased == [stale]
 
 
@@ -179,7 +189,11 @@ def test_a_start_failure_stops_dispatch_for_the_tick(conn):
 def test_repeated_start_failures_eventually_give_up(conn):
     runner = FakeRunner(fail_to_start=True)
     orchestrator = Orchestrator(
-        runner, worker_id=WORKER, max_concurrent=1, max_attempts=3
+        runner,
+        worker_id=WORKER,
+        max_concurrent=1,
+        max_attempts=3,
+        backoff_base_seconds=0,
     )
     run_id = create_run(conn, "sentry_triage", "sentry:F-4")
 
@@ -354,7 +368,9 @@ def test_a_restarted_orchestrator_requeues_a_lost_sandbox_exactly_once(
     lost_runner.kill_all()  # the sandbox is lost with the orchestrator
     del first
 
-    reborn = Orchestrator(lost_runner, worker_id=WORKER, max_concurrent=1)
+    reborn = Orchestrator(
+        lost_runner, worker_id=WORKER, max_concurrent=1, backoff_base_seconds=0
+    )
     recovery = reborn.tick(conn)
 
     assert run_id in recovery.abandoned
@@ -374,7 +390,9 @@ def test_a_restarted_orchestrator_requeues_a_lost_sandbox_exactly_once(
 def test_a_run_survives_the_full_kill_and_resume_cycle(conn, lost_runner):
     """The #12 shape, driven entirely by the loop."""
     run_id = create_run(conn, "sentry_triage", "sentry:RESUME-1")
-    orchestrator = Orchestrator(lost_runner, worker_id=WORKER, max_concurrent=1)
+    orchestrator = Orchestrator(
+        lost_runner, worker_id=WORKER, max_concurrent=1, backoff_base_seconds=0
+    )
 
     orchestrator.tick(conn)
     append(conn, run_id, EventType.STAGE_COMPLETED, {"stage": "investigate"})
