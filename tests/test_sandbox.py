@@ -298,24 +298,28 @@ def test_finish_discards_a_workspace_with_nothing_in_it(roots):
     assert not runner.job_path(run).exists()
 
 
-def test_finish_keeps_a_workspace_that_has_commits(roots):
-    """#7 still has to push that branch."""
-    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
-    commands = FakeCommands(
-        {
-            ("inspect",): (0, "0\n", ""),
-            ("logs",): (0, "", ""),
-            ("status",): (0, "## agent/x...origin/main [ahead 1]\n", ""),
-        }
-    )
+def test_finish_removes_the_workspace_even_when_it_has_commits(roots):
+    """Committed work lives on the branch ref in the parent repo, so removal
+    loses nothing — while a kept worktree pins its branch as "checked out" and
+    blocks the review/revision runs (#8) that need it next."""
+    repo = roots["repos_root"] / "feliu-dev"
+    repo.mkdir(parents=True)
+    commands = FakeCommands({("inspect",): (0, "0\n", ""), ("logs",): (0, "", "")})
     runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
     run = make_run()
     runner.start(run)
-    (runner.workspace_path(run) / ".git").mkdir(parents=True, exist_ok=True)
+    workspace = runner.workspace_path(run)
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / ".git").write_text(f"gitdir: {repo}/.git/worktrees/ma-run-1-1\n")
 
     runner.finish(run, "ma-run-1-1")
 
-    assert runner.workspace_path(run).exists()
+    assert not workspace.exists()
+    removal = commands.commands("worktree", "remove")[0]
+    # From the parent repo, not from inside the worktree — git refuses to
+    # remove the worktree it is standing in (run 3 left a stale entry that way).
+    assert removal[removal.index("-C") + 1] == str(repo)
+    assert str(workspace) in removal
 
 
 # --- the default command runner ----------------------------------------------
@@ -358,18 +362,58 @@ def test_an_unreadable_exit_code_is_none_rather_than_a_crash(roots):
 
 def test_a_worktree_is_deregistered_from_its_parent_repo(roots):
     """Otherwise the parent accumulates stale entries that break later adds."""
-    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
-    commands = FakeCommands(
-        {("inspect",): (0, "0\n", ""), ("logs",): (0, "", ""), ("status",): (0, "", "")}
-    )
+    repo = roots["repos_root"] / "feliu-dev"
+    repo.mkdir(parents=True)
+    commands = FakeCommands({("inspect",): (0, "0\n", ""), ("logs",): (0, "", "")})
     runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
     run = make_run()
     runner.start(run)
-    (runner.workspace_path(run) / ".git").mkdir(parents=True, exist_ok=True)
+    workspace = runner.workspace_path(run)
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / ".git").write_text(f"gitdir: {repo}/.git/worktrees/ma-run-1-1\n")
 
     runner.finish(run, "ma-run-1-1")
 
     assert commands.commands("worktree", "remove")
+
+
+def test_stale_registrations_are_pruned_before_a_worktree_is_added(roots):
+    """A crashed cleanup leaves a missing-but-registered worktree, and
+    `worktree add` refuses over one."""
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    commands = FakeCommands()
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
+
+    runner.start(make_run())
+
+    prune = commands.commands("worktree", "prune")
+    add = commands.commands("worktree", "add")
+    assert prune and add
+    assert commands.calls.index(prune[0]) < commands.calls.index(add[0])
+
+
+def test_reuse_branch_checks_out_without_resetting(roots):
+    """-B would reset the branch to HEAD and erase the fixer's commits, which
+    is exactly what a review or revision run (#8) must not do."""
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    commands = FakeCommands()
+    spec = JobSpec(
+        prompt="p", repo="feliu-dev", branch="agent/run-9", reuse_branch=True
+    )
+    make_runner(roots, commands, spec=spec).start(make_run(9))
+
+    add = commands.commands("worktree", "add")[0]
+    assert "-B" not in add
+    assert "agent/run-9" in add
+
+
+def test_a_fresh_branch_still_uses_dash_b(roots):
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    commands = FakeCommands()
+    spec = JobSpec(prompt="p", repo="feliu-dev")
+    make_runner(roots, commands, spec=spec).start(make_run(9))
+
+    assert "-B" in commands.commands("worktree", "add")[0]
 
 
 # --- GitHub token injection (#11) --------------------------------------------
