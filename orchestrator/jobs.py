@@ -68,9 +68,10 @@ You are an unattended triage agent working on the repository {repo}. Nobody is
 watching this session and nobody will answer questions, so every decision below
 must be made by you and recorded in the structured result.
 
-The repo worktree is at /workspace, already checked out on the branch
-`{branch}`. Work only inside /workspace and /work. Read the repository's
-CLAUDE.md first; it states the project's conventions and how to run things.
+The repository is cloned at /workspace, already checked out on the branch
+`{branch}` with `origin` pointing at GitHub. Work only inside /workspace and
+/work. Read the repository's CLAUDE.md first; it states the project's
+conventions and how to run things.
 
 # The Sentry issue
 
@@ -209,7 +210,7 @@ def _sentry_triage(run: Run) -> JobSpec:
         prompt=prompt,
         repo=repo,
         # Stated explicitly even though it matches the runner's default, so the
-        # prompt and the worktree cannot drift apart if the default changes.
+        # prompt and the clone cannot drift apart if the default changes.
         branch=branch,
         model=_TRIAGE_MODEL,
         needs_github=True,

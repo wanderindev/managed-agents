@@ -154,7 +154,31 @@ def test_a_failed_docker_run_cleans_up_and_raises(roots):
     assert not runner.job_path(run).exists()
 
 
-def test_start_adds_a_worktree_when_the_job_has_a_repo(roots):
+def test_start_clones_locally_and_points_origin_at_github(roots):
+    """A standalone clone (#33), not a worktree: a worktree's .git links into
+    the parent's .git on the host, which is never mounted into the sandbox, so
+    git was dead in /workspace."""
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    commands = FakeCommands()
+    runner = make_runner(
+        roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev", branch="agent/x")
+    )
+    run = make_run()
+
+    runner.start(run)
+
+    clone = commands.commands("clone")[0]
+    assert "--local" in clone
+    assert str(roots["repos_root"] / "feliu-dev") in clone
+    assert str(runner.workspace_path(run)) in clone
+    set_url = commands.commands("remote", "set-url")[0]
+    assert "https://github.com/wanderindev/feliu-dev.git" in set_url
+    assert not commands.commands("worktree")
+
+
+def test_a_fresh_branch_is_cut_from_origins_main(roots):
+    """The parent clone is a static template that only goes staler (#30); the
+    branch must be based on GitHub's main, freshly fetched."""
     (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
     commands = FakeCommands()
     runner = make_runner(
@@ -163,8 +187,23 @@ def test_start_adds_a_worktree_when_the_job_has_a_repo(roots):
 
     runner.start(make_run())
 
-    worktree = commands.commands("worktree", "add")[0]
-    assert "-B" in worktree and "agent/x" in worktree
+    fetch = commands.commands("fetch")[0]
+    assert "+refs/heads/main:refs/remotes/origin/main" in fetch
+    checkout = commands.commands("checkout", "-B")[0]
+    assert "agent/x" in checkout and "origin/main" in checkout
+
+
+def test_local_main_is_forced_to_origins_main(roots):
+    """The prompts compare against local main (`git diff main...HEAD`), so it
+    has to match origin's, not the parent template's."""
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    commands = FakeCommands()
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
+
+    runner.start(make_run())
+
+    branch = commands.commands("branch", "-f")[0]
+    assert "main" in branch and "origin/main" in branch
 
 
 def test_start_fails_clearly_when_the_clone_is_missing(roots):
@@ -299,9 +338,9 @@ def test_finish_discards_a_workspace_with_nothing_in_it(roots):
 
 
 def test_finish_removes_the_workspace_even_when_it_has_commits(roots):
-    """Committed work lives on the branch ref in the parent repo, so removal
-    loses nothing — while a kept worktree pins its branch as "checked out" and
-    blocks the review/revision runs (#8) that need it next."""
+    """Committed work reaches the world by being pushed to origin from inside
+    the sandbox; the standalone clone is disposable, so a plain rm -rf is the
+    whole cleanup — no worktree deregistration machinery (#33)."""
     repo = roots["repos_root"] / "feliu-dev"
     repo.mkdir(parents=True)
     commands = FakeCommands({("inspect",): (0, "0\n", ""), ("logs",): (0, "", "")})
@@ -309,17 +348,12 @@ def test_finish_removes_the_workspace_even_when_it_has_commits(roots):
     run = make_run()
     runner.start(run)
     workspace = runner.workspace_path(run)
-    workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / ".git").write_text(f"gitdir: {repo}/.git/worktrees/ma-run-1-1\n")
+    (workspace / ".git").mkdir(parents=True, exist_ok=True)
 
     runner.finish(run, "ma-run-1-1")
 
     assert not workspace.exists()
-    removal = commands.commands("worktree", "remove")[0]
-    # From the parent repo, not from inside the worktree — git refuses to
-    # remove the worktree it is standing in (run 3 left a stale entry that way).
-    assert removal[removal.index("-C") + 1] == str(repo)
-    assert str(workspace) in removal
+    assert not commands.commands("worktree")
 
 
 # --- the default command runner ----------------------------------------------
@@ -360,41 +394,10 @@ def test_an_unreadable_exit_code_is_none_rather_than_a_crash(roots):
     assert result.outcome is Outcome.FAILED
 
 
-def test_a_worktree_is_deregistered_from_its_parent_repo(roots):
-    """Otherwise the parent accumulates stale entries that break later adds."""
-    repo = roots["repos_root"] / "feliu-dev"
-    repo.mkdir(parents=True)
-    commands = FakeCommands({("inspect",): (0, "0\n", ""), ("logs",): (0, "", "")})
-    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
-    run = make_run()
-    runner.start(run)
-    workspace = runner.workspace_path(run)
-    workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / ".git").write_text(f"gitdir: {repo}/.git/worktrees/ma-run-1-1\n")
-
-    runner.finish(run, "ma-run-1-1")
-
-    assert commands.commands("worktree", "remove")
-
-
-def test_stale_registrations_are_pruned_before_a_worktree_is_added(roots):
-    """A crashed cleanup leaves a missing-but-registered worktree, and
-    `worktree add` refuses over one."""
-    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
-    commands = FakeCommands()
-    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
-
-    runner.start(make_run())
-
-    prune = commands.commands("worktree", "prune")
-    add = commands.commands("worktree", "add")
-    assert prune and add
-    assert commands.calls.index(prune[0]) < commands.calls.index(add[0])
-
-
-def test_reuse_branch_checks_out_without_resetting(roots):
-    """-B would reset the branch to HEAD and erase the fixer's commits, which
-    is exactly what a review or revision run (#8) must not do."""
+def test_reuse_branch_fetches_it_and_checks_out_without_resetting(roots):
+    """The fixer's commits live only on GitHub — it pushed from its own
+    /workspace — so the branch must be fetched, and checked out as-is: -B
+    would reset it and erase the commits a review/revision run (#8) needs."""
     (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
     commands = FakeCommands()
     spec = JobSpec(
@@ -402,18 +405,78 @@ def test_reuse_branch_checks_out_without_resetting(roots):
     )
     make_runner(roots, commands, spec=spec).start(make_run(9))
 
-    add = commands.commands("worktree", "add")[0]
-    assert "-B" not in add
-    assert "agent/run-9" in add
+    fetch = commands.commands("fetch")[0]
+    assert "+refs/heads/agent/run-9:refs/remotes/origin/agent/run-9" in fetch
+    checkout = commands.commands("checkout", "-b")[0]
+    assert "-B" not in checkout
+    assert "agent/run-9" in checkout and "origin/agent/run-9" in checkout
 
 
-def test_a_fresh_branch_still_uses_dash_b(roots):
+def test_a_git_failure_cleans_the_half_built_clone_and_raises(roots):
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    commands = FakeCommands({("fetch",): (128, "", "could not read from remote")})
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
+    run = make_run()
+
+    with pytest.raises(RuntimeError, match="git fetch failed"):
+        runner.start(run)
+
+    assert not runner.workspace_path(run).exists()
+
+
+def test_the_host_side_fetch_carries_the_token_but_the_remote_url_does_not(roots):
+    """The token authenticates the fetch inline, per command; the clone's
+    stored origin stays clean because that config is mounted into the sandbox,
+    where the credential helper supplies GH_TOKEN instead."""
+    minted = []
+
+    def token():
+        minted.append(1)
+        return f"ghs_token_{len(minted)}"
+
     (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
     commands = FakeCommands()
-    spec = JobSpec(prompt="p", repo="feliu-dev")
-    make_runner(roots, commands, spec=spec).start(make_run(9))
+    spec = JobSpec(prompt="p", repo="feliu-dev", needs_github=True)
+    make_runner(roots, commands, spec=spec, github_token=token).start(make_run())
 
-    assert "-B" in commands.commands("worktree", "add")[0]
+    fetch = " ".join(commands.commands("fetch")[0])
+    assert "x-access-token:ghs_token_1@github.com" in fetch
+    set_url = " ".join(commands.commands("remote", "set-url")[0])
+    assert "ghs_token_1" not in set_url
+    # One token per job, shared between the fetch and the sandbox env, so a
+    # leaked token still traces to a single job.
+    assert "GH_TOKEN=ghs_token_1" in commands.commands("run")[0]
+    assert len(minted) == 1
+
+
+def test_a_failed_tokenized_fetch_never_leaks_the_token(roots):
+    """git echoes the remote URL on failure, and the error message lands in
+    the append-only event log."""
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    stderr = "fatal: unable to access 'https://x-access-token:ghs_secret@github.com/'"
+    commands = FakeCommands({("fetch",): (128, "", stderr)})
+    spec = JobSpec(prompt="p", repo="feliu-dev", needs_github=True)
+    runner = make_runner(roots, commands, spec=spec, github_token=lambda: "ghs_secret")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        runner.start(make_run())
+
+    assert "ghs_secret" not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
+
+
+def test_a_repo_job_without_an_app_fetches_the_plain_url(roots):
+    """No App configured and no GitHub needed: the fetch still runs, against
+    the plain URL, which serves a public repo."""
+    (roots["repos_root"] / "feliu-dev").mkdir(parents=True)
+    commands = FakeCommands()
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
+
+    runner.start(make_run())
+
+    fetch = " ".join(commands.commands("fetch")[0])
+    assert "https://github.com/wanderindev/feliu-dev.git" in fetch
+    assert "x-access-token" not in fetch
 
 
 # --- GitHub token injection (#11) --------------------------------------------

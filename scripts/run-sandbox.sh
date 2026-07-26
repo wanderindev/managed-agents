@@ -3,17 +3,17 @@
 # will drive programmatically; having it as a script first means the container
 # contract can be exercised by hand before any orchestration exists.
 #
-#   scripts/run-sandbox.sh <worktree-path> <prompt>
-#   AGENT_WITH_DOCKER=1 scripts/run-sandbox.sh <worktree-path> <prompt>
+#   scripts/run-sandbox.sh <workspace-path> <prompt>
+#   AGENT_WITH_DOCKER=1 scripts/run-sandbox.sh <workspace-path> <prompt>
 set -euo pipefail
 
-WORKTREE="${1:?usage: run-sandbox.sh <worktree-path> <prompt>}"
-PROMPT="${2:?usage: run-sandbox.sh <worktree-path> <prompt>}"
+WORKSPACE="${1:?usage: run-sandbox.sh <workspace-path> <prompt>}"
+PROMPT="${2:?usage: run-sandbox.sh <workspace-path> <prompt>}"
 
 IMAGE="${SANDBOX_IMAGE:-managed-agents/sandbox:latest}"
 CREDENTIALS="${CLAUDE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
 
-[ -d "$WORKTREE" ] || { echo "no such worktree: $WORKTREE" >&2; exit 1; }
+[ -d "$WORKSPACE" ] || { echo "no such workspace: $WORKSPACE" >&2; exit 1; }
 [ -s "$CREDENTIALS" ] || { echo "no credential at $CREDENTIALS" >&2; exit 78; }
 
 args=(
@@ -22,7 +22,7 @@ args=(
     --network bridge
     --memory 3g --memory-swap 4g
     --pids-limit 512
-    --volume "$(realpath "$WORKTREE"):/workspace"
+    --volume "$(realpath "$WORKSPACE"):/workspace"
     # Mounted read-write on purpose: Claude Code refreshes its OAuth token, and
     # a read-only mount works right up until the access token expires and then
     # every unattended run fails at once.
