@@ -56,9 +56,20 @@ SANDBOX_IMAGE = os.environ.get(
     "ORCHESTRATOR_SANDBOX_IMAGE", "managed-agents/sandbox:latest"
 )
 
-#: Host clones live here; each job gets a git worktree off one of them.
+#: Host clones live here; each job gets a standalone local clone off one of
+#: them (`git clone --local`, so the objects are hardlinked and cheap). Not a
+#: worktree: a worktree's .git links into the parent's .git on the *host*, a
+#: path never mounted into the sandbox, which left git dead in /workspace (#33).
 REPOS_ROOT = os.environ.get("ORCHESTRATOR_REPOS_ROOT", "/srv/repos")
+#: Named for the worktree era (#33 replaced worktrees with clones); the env var
+#: and the /srv/worktrees directory keep their names so nothing redeploys.
 WORKTREES_ROOT = os.environ.get("ORCHESTRATOR_WORKTREES_ROOT", "/srv/worktrees")
+
+#: Where each job clone's `origin` points, so commits push straight to GitHub
+#: rather than at the parent clone on the host.
+GITHUB_REMOTE_BASE = os.environ.get(
+    "ORCHESTRATOR_GITHUB_REMOTE_BASE", "https://github.com/wanderindev"
+)
 
 #: Per-job scratch, mounted at /work. The prompt goes here rather than into the
 #: repo, so a job cannot accidentally commit its own instructions.

@@ -36,6 +36,10 @@ PROMPT_FILENAME = "prompt.txt"
 #: looks like an arbitrary failure.
 TIMEOUT_EXIT_CODE = 124
 
+#: Both repos use `main`, and the prompts bake it in (`git diff main...HEAD`,
+#: `--base main`), so the runner may too.
+DEFAULT_BRANCH = "main"
+
 DOCKER_SOCKET = "/var/run/docker.sock"
 
 
@@ -63,10 +67,11 @@ class JobSpec:
     #: with the socket mounted the container stops being a security boundary,
     #: so only a job that runs a suite should carry that reach.
     needs_docker: bool = False
-    #: Check out the existing ``branch`` instead of resetting it (#8). A fix
-    #: run creates its branch fresh off HEAD; the review and revision runs that
-    #: follow must see the fixer's commits, and the default ``-B`` would reset
-    #: the branch to HEAD and silently erase them.
+    #: Check out the existing ``branch`` instead of cutting a fresh one (#8).
+    #: A fix run cuts its branch from origin's main; the review and revision
+    #: runs that follow must see the fixer's commits, which live only on GitHub
+    #: (fixers push from /workspace), so reuse fetches the branch from origin
+    #: and checks it out as-is — never ``-B``, which would reset it.
     reuse_branch: bool = False
 
 
@@ -96,6 +101,7 @@ class DockerRunner:
         run_command: CommandRunner = _run_command,
         github_token: Callable[[], str] | None = None,
         docker_socket: str = DOCKER_SOCKET,
+        remote_base: str | None = None,
     ) -> None:
         self.job_spec = job_spec
         self.image = image or config.SANDBOX_IMAGE
@@ -118,6 +124,7 @@ class DockerRunner:
         self._run = run_command
         self._github_token = github_token
         self.docker_socket = docker_socket
+        self.remote_base = (remote_base or config.GITHUB_REMOTE_BASE).rstrip("/")
 
     # --- naming --------------------------------------------------------------
 
@@ -140,11 +147,23 @@ class DockerRunner:
 
         if not self.credentials.is_file():
             raise RuntimeError(f"no Claude credential at {self.credentials}")
+        if spec.needs_github and self._github_token is None:
+            raise RuntimeError(
+                f"run {run.id} needs GitHub but no App is configured; "
+                "see docs/runbook.md"
+            )
 
-        workspace = self._make_workspace(run, spec)
+        # One token per job, minted at launch so the sandbox gets the full
+        # hour, shared between the host-side fetch and the sandbox's GH_TOKEN
+        # so a leaked token still traces to a single job.
+        token: str | None = None
+        if self._github_token is not None and (spec.repo or spec.needs_github):
+            token = self._github_token()
+
+        workspace = self._make_workspace(run, spec, token)
         job_dir = self._make_job_dir(run, spec)
 
-        argv = self._docker_run_argv(run, spec, name, workspace, job_dir)
+        argv = self._docker_run_argv(run, spec, name, workspace, job_dir, token)
         result = self._run(argv)
         if result.returncode != 0:
             # Leave nothing half-built: the loop will requeue and a retry gets a
@@ -187,10 +206,9 @@ class DockerRunner:
 
         outcome = Outcome.SUCCEEDED if exit_code == 0 else Outcome.FAILED
         self._run([self.docker_bin, "rm", "-f", handle])
-        # The workspace always goes. Committed work lives on the branch ref in
-        # the parent repo and pushed work on origin, so removal loses nothing —
-        # while a kept worktree pins its branch as "checked out" and blocks the
-        # review/revision runs (#8) that need to check it out next.
+        # The workspace always goes. A job's work reaches the world by being
+        # pushed to origin from inside the sandbox; the standalone clone is
+        # disposable and holds nothing else, so removal loses nothing.
         self._cleanup(run, keep_workspace=False)
 
         return SandboxResult(
@@ -207,7 +225,13 @@ class DockerRunner:
     # --- docker --------------------------------------------------------------
 
     def _docker_run_argv(
-        self, run: Run, spec: JobSpec, name: str, workspace: Path, job_dir: Path
+        self,
+        run: Run,
+        spec: JobSpec,
+        name: str,
+        workspace: Path,
+        job_dir: Path,
+        token: str | None,
     ) -> list[str]:
         argv = [
             self.docker_bin,
@@ -242,14 +266,7 @@ class DockerRunner:
         for key, value in spec.env.items():
             argv += ["--env", f"{key}={value}"]
         if spec.needs_github:
-            if self._github_token is None:
-                raise RuntimeError(
-                    f"run {run.id} needs GitHub but no App is configured; "
-                    "see docs/runbook.md"
-                )
-            # Minted here, at launch, so the sandbox gets the full hour rather
-            # than the remains of a token minted at planning time.
-            argv += ["--env", f"GH_TOKEN={self._github_token()}"]
+            argv += ["--env", f"GH_TOKEN={token}"]
         if spec.needs_docker or self.with_docker:
             argv += ["--volume", f"{self.docker_socket}:{self.docker_socket}"]
             # The mount alone is not enough (#26): the socket is root:docker
@@ -311,7 +328,7 @@ class DockerRunner:
 
     # --- workspace -----------------------------------------------------------
 
-    def _make_workspace(self, run: Run, spec: JobSpec) -> Path:
+    def _make_workspace(self, run: Run, spec: JobSpec, token: str | None) -> Path:
         path = self.workspace_path(run)
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
@@ -326,33 +343,90 @@ class DockerRunner:
 
         branch = spec.branch or f"agent/run-{run.id}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Clear any stale registrations first (a crashed cleanup leaves a
-        # missing-but-registered worktree, and `worktree add` refuses over one).
-        self._run([self.git_bin, "-C", str(repo), "worktree", "prune"])
-        # A worktree rather than a clone: same object store, so this is cheap even
-        # for a large repo, and concurrent jobs cannot collide on a branch.
-        #
-        # -B creates-or-resets the branch at HEAD, which is right for a fresh fix
-        # and catastrophic for a review or revision (#8): those must see the
-        # fixer's commits, so reuse_branch checks the existing branch out as-is
-        # and fails loudly if it does not exist.
-        if spec.reuse_branch:
-            argv = [self.git_bin, "-C", str(repo), "worktree", "add", str(path), branch]
-        else:
-            argv = [
-                self.git_bin,
+        # A standalone clone, not a worktree (#33): a worktree's .git links into
+        # the parent's .git on the host, a path never mounted into the sandbox,
+        # which left git dead in /workspace and every fixer improvising private
+        # in-sandbox clones. --local hardlinks the objects, so this stays cheap.
+        default = f"+refs/heads/{DEFAULT_BRANCH}:refs/remotes/origin/{DEFAULT_BRANCH}"
+        try:
+            self._git("clone", "--local", str(repo), str(path))
+            # Pushes and fetches go straight to GitHub. The URL carries no
+            # token; inside the sandbox the entrypoint's credential helper
+            # supplies GH_TOKEN, and on the host the fetch below passes a
+            # tokenized URL explicitly rather than persisting it in config.
+            self._git(
+                "-C", str(path), "remote", "set-url", "origin", self._remote_url(spec)
+            )
+            fetch_url = self._fetch_url(spec, token)
+            if spec.reuse_branch:
+                # The fixer's commits live only on GitHub (pushed from its own
+                # /workspace), so the branch must be fetched — and checked out
+                # as-is, never -B, which would reset it and erase them. A
+                # missing branch fails loudly here.
+                self._git(
+                    "-C",
+                    str(path),
+                    "fetch",
+                    fetch_url,
+                    default,
+                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    scrub=token,
+                )
+                self._git("-C", str(path), "checkout", "-b", branch, f"origin/{branch}")
+            else:
+                # Cut the fresh branch from origin's main, not the parent's
+                # HEAD: the parent clone is a static template that only goes
+                # staler (#30), and a PR based on stale main reviews badly.
+                self._git("-C", str(path), "fetch", fetch_url, default, scrub=token)
+                self._git(
+                    "-C",
+                    str(path),
+                    "checkout",
+                    "-B",
+                    branch,
+                    f"origin/{DEFAULT_BRANCH}",
+                )
+            # The prompts compare against local main (`git diff main...HEAD`,
+            # `git checkout main -- <files>`), so it has to match origin's.
+            self._git(
                 "-C",
-                str(repo),
-                "worktree",
-                "add",
-                "-B",
-                branch,
                 str(path),
-            ]
-        result = self._run(argv)
-        if result.returncode != 0:
-            raise RuntimeError(f"git worktree add failed: {result.stderr.strip()}")
+                "branch",
+                "-f",
+                DEFAULT_BRANCH,
+                f"origin/{DEFAULT_BRANCH}",
+            )
+        except Exception:
+            # Leave nothing half-built; a retry gets a clean clone.
+            shutil.rmtree(path, ignore_errors=True)
+            raise
         return path
+
+    def _remote_url(self, spec: JobSpec) -> str:
+        return f"{self.remote_base}/{spec.repo}.git"
+
+    def _fetch_url(self, spec: JobSpec, token: str | None) -> str:
+        """The remote URL with the job's token inlined, for host-side fetches.
+
+        Inlined per command rather than written to the clone's config, so the
+        token never persists into the sandbox mount. Without a token (a private
+        remote will then refuse) the plain URL still serves public repos.
+        """
+        url = self._remote_url(spec)
+        if token is None:
+            return url
+        return url.replace("https://", f"https://x-access-token:{token}@", 1)
+
+    def _git(self, *args: str, scrub: str | None = None) -> None:
+        result = self._run([self.git_bin, *args])
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if scrub:
+                # git echoes the remote URL on failure, and a tokenized URL in
+                # a RuntimeError would land in the append-only event log.
+                stderr = stderr.replace(scrub, "***")
+            verb = args[2] if args[0] == "-C" else args[0]
+            raise RuntimeError(f"git {verb} failed: {stderr}")
 
     def _make_job_dir(self, run: Run, spec: JobSpec) -> Path:
         path = self.job_path(run)
@@ -376,41 +450,10 @@ class DockerRunner:
     def _cleanup(self, run: Run, *, keep_workspace: bool) -> None:
         self._remove_paths(self.job_path(run))
         if not keep_workspace:
-            workspace = self.workspace_path(run)
-            repo = self._parent_repo(workspace)
-            if repo is not None:
-                # Deregister from the parent repo, or the branch stays pinned
-                # as "checked out" and later runs cannot check it out. Run 3
-                # taught the sharp edge here: `git -C <worktree> worktree
-                # remove .` refuses to remove the worktree it is standing in,
-                # so the command must run from the parent repo.
-                self._run(
-                    [
-                        self.git_bin,
-                        "-C",
-                        str(repo),
-                        "worktree",
-                        "remove",
-                        "--force",
-                        str(workspace),
-                    ]
-                )
-            self._remove_paths(workspace)
-
-    def _parent_repo(self, workspace: Path) -> Path | None:
-        """The clone a worktree belongs to, read from its .git link file.
-
-        The link says ``gitdir: <repo>/.git/worktrees/<name>``; three parents
-        up is the repo. Read from disk rather than remembered, because finish()
-        can run in a different process than start().
-        """
-        gitfile = workspace / ".git"
-        if not gitfile.is_file():
-            return None
-        gitdir = gitfile.read_text().partition("gitdir:")[2].strip()
-        if not gitdir:
-            return None
-        return Path(gitdir).parents[2]
+            # A standalone clone registers nothing anywhere: rm -rf is the
+            # whole cleanup. The worktree era's prune/deregister machinery
+            # (and its run-3 sharp edges) went with #33.
+            self._remove_paths(self.workspace_path(run))
 
     @staticmethod
     def _remove_paths(*paths: Path) -> None:

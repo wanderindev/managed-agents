@@ -72,8 +72,8 @@ scripts/run-sandbox.sh /srv/worktrees/<job> "<prompt>"
 ```
 
 Contains Node 22, a pinned Claude Code, git, `gh`, Python, and the Docker
-**client**. Nothing job-specific is baked in: the worktree, the credential and
-any secrets arrive at run time.
+**client**. Nothing job-specific is baked in: the workspace clone, the
+credential and any secrets arrive at run time.
 
 ### The credential is mounted read-write, deliberately
 
@@ -94,8 +94,8 @@ worth stating plainly rather than pretending the container solves it.
 ### `bypassPermissions`, and what the Docker socket costs
 
 The entrypoint defaults to `--permission-mode bypassPermissions`. That is right
-*here* and nowhere else: the container is disposable, holds one worktree, and an
-interactive approval prompt in an unattended job just deadlocks.
+*here* and nowhere else: the container is disposable, holds one job's clone, and
+an interactive approval prompt in an unattended job just deadlocks.
 
 The honest caveat: `AGENT_WITH_DOCKER=1` mounts the host's Docker socket, which
 a job needs to run feliu-dev's testcontainers suite or PIC's compose commands.
@@ -153,8 +153,8 @@ SELECT seq, type, left(payload::text, 90) FROM agent_events WHERE run_id = 2 ORD
 
 | Path | Contents |
 |---|---|
-| `/srv/repos/<repo>` | host clone; each job gets a `git worktree` off it |
-| `/srv/worktrees/ma-run-<id>-<attempt>` | the job's checkout, mounted at `/workspace` |
+| `/srv/repos/<repo>` | host template clone; each job gets a standalone `git clone --local` off it (#33 — a worktree's `.git` links at a host path the sandbox can't see) |
+| `/srv/worktrees/ma-run-<id>-<attempt>` | the job's standalone clone, `origin` pointed at GitHub, mounted at `/workspace` (directory keeps its worktree-era name) |
 | `/srv/jobs/ma-run-<id>-<attempt>` | `prompt.txt` in, `result.json` out, mounted at `/work` |
 
 The prompt lives outside the repo on purpose, so a job cannot commit its own
@@ -282,8 +282,9 @@ injects it as `GH_TOKEN`.
 
 Inside the container the entrypoint configures a git credential helper that reads
 `GH_TOKEN` from the environment, rather than writing it into a remote URL. That
-matters because a worktree with commits is kept after the run, and a token baked
-into `.git/config` would outlive the container that was supposed to contain it.
+matters because the clone's `.git/config` lives on the host, and a token baked
+into it would outlive the container that was supposed to contain it. The runner's
+own host-side fetch passes its tokenized URL per command for the same reason.
 
 ## Log database
 
