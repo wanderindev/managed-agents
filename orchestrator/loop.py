@@ -60,6 +60,19 @@ def backoff_delay(
     return timedelta(seconds=delay * (1 - _JITTER_FRACTION * jitter()))
 
 
+def _rate_limit_reset(payload: dict[str, Any]) -> datetime | None:
+    """The usable reset time carried by a rejected rate-limit event, if any."""
+    if payload.get("type") != "rate_limit_event":
+        return None
+    info = payload.get("rate_limit_info") or {}
+    if info.get("status") == "allowed":
+        return None
+    resets_at = info.get("resetsAt")
+    if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
+        return datetime.fromtimestamp(resets_at, tz=UTC)
+    return None
+
+
 @dataclass
 class TickResult:
     """What one tick did. Returned for logging and asserted on in tests."""
@@ -168,7 +181,7 @@ class Orchestrator:
             # exactly right and cannot duplicate work.
             self._abandon(conn, run, "sandbox never started", result)
         elif self.runner.is_alive(handle):
-            self._heartbeat(conn, run, result)
+            self._heartbeat(conn, run, handle, result)
         else:
             self._finish(conn, run, handle, result)
 
@@ -189,6 +202,10 @@ class Orchestrator:
             # If the transcript showed a rate limit, its reset time is a better
             # wait than any computed backoff: retrying sooner is guaranteed to
             # fail, and three instant retries would just burn the attempt budget.
+            # A truly vanished container hands back no events at all, so the
+            # limit is usually one a heartbeat drained earlier — check the log.
+            if rate_limit_reset is None:
+                rate_limit_reset = self._stored_rate_limit_reset(conn, run)
             self._abandon(
                 conn,
                 run,
@@ -312,9 +329,23 @@ class Orchestrator:
             info.get("rateLimitType"),
             info.get("resetsAt"),
         )
-        resets_at = info.get("resetsAt")
-        if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
-            return datetime.fromtimestamp(resets_at, tz=UTC)
+        return _rate_limit_reset(payload)
+
+    def _stored_rate_limit_reset(
+        self, conn: psycopg.Connection, run: Run
+    ) -> datetime | None:
+        """The reset time of the last rate limit already banked in the log.
+
+        The drain returns a reset only for events it just appended, so a limit
+        harvested by an earlier heartbeat is invisible to the GONE-path drain.
+        The log still has it, and it is still the best wait available.
+        """
+        for event in reversed(log.load_events(conn, run.id)):
+            if event.type is not EventType.CLAUDE_EVENT:
+                continue
+            reset = _rate_limit_reset(event.payload)
+            if reset is not None:
+                return reset
         return None
 
     def _handle_for(self, conn: psycopg.Connection, run: Run) -> str | None:
@@ -324,19 +355,32 @@ class Orchestrator:
         return event.payload.get("container")
 
     def _heartbeat(
-        self, conn: psycopg.Connection, run: Run, result: TickResult
+        self, conn: psycopg.Connection, run: Run, handle: str, result: TickResult
     ) -> None:
-        """Push the lease out while the sandbox is still working.
+        """Push the lease out, then bank the transcript emitted so far.
 
-        Deliberately does *not* append an event. A heartbeat every tick for every
-        active run would bury the actual narrative under thousands of rows, and
-        the lease is operational metadata that replay never derives. The log stays
-        the source of truth for *status*; the lease is just how long this worker's
-        claim is good for.
+        Deliberately appends no *heartbeat* event. A heartbeat every tick for
+        every active run would bury the actual narrative under thousands of rows,
+        and the lease is operational metadata that replay never derives. The log
+        stays the source of truth for *status*; the lease is just how long this
+        worker's claim is good for.
+
+        The drain, though, is the load-bearing half of #12: before it, transcript
+        events were only harvested at finish(), so a container that vanished took
+        its whole history with it and a resume had nothing to read. Draining
+        every heartbeat means a kill can only lose one tick's worth of narrative.
+        The lease extension commits first and the drain is guarded, so a logs
+        hiccup never costs the claim.
         """
         with conn.transaction():
             queue.extend_lease(conn, run.id, self.worker_id, self.lease_seconds)
         result.heartbeated.append(run.id)
+        try:
+            self._drain(conn, run, self.runner.logs(handle))
+        except Exception:
+            logger.exception(
+                "run %s: mid-flight drain failed; the next tick retries", run.id
+            )
 
     def _abandon(
         self,

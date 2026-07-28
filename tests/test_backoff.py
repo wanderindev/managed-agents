@@ -180,6 +180,37 @@ def test_a_rate_limit_reset_becomes_the_wait(conn):
     assert verify_replay(conn, run_id)
 
 
+def test_a_rate_limit_banked_by_a_heartbeat_still_becomes_the_wait(conn):
+    """With heartbeat drains (#12) the limit is usually stored before the
+    container dies, so the GONE-path drain sees nothing new. The log still has
+    it, and the abandon must still wait for the stated reset."""
+    resets_at = datetime.now(UTC) + timedelta(hours=5)
+    runner = VanishingRunner(
+        events=[
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "five_hour",
+                    "resetsAt": int(resets_at.timestamp()),
+                },
+            }
+        ]
+    )
+    orchestrator = Orchestrator(runner, worker_id=WORKER, max_concurrent=1)
+    run_id = create_run(conn, "smoke", "backoff:10")
+    orchestrator.tick(conn)  # start
+    orchestrator.tick(conn)  # heartbeat banks the rate limit
+    runner.events = []  # the container dies taking its logs with it
+    runner.kill_all()
+
+    orchestrator.tick(conn)
+
+    run = get_run(conn, run_id)
+    assert run.status is RunStatus.QUEUED
+    assert abs((run.not_before - resets_at).total_seconds()) < 1
+
+
 def test_a_rate_limit_without_a_usable_reset_falls_back_to_the_guess(conn):
     """A malformed stream event must degrade to the computed backoff, not crash
     the reconcile pass or produce a run with no window at all."""
