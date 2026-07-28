@@ -166,3 +166,25 @@ GITHUB_EXPECTED_REPOS = (
     "wanderindev/feliu-dev",
     "wanderindev/panama-in-context",
 )
+
+# --- github change-request source (#10) --------------------------------------
+
+#: The login GitHub shows for PRs the App opens. How #10 tells this
+#: orchestrator's pull requests apart from a human's.
+GITHUB_BOT_LOGIN = os.environ.get(
+    "ORCHESTRATOR_GITHUB_BOT_LOGIN", "wanderindev-managed-agents[bot]"
+)
+
+#: Humans whose commits on an agent branch mean "hands off". Checked against
+#: commit author/committer logins, because the *positive* identity of sandbox
+#: commits is unreliable (PR #431's commit resolves to login `claude`).
+GITHUB_HUMAN_LOGINS = tuple(
+    login.strip()
+    for login in os.environ.get(
+        "ORCHESTRATOR_GITHUB_HUMAN_LOGINS", "wanderindev"
+    ).split(",")
+    if login.strip()
+)
+
+#: Revision runs one poll may enqueue. A review spree must not spawn a fleet.
+GITHUB_PR_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_GITHUB_PR_MAX_PER_POLL", "3"))
