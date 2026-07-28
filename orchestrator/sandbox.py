@@ -183,6 +183,16 @@ class DockerRunner:
             return False  # unknown container: gone, not running
         return result.stdout.strip() == "true"
 
+    def logs(self, handle: str) -> list[dict]:
+        """The transcript so far, for the loop's heartbeat drain (#12).
+
+        `docker logs` on a running container returns everything emitted to date;
+        on a vanished one it fails, and _collect_logs parses that empty output to
+        an empty list — exactly the tolerant behavior the protocol asks for.
+        """
+        events, _ = self._collect_logs(handle)
+        return events
+
     def finish(self, run: Run, handle: str) -> SandboxResult:
         state = self._run(
             [self.docker_bin, "inspect", "-f", "{{.State.ExitCode}}", handle]

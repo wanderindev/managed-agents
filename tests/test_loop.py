@@ -223,6 +223,73 @@ def test_a_live_sandbox_gets_its_lease_extended(conn, orchestrator):
     assert len(load_events(conn, run_id)) == events_before
 
 
+def test_a_heartbeat_banks_the_transcript_so_far(conn):
+    """The load-bearing half of #12: before this, a killed container took its
+    whole history with it and a resume had nothing to read."""
+    transcript = [{"type": "system"}, {"type": "assistant", "n": 1}]
+    runner = FakeRunner(events=transcript)
+    orchestrator = Orchestrator(runner, worker_id=WORKER, max_concurrent=1)
+    run_id = create_run(conn, "sentry_triage", "sentry:HB-2")
+
+    orchestrator.tick(conn)  # start
+    orchestrator.tick(conn)  # heartbeat drains
+
+    stored = [e for e in load_events(conn, run_id) if e.type is EventType.CLAUDE_EVENT]
+    assert [e.payload for e in stored] == transcript
+
+
+def test_heartbeat_drains_do_not_duplicate_on_finish(conn):
+    """finish() hands back the same transcript from the beginning; the
+    count-based skip must make the two drains add up to one copy."""
+    runner = FakeRunner(events=[{"type": "assistant", "n": 1}])
+    orchestrator = Orchestrator(runner, worker_id=WORKER, max_concurrent=1)
+    run_id = create_run(conn, "sentry_triage", "sentry:HB-3")
+
+    orchestrator.tick(conn)  # start
+    orchestrator.tick(conn)  # heartbeat drains
+    runner.kill_all()
+    orchestrator.tick(conn)  # finish drains the same events
+
+    stored = [e for e in load_events(conn, run_id) if e.type is EventType.CLAUDE_EVENT]
+    assert len(stored) == 1
+    assert get_run(conn, run_id).status is RunStatus.DONE
+
+
+def test_events_drained_at_heartbeat_survive_a_lost_sandbox(conn):
+    """A truly vanished container hands back nothing at finish; what the
+    heartbeat banked is all a resume gets, and it must still be there."""
+    runner = VanishingRunner(events=[{"type": "assistant", "n": 1}])
+    orchestrator = Orchestrator(runner, worker_id=WORKER, max_concurrent=1)
+    run_id = create_run(conn, "sentry_triage", "sentry:HB-4")
+
+    orchestrator.tick(conn)  # start
+    orchestrator.tick(conn)  # heartbeat drains
+    runner.events = []  # the container dies taking its logs with it
+    runner.kill_all()
+    result = orchestrator.tick(conn)
+
+    assert run_id in result.abandoned
+    stored = [e for e in load_events(conn, run_id) if e.type is EventType.CLAUDE_EVENT]
+    assert [e.payload for e in stored] == [{"type": "assistant", "n": 1}]
+
+
+def test_a_failing_drain_does_not_cost_the_heartbeat(conn, orchestrator, runner):
+    """The lease extension commits first: a docker-logs hiccup must not let the
+    lease lapse, which would get a healthy run abandoned by the next tick."""
+    run_id = create_run(conn, "sentry_triage", "sentry:HB-5")
+    orchestrator.tick(conn)
+    before = get_run(conn, run_id).lease_expires_at
+
+    def boom(handle):
+        raise RuntimeError("docker daemon hiccup")
+
+    runner.logs = boom
+    result = orchestrator.tick(conn)
+
+    assert result.heartbeated == [run_id]
+    assert get_run(conn, run_id).lease_expires_at >= before
+
+
 # --- reconcile ---------------------------------------------------------------
 
 

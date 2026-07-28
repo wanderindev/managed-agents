@@ -54,6 +54,16 @@ class Runner(Protocol):
         """Whether the container behind ``handle`` is still running."""
         ...
 
+    def logs(self, handle: str) -> list[dict[str, Any]]:
+        """The stream-json events emitted so far, from the beginning of the run.
+
+        Called while the container is still alive: the loop drains the transcript
+        on every heartbeat so that a sandbox killed mid-job (#12) loses nothing
+        the log has not already banked. Must tolerate a vanished handle by
+        returning an empty list; the reconcile pass will notice the death itself.
+        """
+        ...
+
     def finish(self, run: Run, handle: str) -> SandboxResult:
         """Collect what a no-longer-running sandbox produced, and clean up.
 

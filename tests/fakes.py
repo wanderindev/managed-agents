@@ -33,6 +33,7 @@ class FakeRunner:
         self.started: list[int] = []
         self.finished: list[str] = []
         self.killed: list[str] = []
+        self.log_reads: list[str] = []
         self._alive: set[str] = set()
 
     def start(self, run: Run) -> str:
@@ -47,6 +48,11 @@ class FakeRunner:
 
     def is_alive(self, handle: str) -> bool:
         return handle in self._alive
+
+    def logs(self, handle: str) -> list[dict[str, Any]]:
+        """Same transcript finish() would hand back, like `docker logs` mid-run."""
+        self.log_reads.append(handle)
+        return list(self.events)
 
     def finish(self, run: Run, handle: str) -> SandboxResult:
         self.finished.append(handle)

@@ -5,11 +5,13 @@ knows what a `sentry_triage` run actually *means*, and that separation is what
 lets a new kind of work arrive without touching either.
 """
 
+import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from orchestrator import config
+from orchestrator import config, db, log
+from orchestrator.enums import EventType
 from orchestrator.queue import Run
 from orchestrator.sandbox import JobSpec
 from orchestrator.sources import sentry
@@ -62,6 +64,28 @@ build must pass too.""",
 _GENERIC_GATE = """\
 Mirror the repository's CI exactly (see .github/workflows): every check it runs
 must pass locally before you open a PR."""
+
+#: Spliced into every multi-phase prompt (triage and revision). What it buys:
+#: the markers ride the stream-json transcript, which heartbeat drains make
+#: durable, so a killed sandbox's replacement knows what was already done (#12).
+_STAGE_MARKERS = """\
+# Durability markers (MANDATORY)
+
+This sandbox can be killed at any moment and a fresh agent restarted from your
+transcript; the transcript is the only thing that survives. Immediately after
+each milestone below becomes true, print one line of reply text in exactly this
+shape (no code fence), then keep going:
+
+STAGE_COMPLETED {{"stage": "investigated", "outcome": "<the outcome you decided>", "cause": "<one sentence>"}}
+STAGE_COMPLETED {{"stage": "fix_committed", "test": "<test id>", "commit": "<sha>"}}
+STAGE_COMPLETED {{"stage": "pushed", "branch": "{branch}"}}
+STAGE_COMPLETED {{"stage": "pr_opened", "pr_url": "<the PR URL>"}}
+
+A marker may state only facts that are already true — a resumed agent will
+trust these lines instead of redoing the work. Markers whose milestone never
+happens (NOT_A_BUG commits nothing) are simply never printed.
+
+"""
 
 _TRIAGE_PROMPT = """\
 You are an unattended triage agent working on the repository {repo}. Nobody is
@@ -136,7 +160,7 @@ weaken or skip an existing test to get to green.
 - Do not touch Sentry itself; resolution happens via the commit message.
 - Stay inside /workspace and /work.
 
-# Result contract (MANDATORY)
+{markers}# Result contract (MANDATORY)
 
 Before you finish — whatever the outcome, even on failure — write
 /work/result.json:
@@ -205,6 +229,7 @@ def _sentry_triage(run: Run) -> JobSpec:
         permalink=payload.get("permalink") or "?",
         detail=_issue_detail(payload),
         gate=_REPO_GATES.get(repo, _GENERIC_GATE),
+        markers=_STAGE_MARKERS.format(branch=branch),
     )
     return JobSpec(
         prompt=prompt,
@@ -348,7 +373,7 @@ what is red and why. Never weaken or skip an existing test to get to green.
 - Keep the pull request a draft; the next review round decides readiness.
 - Stay inside /workspace and /work.
 
-# Result contract (MANDATORY)
+{markers}# Result contract (MANDATORY)
 
 Write /work/result.json before you finish:
 
@@ -424,6 +449,7 @@ def _fix_revision(run: Run) -> JobSpec:
         round=payload.get("round", 2),
         refutation=payload.get("refutation") or "(refutation text missing)",
         gate=_REPO_GATES.get(repo, _GENERIC_GATE),
+        markers=_STAGE_MARKERS.format(branch=branch),
     )
     return JobSpec(
         prompt=prompt,
@@ -433,6 +459,118 @@ def _fix_revision(run: Run) -> JobSpec:
         model=_TRIAGE_MODEL,
         needs_github=True,
         needs_docker=True,
+    )
+
+
+# --- kill-and-resume (#12) ----------------------------------------------------
+
+STAGE_MARKER = "STAGE_COMPLETED"
+
+_RESUME_PREAMBLE = """\
+# RESUME — this is attempt {attempt} of an interrupted job
+
+A previous attempt at this exact job was killed part way through. Its sandbox
+and any uncommitted local work are gone; only what reached origin or is stated
+below survived. From its transcript, it had completed:
+
+{stages}
+
+Verify each line cheaply (a branch on origin, an open PR, a recorded decision)
+instead of re-deriving it, pick up after the last completed stage, and do not
+redo work a marker already covers. The original brief follows.
+
+"""
+
+
+def _reply_texts(event: dict) -> list[str]:
+    """The agent's own words in one stream-json event.
+
+    Only assistant text blocks and the final result count. Tool results ride
+    events of type "user" and can contain file contents — including the prompt
+    that *defines* the markers — and a marker quoted from there is not a
+    milestone.
+    """
+    if event.get("type") == "assistant":
+        content = (event.get("message") or {}).get("content") or []
+        return [
+            block.get("text") or ""
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+    if event.get("type") == "result" and isinstance(event.get("result"), str):
+        return [event["result"]]
+    return []
+
+
+def stage_markers(events: list[dict]) -> list[dict]:
+    """Mechanically extract the STAGE_COMPLETED lines from a stored transcript.
+
+    No LLM in the loop: this is a resume, not a summary. Keeps the last marker
+    per stage name, ordered by when each stage last completed, so a stage the
+    agent redid supersedes its earlier claim.
+    """
+    stages: dict[str, dict] = {}
+    for event in events:
+        for text in _reply_texts(event):
+            for line in text.splitlines():
+                line = line.strip()
+                if not line.startswith(STAGE_MARKER):
+                    continue
+                try:
+                    parsed = json.loads(line[len(STAGE_MARKER) :].strip())
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict) and parsed.get("stage"):
+                    stages.pop(parsed["stage"], None)
+                    stages[parsed["stage"]] = parsed
+    return list(stages.values())
+
+
+def _prior_claude_events(run: Run) -> list[dict]:
+    """The stored transcript of this run's earlier attempts.
+
+    Opens its own connection because spec building happens inside the runner's
+    ``start``, a layer deliberately free of database access. Module-level (like
+    ``_sentry_client``) so tests can substitute.
+    """
+    with db.connect() as conn:
+        return [
+            e.payload
+            for e in log.load_events(conn, run.id)
+            if e.type is EventType.CLAUDE_EVENT
+        ]
+
+
+def _resumed(run: Run, spec: JobSpec) -> JobSpec:
+    """Brief a retry on what its predecessor established.
+
+    Best-effort on purpose: a failure to read the history logs and falls back
+    to the plain spec, because a resume feature must never become a new way to
+    lose the run. When the previous attempt pushed its branch, the workspace
+    switches to ``reuse_branch`` so the retry starts from those commits instead
+    of resetting the branch and erasing them.
+    """
+    try:
+        stages = stage_markers(_prior_claude_events(run))
+    except Exception:
+        logger.exception("run %s: could not load prior-attempt context", run.id)
+        return spec
+    if not stages:
+        return spec
+    lines = "\n".join(f"{STAGE_MARKER} {json.dumps(s)}" for s in stages)
+    prompt = _RESUME_PREAMBLE.format(attempt=run.attempts, stages=lines) + spec.prompt
+    pushed = any(s.get("stage") in ("pushed", "pr_opened") for s in stages)
+    logger.info(
+        "run %s resumes attempt %s with %s prior stage(s)%s",
+        run.id,
+        run.attempts,
+        len(stages),
+        "; reusing the pushed branch" if pushed and spec.repo else "",
+    )
+    return replace(
+        spec,
+        prompt=prompt,
+        reuse_branch=spec.reuse_branch or (pushed and bool(spec.repo)),
     )
 
 
@@ -565,4 +703,10 @@ def build_spec(run: Run) -> JobSpec:
     builder = REGISTRY.get(run.kind)
     if builder is None:
         raise RuntimeError(f"no job spec registered for kind {run.kind!r}")
-    return builder(run)
+    spec = builder(run)
+    if run.attempts > 1:
+        # By dispatch time attempts is already this attempt's number, so > 1
+        # means a predecessor ran (or at least leased) and may have left a
+        # transcript worth resuming from (#12).
+        spec = _resumed(run, spec)
+    return spec
