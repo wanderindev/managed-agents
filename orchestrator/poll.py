@@ -13,9 +13,9 @@ import argparse
 import logging
 import sys
 
-from orchestrator import config
+from orchestrator import config, github
 from orchestrator.db import connect
-from orchestrator.sources import sentry
+from orchestrator.sources import github_prs, sentry
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +55,23 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             stats_period=config.SENTRY_STATS_PERIOD,
         )
+        _poll_prs(conn, dry_run=args.dry_run)
     # Exit code carries nothing about how many were enqueued: a poll that finds
     # nothing is a completely normal outcome and must not look like a failure to
     # whatever timer runs this.
     return 0 if report is not None else 1
+
+
+def _poll_prs(conn, *, dry_run: bool) -> None:
+    """The change-request source (#10). Optional: without the App configured
+    there are no orchestrator PRs to poll, so skipping is correct, not a
+    degradation — but it is said out loud, never silently."""
+    try:
+        token = github.from_config().installation_token()
+    except github.GitHubAppError as exc:
+        logger.warning("skipping the PR poll (GitHub App not usable: %s)", exc)
+        return
+    github_prs.poll(conn, github_prs.PullsClient(token), dry_run=dry_run)
 
 
 if __name__ == "__main__":
