@@ -5,7 +5,6 @@ a branch a human pushed to, never more than three revision rounds, and never
 the same comment handled twice.
 """
 
-
 from orchestrator import jobs
 from orchestrator.enums import EventType
 from orchestrator.log import append, create_run
