@@ -295,15 +295,25 @@ class Orchestrator:
     ) -> datetime | None:
         """Append the transcript, skipping whatever is already stored.
 
-        The runner hands back every event from the beginning of the run, so this
-        is idempotent: a crash part way through a drain costs nothing, and a
+        The runner hands back every event from the beginning of the *container*,
+        so the skip is anchored at the current attempt's ``sandbox_started`` and
+        counts only the events stored after it. Anchoring at the run instead
+        swallows a retry's transcript whenever the killed predecessor stored
+        more events than the retry has emitted yet. Within the attempt this is
+        idempotent: a crash part way through a drain costs nothing, and a
         harvest after a restart picks up exactly where the last one stopped.
 
         Returns the reset time of the last rate limit seen, if any, so the
         abandon path can wait until then instead of guessing.
         """
         reset_at: datetime | None = None
-        already = log.count_events(conn, run.id, EventType.CLAUDE_EVENT)
+        started = log.latest_event(conn, run.id, EventType.SANDBOX_STARTED)
+        already = log.count_events(
+            conn,
+            run.id,
+            EventType.CLAUDE_EVENT,
+            after_seq=started.seq if started else 0,
+        )
         for payload in events[already:]:
             with conn.transaction():
                 log.append(conn, run.id, EventType.CLAUDE_EVENT, payload)
@@ -338,14 +348,18 @@ class Orchestrator:
 
         The drain returns a reset only for events it just appended, so a limit
         harvested by an earlier heartbeat is invisible to the GONE-path drain.
-        The log still has it, and it is still the best wait available.
+        The log still has it, and it is still the best wait available — unless
+        it has already passed (a limit banked by a *previous* attempt), where a
+        not_before in the past would disable the backoff outright and the
+        computed guess is the honest fallback.
         """
+        now = datetime.now(UTC)
         for event in reversed(log.load_events(conn, run.id)):
             if event.type is not EventType.CLAUDE_EVENT:
                 continue
             reset = _rate_limit_reset(event.payload)
             if reset is not None:
-                return reset
+                return reset if reset > now else None
         return None
 
     def _handle_for(self, conn: psycopg.Connection, run: Run) -> str | None:

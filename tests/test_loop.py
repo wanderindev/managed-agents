@@ -273,6 +273,38 @@ def test_events_drained_at_heartbeat_survive_a_lost_sandbox(conn):
     assert [e.payload for e in stored] == [{"type": "assistant", "n": 1}]
 
 
+def test_a_retrys_transcript_is_not_swallowed_by_its_predecessors(conn):
+    """Found live by the run-8 demo: the drain's skip counted the whole run,
+    but each container's transcript restarts from zero. A killed attempt that
+    banked more events than its retry has emitted made the retry's drain skip
+    everything, so the retry finished with no transcript at all — and a third
+    attempt would have resumed from the wrong attempt's markers."""
+    runner = VanishingRunner(
+        events=[{"type": "assistant", "n": 1}, {"type": "assistant", "n": 2}]
+    )
+    orchestrator = Orchestrator(
+        runner, worker_id=WORKER, max_concurrent=1, backoff_base_seconds=0
+    )
+    run_id = create_run(conn, "sentry_triage", "sentry:HB-6")
+
+    orchestrator.tick(conn)  # start attempt 1
+    orchestrator.tick(conn)  # heartbeat banks both events
+    runner.events = []  # attempt 1 dies taking its logs with it
+    runner.kill_all()
+    orchestrator.tick(conn)  # abandon + re-lease + start attempt 2
+    runner.events = [{"type": "assistant", "resumed": True}]  # shorter transcript
+    orchestrator.tick(conn)  # heartbeat must bank it, not skip it
+
+    stored = [
+        e.payload for e in load_events(conn, run_id) if e.type is EventType.CLAUDE_EVENT
+    ]
+    assert stored == [
+        {"type": "assistant", "n": 1},
+        {"type": "assistant", "n": 2},
+        {"type": "assistant", "resumed": True},
+    ]
+
+
 def test_a_failing_drain_does_not_cost_the_heartbeat(conn, orchestrator, runner):
     """The lease extension commits first: a docker-logs hiccup must not let the
     lease lapse, which would get a healthy run abandoned by the next tick."""
