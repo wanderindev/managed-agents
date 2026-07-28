@@ -232,17 +232,29 @@ def verify_replay(conn: psycopg.Connection, run_id: int) -> bool:
     return replay_status(load_events(conn, run_id)) == stored_status(conn, run_id)
 
 
-def count_events(conn: psycopg.Connection, run_id: int, event_type: EventType) -> int:
-    """How many events of a type a run already has.
+def count_events(
+    conn: psycopg.Connection,
+    run_id: int,
+    event_type: EventType,
+    after_seq: int = 0,
+) -> int:
+    """How many events of a type a run has past ``after_seq``.
 
     Draining a transcript uses this as its resume point: the sandbox hands back
     every event from the beginning, and the loop skips the ones already stored.
     That makes the drain idempotent, so a crash part way through costs nothing.
+
+    ``after_seq`` scopes the count to the current *attempt* — anchored at its
+    ``sandbox_started`` — because the transcript restarts from zero with each
+    container. Counting the whole run instead silently swallows a retry's
+    transcript whenever the predecessor stored more events than the retry has
+    emitted (the live run-8 demo found exactly that).
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT count(*) AS n FROM agent_events WHERE run_id = %s AND type = %s",
-            (run_id, event_type.value),
+            "SELECT count(*) AS n FROM agent_events"
+            " WHERE run_id = %s AND type = %s AND seq > %s",
+            (run_id, event_type.value, after_seq),
         )
         return cur.fetchone()["n"]
 
