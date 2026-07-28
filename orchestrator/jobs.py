@@ -579,6 +579,111 @@ def _pr_revision(run: Run) -> JobSpec:
     )
 
 
+# --- dreaming job (#15) ---------------------------------------------------------
+
+DREAM_KIND = "memory_dream"
+
+_DREAM_PROMPT = """\
+You are an unattended memory auditor — the "dreaming job" — for the
+repository {repo}. Nobody is watching this session and nobody will answer
+questions.
+
+The repository is cloned at /workspace, checked out on the branch `{branch}`.
+Its memory file is CLAUDE.md at the repository root: the persistent facts
+every future agent session loads before touching this codebase. Your job is
+to audit that memory against two sources of truth: the repository as it
+exists today in the working tree, and the evidence below from the last
+{days} day(s) of unattended runs.
+
+# Evidence from recent runs
+
+{digest}
+
+# What to look for — three classes
+
+1. CONTRADICTED — a memory claim that the evidence above or the code
+   contradicts.
+2. STALE — a memory claim citing something that no longer exists: a file, an
+   endpoint, a table, a command, a flag. Verify every citation CLAUDE.md
+   makes against the working tree; that is exactly why you have the
+   repository and not just the memory file.
+3. MISSING — a durable fact the recent runs established that no memory
+   records, and that a future agent would act differently for knowing.
+   Durable means about the codebase or its operation — not about any one
+   incident.
+
+# What to do about each
+
+- SAFE EDITS (apply): additions for MISSING facts, and corrections for STALE
+  citations whose correct value you can verify in the working tree. Edit
+  CLAUDE.md in place, keeping its structure and voice, with the smallest
+  change that fixes the memory. Then commit, push
+  (`git push -u origin {branch}`), and open a DRAFT pull request against main
+  (write the body to a file, `gh pr create --draft --base main --title "..."
+  --body-file <file>`) whose body lists each edit and its evidence.
+- FLAGS (never apply): deletions, and CONTRADICTED claims. NEVER delete or
+  rewrite a memory whose correction you cannot positively verify — deletion
+  is the one operation here with no recovery path. Record each flag in the
+  result with its specific evidence; a human reviews those.
+
+If there are no safe edits, make no commit and no pull request.
+
+# Hard rules
+
+- Edit ONLY CLAUDE.md. Never touch code, tests, or configuration.
+- Never merge anything. Never push to main. Never force-push.
+- Stay inside /workspace and /work.
+
+{markers}# Result contract (MANDATORY)
+
+Write /work/result.json before you finish:
+
+{{
+  "outcome": "CLEAN" | "FINDINGS",
+  "applied": [
+    {{"class": "STALE" | "MISSING", "claim": "the memory line touched",
+      "edit": "what changed", "evidence": "why this is correct"}}
+  ],
+  "flagged": [
+    {{"class": "CONTRADICTED" | "DELETION", "claim": "the memory line",
+      "evidence": "what contradicts it"}}
+  ],
+  "pr_url": "the draft PR URL, when safe edits were applied",
+  "summary": "one paragraph: the state of this repository's memory"
+}}
+
+CLEAN means both lists are empty and nothing needed changing.
+"""
+
+
+def _memory_dream(run: Run) -> JobSpec:
+    payload = run.payload or {}
+    repo = payload.get("repo")
+    if not repo:
+        raise RuntimeError(f"dream run {run.id} has no repo in its payload")
+    branch = f"agent/run-{run.id}"
+    entries = payload.get("digest") or []
+    digest = "\n".join(json.dumps(e) for e in entries) or "(no recent run evidence)"
+    prompt = _DREAM_PROMPT.format(
+        repo=repo,
+        branch=branch,
+        days=payload.get("days", 7),
+        digest=digest,
+        markers=_STAGE_MARKERS.format(branch=branch),
+    )
+    return JobSpec(
+        prompt=prompt,
+        repo=repo,
+        branch=branch,
+        model=_TRIAGE_MODEL,
+        needs_github=True,
+        # No docker: the audit reads code and edits one markdown file. A
+        # memory PR that somehow needs the test suite is a memory PR that is
+        # editing more than memory.
+        needs_docker=False,
+    )
+
+
 # --- kill-and-resume (#12) ----------------------------------------------------
 
 STAGE_MARKER = "STAGE_COMPLETED"
@@ -785,6 +890,22 @@ def followups(run: Run, result: dict | None) -> Followups:
             }
         )
 
+    if run.kind == DREAM_KIND:
+        # Anything worth a human's eyes — a PR of safe edits, or flags that
+        # must never be auto-applied — parks the run; #9 emails the report.
+        # CLEAN completes quietly and the notifier says so once.
+        if result.get("flagged") or result.get("pr_url"):
+            return Followups(
+                human_gate={
+                    "why": "memory audit found issues to review",
+                    "outcome": result.get("outcome"),
+                    "reason": result.get("summary") or "",
+                    "pr_url": result.get("pr_url"),
+                    "flagged": result.get("flagged") or [],
+                }
+            )
+        return Followups()
+
     if run.kind == REVIEW_KIND:
         verdict = result.get("verdict")
         round_ = payload.get("round", 1)
@@ -837,6 +958,7 @@ REGISTRY: dict[str, SpecBuilder] = {
     REVIEW_KIND: _adversarial_review,
     REVISION_KIND: _fix_revision,
     PR_REVISION_KIND: _pr_revision,
+    DREAM_KIND: _memory_dream,
 }
 
 

@@ -31,13 +31,13 @@ import psycopg
 from orchestrator import config, log
 from orchestrator.db import connect
 from orchestrator.enums import EventType
-from orchestrator.jobs import REVIEW_KIND, REVISION_KIND
+from orchestrator.jobs import DREAM_KIND, PR_REVISION_KIND, REVIEW_KIND, REVISION_KIND
 from orchestrator.sources.sentry import RUN_KIND as TRIAGE_KIND
 
 logger = logging.getLogger(__name__)
 
 #: Kinds whose outcomes a human cares about. Smoke runs never email.
-_KINDS = (TRIAGE_KIND, REVISION_KIND, REVIEW_KIND)
+_KINDS = (TRIAGE_KIND, REVISION_KIND, REVIEW_KIND, PR_REVISION_KIND, DREAM_KIND)
 
 _warned_disabled = False
 
@@ -146,12 +146,19 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
         return f"run ABANDONED after {cand.attempts} attempts"
     # DONE:
     outcome = result.get("outcome")
-    if cand.kind in (TRIAGE_KIND, REVISION_KIND):
+    if cand.kind in (TRIAGE_KIND, REVISION_KIND, PR_REVISION_KIND):
         if outcome in ("NOT_A_BUG", "NEEDS_HUMAN"):
             return outcome
         if outcome == "FIX":
             return None  # the chain continues; the review run will email
         return "finished without a structured result"
+    if cand.kind == DREAM_KIND:
+        # A dream with findings parks AWAITING_HUMAN and is handled above;
+        # DONE means it found nothing, and that is still said once — a weekly
+        # audit whose silence could mean "clean" or "never ran" is worthless.
+        if outcome == "CLEAN":
+            return "memory audit: CLEAN"
+        return "memory audit finished without a structured result"
     return None  # a DONE review chained a revision; that run will email
 
 
@@ -182,6 +189,16 @@ def _body(cand: _Candidate, result: dict, gate: dict) -> str:
         ]
     elif gate.get("why"):
         lines += [f"Parked because: {gate['why']}", gate.get("reason") or "", ""]
+    if gate.get("flagged"):
+        # The dreamer's contradictions and deletion candidates. Listed in
+        # full: these are precisely the edits nothing will apply for you.
+        lines += ["Flagged for review (never auto-applied):"]
+        for item in gate["flagged"]:
+            lines += [
+                f"- [{item.get('class', '?')}] {item.get('claim', '?')}",
+                f"    evidence: {item.get('evidence', '?')}",
+            ]
+        lines += [""]
     if result.get("test"):
         lines += [f"Covered by: {result['test']}", ""]
     lines += [
