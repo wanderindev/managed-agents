@@ -32,7 +32,15 @@ from orchestrator import config, log
 from orchestrator.db import connect
 from orchestrator.driver import RUN_KIND as DRIVE_KIND
 from orchestrator.enums import EventType
-from orchestrator.jobs import DREAM_KIND, PR_REVISION_KIND, REVIEW_KIND, REVISION_KIND
+from orchestrator.jobs import (
+    DREAM_KIND,
+    PR_REVISION_KIND,
+    RESEARCH_REVISE_KIND,
+    RESEARCH_WRITE_KIND,
+    REVIEW_KIND,
+    REVISION_KIND,
+    RUBRIC_VERIFY_KIND,
+)
 from orchestrator.sources.sentry import RUN_KIND as TRIAGE_KIND
 
 logger = logging.getLogger(__name__)
@@ -45,6 +53,9 @@ _KINDS = (
     PR_REVISION_KIND,
     DREAM_KIND,
     DRIVE_KIND,
+    RESEARCH_WRITE_KIND,
+    RUBRIC_VERIFY_KIND,
+    RESEARCH_REVISE_KIND,
 )
 
 _warned_disabled = False
@@ -167,6 +178,16 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
         if outcome == "CLEAN":
             return "memory audit: CLEAN"
         return "memory audit finished without a structured result"
+    if cand.kind in (RESEARCH_WRITE_KIND, RESEARCH_REVISE_KIND):
+        if outcome in ("WROTE", "REVISED"):
+            return None  # the chain continues; the verify run will email
+        return "finished without a structured result"
+    if cand.kind == RUBRIC_VERIFY_KIND:
+        # Passing and bound-exhausted grades park AWAITING_HUMAN above; a DONE
+        # verify chained a revision, and that run (or the next grade) emails.
+        if result.get("verdicts"):
+            return None
+        return "finished without a structured result"
     if cand.kind == DRIVE_KIND:
         # An incomplete drive parks AWAITING_HUMAN and is handled above; a
         # COMPLETE Saturday still gets its one line, same silence rule.
