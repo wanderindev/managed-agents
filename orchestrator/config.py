@@ -188,3 +188,33 @@ GITHUB_HUMAN_LOGINS = tuple(
 
 #: Revision runs one poll may enqueue. A review spree must not spawn a fleet.
 GITHUB_PR_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_GITHUB_PR_MAX_PER_POLL", "3"))
+
+# --- weekly-series driver (#13) ------------------------------------------------
+
+#: Scheme + host of the PIC deployment. CallSpec paths are absolute
+#: (/api/v1/...), so this is the only URL piece the driver supplies.
+PIC_API_BASE = os.environ.get(
+    "ORCHESTRATOR_PIC_API_BASE", "https://panamaincontext.com"
+)
+
+#: The long-lived service token PIC's agent-tasks router accepts (its #418).
+#: Empty disables the driver entirely.
+PIC_DRIVER_TOKEN = os.environ.get("ORCHESTRATOR_PIC_DRIVER_TOKEN", "")
+
+#: Ceiling on tasks one drive session will execute. A week's graph is a few
+#: dozen rows; a session that hits this cap is looping, not working.
+DRIVER_MAX_TASKS = int(os.environ.get("ORCHESTRATOR_DRIVER_MAX_TASKS", "60"))
+
+#: Session failure budget. The issue's rule is "anything that fails twice
+#: becomes an email, not a retry loop"; PIC's own attempts ceiling parks
+#: individual tasks, and this bounds the session as a whole.
+DRIVER_MAX_FAILURES = int(os.environ.get("ORCHESTRATOR_DRIVER_MAX_FAILURES", "5"))
+
+#: Background-job polling cadence and patience (the 202-returning fact-check
+#: kinds). The timeout mirrors the sandbox wall clock: generous, but an ending.
+DRIVER_JOB_POLL_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_DRIVER_JOB_POLL_SECONDS", "15")
+)
+DRIVER_JOB_TIMEOUT_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_DRIVER_JOB_TIMEOUT_SECONDS", "1800")
+)

@@ -30,6 +30,7 @@ import psycopg
 
 from orchestrator import config, log
 from orchestrator.db import connect
+from orchestrator.driver import RUN_KIND as DRIVE_KIND
 from orchestrator.enums import EventType
 from orchestrator.jobs import DREAM_KIND, PR_REVISION_KIND, REVIEW_KIND, REVISION_KIND
 from orchestrator.sources.sentry import RUN_KIND as TRIAGE_KIND
@@ -37,7 +38,14 @@ from orchestrator.sources.sentry import RUN_KIND as TRIAGE_KIND
 logger = logging.getLogger(__name__)
 
 #: Kinds whose outcomes a human cares about. Smoke runs never email.
-_KINDS = (TRIAGE_KIND, REVISION_KIND, REVIEW_KIND, PR_REVISION_KIND, DREAM_KIND)
+_KINDS = (
+    TRIAGE_KIND,
+    REVISION_KIND,
+    REVIEW_KIND,
+    PR_REVISION_KIND,
+    DREAM_KIND,
+    DRIVE_KIND,
+)
 
 _warned_disabled = False
 
@@ -159,6 +167,12 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
         if outcome == "CLEAN":
             return "memory audit: CLEAN"
         return "memory audit finished without a structured result"
+    if cand.kind == DRIVE_KIND:
+        # An incomplete drive parks AWAITING_HUMAN and is handled above; a
+        # COMPLETE Saturday still gets its one line, same silence rule.
+        if outcome == "COMPLETE":
+            return "weekly drive: COMPLETE"
+        return "weekly drive finished without a structured result"
     return None  # a DONE review chained a revision; that run will email
 
 
@@ -197,6 +211,15 @@ def _body(cand: _Candidate, result: dict, gate: dict) -> str:
             lines += [
                 f"- [{item.get('class', '?')}] {item.get('claim', '?')}",
                 f"    evidence: {item.get('evidence', '?')}",
+            ]
+        lines += [""]
+    if gate.get("parked_tasks"):
+        # The drive's stuck steps; the admin queue page is the fixing tool.
+        lines += ["Parked tasks (retry or skip them from the admin queue page):"]
+        for item in gate["parked_tasks"]:
+            lines += [
+                f"- task {item.get('task_id')}  {item.get('kind', '?')}"
+                f"  on {item.get('subject', '?')}: {item.get('error') or '(no error text)'}"
             ]
         lines += [""]
     if result.get("test"):
