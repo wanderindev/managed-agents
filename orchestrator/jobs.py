@@ -684,6 +684,260 @@ def _memory_dream(run: Run) -> JobSpec:
     )
 
 
+# --- rubric verifier (#14) ------------------------------------------------------
+
+RESEARCH_WRITE_KIND = "research_write"
+RUBRIC_VERIFY_KIND = "rubric_verify"
+RESEARCH_REVISE_KIND = "research_revise"
+
+#: Grade-revise-regrade iterations, total, hard-bounded: an unbounded revise
+#: loop is the expensive failure mode of every generate-and-check system.
+MAX_RUBRIC_ITERATIONS = 2
+
+_RESEARCH_WRITE_PROMPT = """\
+You are an unattended research writer working in the repository {repo}. Nobody
+is watching this session and nobody will answer questions.
+
+The repository is cloned at /workspace on the branch `{branch}`. Your job is to
+produce a research document that a separate, fresh-context grader will score
+against the rubric below. The grader sees only the rubric and your document —
+none of your reasoning — so the document must carry its own evidence.
+
+# The assignment
+
+Topic: {topic}
+
+Required subtopics:
+{subtopics}
+
+Research the topic using web search and page fetches. Prioritize primary and
+authoritative sources, cite as you go, and cover every required subtopic
+substantively — a heading with two sentences under it is not coverage.
+
+# The rubric your document will be graded against
+
+{rubric}
+
+The rubric was written before you started, and it will not bend to fit what
+you produce. Meet it.
+
+# Deliverable
+
+Write the document as markdown to `{artifact_path}` inside /workspace (create
+directories as needed). Then commit it and push the branch:
+`git push -u origin {branch}`. Never open a pull request; the branch itself is
+the hand-off to the grader.
+
+# Hard rules
+
+- Touch ONLY `{artifact_path}`. Never merge, never push to main, never
+  force-push.
+- Stay inside /workspace and /work.
+
+{markers}# Result contract (MANDATORY)
+
+Write /work/result.json before you finish:
+
+{{
+  "outcome": "WROTE" | "NEEDS_HUMAN",
+  "artifact_path": "{artifact_path}",
+  "word_count": <integer>,
+  "reason": "for NEEDS_HUMAN: what stopped you",
+  "summary": "one paragraph: what the document covers and its main sources"
+}}
+"""
+
+_RUBRIC_VERIFY_PROMPT = """\
+You are a fresh-context grader. A separate agent produced an artifact; you have
+deliberately been given none of its reasoning — only the rubric below, written
+before the artifact existed, and the artifact itself. If the artifact does not
+demonstrate a criterion on its own evidence, that criterion FAILS. Grade what
+is on the page, not what the author probably meant.
+
+This is grading pass {iteration} of at most {max_iterations} for this artifact.
+
+The repository is cloned at /workspace on the branch `{branch}`. The artifact
+is the file `{artifact_path}`. Read it in full.
+
+# The rubric
+
+{rubric}
+
+# How to grade
+
+For every criterion, decide pass or fail and state the specific evidence: a
+word count you computed, the heading you found or did not find, the subtopic
+whose treatment you judged substantive or thin and why. Where a criterion
+states a mechanical check (a count, a required heading), perform it exactly —
+compute, do not estimate. The default is fail: a criterion you cannot verify
+from the artifact alone is a criterion the artifact does not meet.
+
+# Hard rules
+
+- Read-only: change nothing, commit nothing, push nothing. Your verdict
+  travels through the result file alone.
+- Stay inside /workspace and /work.
+
+# Result contract (MANDATORY)
+
+Write /work/result.json before you finish:
+
+{{
+  "passed": true | false,
+  "verdicts": [
+    {{"id": "<criterion id>", "pass": true | false,
+      "evidence": "what you measured or found",
+      "gap": "for failures: specifically what is missing and how much"}}
+  ],
+  "summary": "one paragraph: the artifact's standing against the rubric"
+}}
+
+``passed`` must be true only when every criterion passes.
+"""
+
+_RESEARCH_REVISE_PROMPT = """\
+You are an unattended revision agent working in the repository {repo}. Nobody
+is watching this session and nobody will answer questions.
+
+A fresh-context grader scored the research document `{artifact_path}` (on the
+branch `{branch}`, checked out at /workspace) against a rubric written before
+the document existed. It failed. These are the failed criteria, with the
+grader's evidence and gaps:
+
+{gaps}
+
+# Your job
+
+Fix exactly what the gaps name. Extend thin subtopics with substantive,
+sourced material; add what is missing; do not pad, and do not rewrite what
+already passed — the next grading pass re-checks every criterion, and churn
+risks breaking ones that were fine. Research with web search where the gaps
+demand new material.
+
+Then commit and push the branch. Never open a pull request.
+
+# Hard rules
+
+- Touch ONLY `{artifact_path}`. Never merge, never push to main, never
+  force-push.
+- Stay inside /workspace and /work.
+
+{markers}# Result contract (MANDATORY)
+
+Write /work/result.json before you finish:
+
+{{
+  "outcome": "REVISED" | "NEEDS_HUMAN",
+  "artifact_path": "{artifact_path}",
+  "word_count": <integer>,
+  "reason": "for NEEDS_HUMAN: what stopped you",
+  "summary": "per failed criterion: what you changed for it"
+}}
+"""
+
+
+def _format_rubric(rubric: list) -> str:
+    lines = []
+    for criterion in rubric:
+        if isinstance(criterion, dict):
+            lines.append(
+                f"- [{criterion.get('id', '?')}] {criterion.get('criterion', '?')}"
+                + (f"\n  Check: {criterion['check']}" if criterion.get("check") else "")
+            )
+    return "\n".join(lines) or "(empty rubric)"
+
+
+def _rubric_payload_guard(run: Run) -> dict:
+    payload = run.payload or {}
+    if not payload.get("repo") or not payload.get("artifact_path"):
+        raise RuntimeError(f"run {run.id} lacks repo/artifact_path in its payload")
+    if not payload.get("rubric"):
+        # The rubric is written at planning time or not at all. A missing one
+        # here means the enqueuer skipped the whole point of #14.
+        raise RuntimeError(f"run {run.id} has no rubric in its payload")
+    return payload
+
+
+def _research_write(run: Run) -> JobSpec:
+    payload = _rubric_payload_guard(run)
+    repo = payload["repo"]
+    branch = f"agent/run-{run.id}"
+    prompt = _RESEARCH_WRITE_PROMPT.format(
+        repo=repo,
+        branch=branch,
+        topic=payload.get("topic") or "?",
+        subtopics="\n".join(f"- {s}" for s in payload.get("subtopics") or []),
+        rubric=_format_rubric(payload["rubric"]),
+        artifact_path=payload["artifact_path"],
+        markers=_STAGE_MARKERS.format(branch=branch),
+    )
+    return JobSpec(
+        prompt=prompt,
+        repo=repo,
+        branch=branch,
+        model=_TRIAGE_MODEL,
+        needs_github=True,
+        needs_docker=False,
+    )
+
+
+def _rubric_verify(run: Run) -> JobSpec:
+    payload = _rubric_payload_guard(run)
+    branch = payload.get("branch")
+    if not branch:
+        raise RuntimeError(f"verify run {run.id} lacks a branch in its payload")
+    prompt = _RUBRIC_VERIFY_PROMPT.format(
+        branch=branch,
+        artifact_path=payload["artifact_path"],
+        rubric=_format_rubric(payload["rubric"]),
+        iteration=payload.get("iteration", 1),
+        max_iterations=MAX_RUBRIC_ITERATIONS,
+    )
+    return JobSpec(
+        prompt=prompt,
+        repo=payload["repo"],
+        branch=branch,
+        reuse_branch=True,
+        model=_TRIAGE_MODEL,
+        # Read-only by contract; the token only exists to fetch the branch.
+        needs_github=True,
+        needs_docker=False,
+    )
+
+
+def _research_revise(run: Run) -> JobSpec:
+    payload = _rubric_payload_guard(run)
+    branch = payload.get("branch")
+    if not branch:
+        raise RuntimeError(f"revise run {run.id} lacks a branch in its payload")
+    gaps = "\n".join(
+        f"- [{v.get('id', '?')}] gap: {v.get('gap') or '?'}\n"
+        f"  grader's evidence: {v.get('evidence') or '?'}"
+        for v in payload.get("failed") or []
+    )
+    prompt = _RESEARCH_REVISE_PROMPT.format(
+        repo=payload["repo"],
+        branch=branch,
+        artifact_path=payload["artifact_path"],
+        gaps=gaps or "(no gaps carried; treat the whole rubric as suspect)",
+        markers=_STAGE_MARKERS.format(branch=branch),
+    )
+    return JobSpec(
+        prompt=prompt,
+        repo=payload["repo"],
+        branch=branch,
+        reuse_branch=True,
+        model=_TRIAGE_MODEL,
+        needs_github=True,
+        needs_docker=False,
+    )
+
+
+def _rubric_chain_payload(payload: dict) -> dict:
+    keys = ("repo", "artifact_path", "rubric", "topic", "subtopics", "branch")
+    return {k: payload[k] for k in keys if k in payload}
+
+
 # --- kill-and-resume (#12) ----------------------------------------------------
 
 STAGE_MARKER = "STAGE_COMPLETED"
@@ -906,6 +1160,102 @@ def followups(run: Run, result: dict | None) -> Followups:
             )
         return Followups()
 
+    if run.kind == RESEARCH_WRITE_KIND:
+        if result.get("outcome") == "WROTE":
+            return Followups(
+                enqueue=(
+                    NewRun(
+                        RUBRIC_VERIFY_KIND,
+                        run.subject,
+                        {
+                            **_rubric_chain_payload(payload),
+                            "branch": f"agent/run-{run.id}",
+                            "iteration": 1,
+                            "wrote_by_run": run.id,
+                        },
+                    ),
+                )
+            )
+        return Followups(
+            human_gate={
+                "why": "research write could not produce an artifact",
+                "outcome": result.get("outcome"),
+                "reason": result.get("reason") or result.get("summary") or "",
+            }
+        )
+
+    if run.kind == RUBRIC_VERIFY_KIND:
+        iteration = payload.get("iteration", 1)
+        verdicts = result.get("verdicts") or []
+        failed = [v for v in verdicts if isinstance(v, dict) and not v.get("pass")]
+        # passed must be consistent with its own verdicts — a gate that claims
+        # a pass alongside failing criteria is downgraded, same as #8's rule
+        # that a verdict has to agree with the findings it is paired with.
+        passed = bool(result.get("passed")) and not failed and bool(verdicts)
+        if passed:
+            return Followups(
+                human_gate={
+                    "why": f"rubric cleared on grading pass {iteration}",
+                    "iteration": iteration,
+                    "reason": result.get("summary") or "",
+                    "branch": payload.get("branch"),
+                }
+            )
+        if iteration < MAX_RUBRIC_ITERATIONS:
+            return Followups(
+                enqueue=(
+                    NewRun(
+                        RESEARCH_REVISE_KIND,
+                        run.subject,
+                        {
+                            **_rubric_chain_payload(payload),
+                            "failed": failed,
+                            "iteration": iteration,
+                            "failed_by_run": run.id,
+                        },
+                    ),
+                )
+            )
+        return Followups(
+            human_gate={
+                "why": f"rubric not cleared after {iteration} grading pass(es)",
+                "iteration": iteration,
+                "reason": result.get("summary") or "",
+                "flagged": [
+                    {
+                        "class": v.get("id", "?"),
+                        "claim": v.get("gap") or "criterion failed",
+                        "evidence": v.get("evidence") or "",
+                    }
+                    for v in failed
+                ],
+                "branch": payload.get("branch"),
+            }
+        )
+
+    if run.kind == RESEARCH_REVISE_KIND:
+        if result.get("outcome") == "REVISED":
+            return Followups(
+                enqueue=(
+                    NewRun(
+                        RUBRIC_VERIFY_KIND,
+                        run.subject,
+                        {
+                            **_rubric_chain_payload(payload),
+                            "iteration": payload.get("iteration", 1) + 1,
+                            "revised_by_run": run.id,
+                        },
+                    ),
+                )
+            )
+        return Followups(
+            human_gate={
+                "why": "revision could not clear the rubric's gaps",
+                "outcome": result.get("outcome"),
+                "reason": result.get("reason") or result.get("summary") or "",
+            }
+        )
+
     if run.kind == REVIEW_KIND:
         verdict = result.get("verdict")
         round_ = payload.get("round", 1)
@@ -959,6 +1309,9 @@ REGISTRY: dict[str, SpecBuilder] = {
     REVISION_KIND: _fix_revision,
     PR_REVISION_KIND: _pr_revision,
     DREAM_KIND: _memory_dream,
+    RESEARCH_WRITE_KIND: _research_write,
+    RUBRIC_VERIFY_KIND: _rubric_verify,
+    RESEARCH_REVISE_KIND: _research_revise,
 }
 
 
