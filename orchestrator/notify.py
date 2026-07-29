@@ -218,8 +218,11 @@ def _body(cand: _Candidate, result: dict, gate: dict) -> str:
         lines += ["Parked tasks (retry or skip them from the admin queue page):"]
         for item in gate["parked_tasks"]:
             lines += [
-                f"- task {item.get('task_id')}  {item.get('kind', '?')}"
-                f"  on {item.get('subject', '?')}: {item.get('error') or '(no error text)'}"
+                (
+                    f"- task {item.get('task_id')}  {item.get('kind', '?')} on"
+                    f" {item.get('subject', '?')}:"
+                    f" {item.get('error') or '(no error text)'}"
+                )
             ]
         lines += [""]
     if result.get("test"):

@@ -225,8 +225,10 @@ def execute_calls(
             return (
                 False,
                 data,
-                f"{call['method']} {path} answered {status}: "
-                f"{json.dumps(data, default=str)[:300]}",
+                (
+                    f"{call['method']} {path} answered {status}: "
+                    f"{json.dumps(data, default=str)[:300]}"
+                ),
             )
         if isinstance(data, dict) and data.get("success") is False:
             return False, data, f"{path} reported success=false"
