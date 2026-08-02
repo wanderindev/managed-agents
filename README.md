@@ -6,7 +6,7 @@ Code in disposable sandboxes on a personal DigitalOcean droplet.
 **Outer harness only.** Claude Code stays the inner harness. Rebuilding that part
 is the collision risk, so this repo does not try.
 
-Roadmap and reasoning live in [issue #1](https://github.com/wanderindev/managed-agents/issues/1).
+The build log lives in [issues #1–#15](https://github.com/wanderindev/managed-agents/issues?q=is%3Aissue) (all closed; the epic is complete). The design write-up, with the live record and the lessons, is at [feliu.dev/projects/managed-agents](https://feliu.dev/projects/managed-agents).
 
 ## The idea
 
@@ -15,15 +15,22 @@ orchestrator is stateless and reconstructs everything by replaying the log, so a
 job can be killed and resumed without losing the work that came before it.
 
 ```
-work source  ->  agent_runs (queue)  ->  sandbox container  ->  artifact  ->  human gate
-                       |                        |
-                       +----- agent_events (append-only log) ----+
+work source  ->  agent_runs (queue)  ->  sandbox container  ->  artifact  ->  adversarial review  ->  human gate
+                       |                        |                                     |
+                       +----- agent_events (append-only log) ----+--------------------+
 ```
 
-The first workload is Sentry triage for `feliu-dev` and `panama-in-context`: poll
-for unresolved issues, investigate in a sandbox, patch, test, open a draft PR,
-have a fresh-context adversarial reviewer try to refute the patch, then email a
-human. Nothing merges without a person.
+Three workloads run through the loop today. Sentry triage polls unresolved
+issues on `feliu-dev` and `panama-in-context`, investigates in a sandbox, and
+lands one of three verdicts: a fix with a failing-then-passing test and a draft
+PR, `NOT_A_BUG` with evidence, or `NEEDS_HUMAN` with a brief. Every FIX is
+attacked by a fresh-context adversarial reviewer that must return STANDS before
+the PR leaves draft. The change-request loop turns human review comments on the
+orchestrator's own PRs into guarded revision runs. A nightly dreaming job
+audits each repo's memory file against digests of recent runs. On Saturdays a
+driver works PIC's agent-task queue through a weekly article series, with a
+rubric verifier grading output against a rubric written at planning time.
+Nothing merges without a person.
 
 ## Layout
 
@@ -32,15 +39,22 @@ migrations/          numbered plain SQL, applied in filename order
 orchestrator/
   config.py          environment, read once
   db.py              psycopg3 connection helper
+  dream.py           nightly memory-audit ("dreaming") entry point
+  driver.py          Saturday driver for PIC's agent-task queue
   enums.py           run statuses and event types
+  github.py          GitHub App auth, per-job installation tokens
+  jobs.py            job specs, prompts, and the followup chain
   log.py             the append-only log and the status fold
-  jobs.py            registry mapping a run's kind to a job spec
   loop.py            the stateless loop: reconcile, then dispatch
-  main.py            entry point
+  main.py            entry point for the loop
   migrate.py         migration runner
+  notify.py          outcome email; every silence explains itself
+  poll.py            work-source poll: Sentry issues, PR change requests
   queue.py           queue reads and the lease write
+  research_gate.py   research-gate experiment: write, rubric-verify, revise
   runner.py          Runner protocol, the seam to container mechanics
   sandbox.py         the Docker runner
+  sources/           the poll's work sources: sentry.py, github_prs.py
 docker/sandbox/      the disposable sandbox image
 scripts/             host provisioning, sandbox launch
 docs/runbook.md      how the host and database were built, and what bit
@@ -97,9 +111,18 @@ migrations connect as the owner and grants would not bind them.
 
 ## Configuration
 
+Everything is read once at import in `orchestrator/config.py`, which documents
+the full set (loop, sandbox, Sentry poll, GitHub App, notifier, PIC driver);
+`docs/runbook.md` covers how each was provisioned. The knobs that matter most:
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `ORCHESTRATOR_DATABASE_URL` | local dev DSN | log database, its own DB on the managed instance |
-| `ORCHESTRATOR_DB_POOL_MAX` | `2` | keep off the managed instance's connection headroom |
 | `ORCHESTRATOR_MAX_CONCURRENT_RUNS` | `1` | in-flight runs |
-| `ORCHESTRATOR_WORKER_ID` | `orchestrator-1` | identifies this process in `agent_runs.worker_id` |
+| `ORCHESTRATOR_TICK_SECONDS` | `15` | loop cadence; also the heartbeat/transcript-drain interval |
+| `ORCHESTRATOR_SANDBOX_IMAGE` | `managed-agents/sandbox:latest` | the disposable sandbox image |
+| `ORCHESTRATOR_SANDBOX_WITH_DOCKER` | `0` | mount the Docker socket, only for jobs that run test suites |
+| `ORCHESTRATOR_SENTRY_TOKEN` | empty | Sentry API token for the triage poll |
+| `ORCHESTRATOR_GITHUB_APP_ID` (+ key path, installation id) | empty | mints the per-job installation tokens |
+| `ORCHESTRATOR_NOTIFY_TO` / `_FROM` | empty | where outcome emails go |
+| `ORCHESTRATOR_PIC_DRIVER_TOKEN` | empty | scoped token for PIC's agent-task queue |
