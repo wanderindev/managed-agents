@@ -76,6 +76,40 @@ def test_start_does_not_pass_rm_so_logs_survive(roots):
     assert "--detach" in argv
 
 
+def test_workspace_is_mounted_at_the_same_path_as_on_the_host(roots):
+    """The host daemon resolves bind mounts against ITS filesystem (#43): a
+    container-only /workspace made repo tooling that mounts `git rev-parse
+    --show-toplevel` into a sibling container silently mount empty dirs."""
+    commands = FakeCommands()
+    runner = make_runner(roots, commands)
+    run = make_run()
+    runner.start(run)
+
+    argv = commands.commands("run")[0]
+    workspace = str(runner.workspace_path(run))
+    assert f"{workspace}:{workspace}" in argv
+    assert not any(v.endswith(":/workspace") for v in argv)
+    assert argv[argv.index("--workdir") + 1] == workspace
+
+
+def test_prompts_reference_the_real_workspace_path(roots):
+    """Prompts are written against the canonical /workspace name; the runner
+    rewrites them to the per-attempt mount path in the one place every prompt
+    passes through (#43)."""
+    commands = FakeCommands()
+    spec = JobSpec(prompt="The repo is at /workspace. Stay inside /workspace and /work.")
+    runner = make_runner(roots, commands, spec=spec)
+    run = make_run(9, attempts=2)
+    runner.start(run)
+
+    prompt = (runner.job_path(run) / PROMPT_FILENAME).read_text()
+    workspace = str(runner.workspace_path(run))
+    assert "ma-run-9-2" in workspace
+    assert f"The repo is at {workspace}." in prompt
+    assert f"Stay inside {workspace} and /work." in prompt
+    assert "/workspace" not in prompt.replace(workspace, "")
+
+
 def test_start_mounts_the_credential_and_bounds_the_clock(roots):
     commands = FakeCommands()
     runner = make_runner(roots, commands)

@@ -16,14 +16,15 @@ fi
 # Claude Code will not run non-interactively until onboarding is marked done.
 # Written here rather than mounted, so the host's ~/.claude.json (machine id,
 # feature caches, and every project it has ever opened) never enters a sandbox.
-# /workspace is marked trusted (#31): without it every run's stderr warns
+# The workspace is marked trusted (#31): without it every run's stderr warns
 # "Ignoring N permissions.allow entries ... workspace has not been trusted" and
 # the repo's own .claude/settings.json allow rules would silently not apply if
-# the permission mode were ever tightened past bypassPermissions.
+# the permission mode were ever tightened past bypassPermissions. $PWD, not a
+# hardcoded /workspace: since #43 the workspace is mounted at the same absolute
+# path as on the host and the runner sets it as the working directory.
 if [ ! -f "${HOME}/.claude.json" ]; then
-    printf '%s\n' \
-        '{"hasCompletedOnboarding":true,"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' \
-        > "${HOME}/.claude.json"
+    printf '{"hasCompletedOnboarding":true,"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' \
+        "$PWD" > "${HOME}/.claude.json"
 fi
 
 # GitHub App installation token (#11), when the job was given one. The token is

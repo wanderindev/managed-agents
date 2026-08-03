@@ -63,6 +63,9 @@ RUN test "$(node --version | sed 's/^v\([0-9]*\).*/\1/')" -ge 22 \
     && docker --version
 
 USER agent
+# Fallback only: the runner passes --workdir with the same-path workspace mount
+# (#43), which overrides this. Kept so a manual `docker run` without --workdir
+# still lands somewhere sane.
 WORKDIR /workspace
 
 LABEL org.opencontainers.image.source="https://github.com/wanderindev/managed-agents" \
