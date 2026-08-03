@@ -97,7 +97,9 @@ def test_prompts_reference_the_real_workspace_path(roots):
     rewrites them to the per-attempt mount path in the one place every prompt
     passes through (#43)."""
     commands = FakeCommands()
-    spec = JobSpec(prompt="The repo is at /workspace. Stay inside /workspace and /work.")
+    spec = JobSpec(
+        prompt="The repo is at /workspace. Stay inside /workspace and /work."
+    )
     runner = make_runner(roots, commands, spec=spec)
     run = make_run(9, attempts=2)
     runner.start(run)
