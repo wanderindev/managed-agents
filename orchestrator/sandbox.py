@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 #: structured result. Mounted separately from the repo so a job cannot commit
 #: its own instructions by accident.
 WORK_MOUNT = "/work"
+
+#: The canonical workspace name prompts are written against. The workspace is
+#: mounted at the SAME absolute path inside the container as on the host (#43):
+#: sandboxes share the host docker daemon, and a daemon resolves bind mounts
+#: against ITS filesystem, so a container-only path like /workspace makes any
+#: repo tooling that mounts `git rev-parse --show-toplevel` into a sibling
+#: container silently mount empty directories. Prompts keep referencing
+#: /workspace for readability; _make_job_dir rewrites them to the real path in
+#: one place, so no prompt author has to remember the rule.
+WORKSPACE_TOKEN = "/workspace"
 RESULT_FILENAME = "result.json"
 PROMPT_FILENAME = "prompt.txt"
 
@@ -259,8 +269,15 @@ class DockerRunner:
             self.memory_swap,
             "--pids-limit",
             "512",
+            # Same path on both sides of the boundary (#43): the container and
+            # the host daemon must mean the same thing by this path, or any
+            # test script that bind-mounts the repo into a sibling container
+            # gets empty directories. --workdir overrides the image's fallback
+            # WORKDIR; docker creates the mountpoint itself.
             "--volume",
-            f"{workspace}:/workspace",
+            f"{workspace}:{workspace}",
+            "--workdir",
+            str(workspace),
             "--volume",
             f"{job_dir}:{WORK_MOUNT}",
             # Read-write on purpose: Claude Code refreshes its OAuth token, and a
@@ -443,7 +460,13 @@ class DockerRunner:
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
         path.mkdir(parents=True, exist_ok=True)
-        (path / PROMPT_FILENAME).write_text(spec.prompt)
+        # Prompts are written against the canonical /workspace name; the real
+        # mount is the per-attempt host path (#43). Rewritten here, at the one
+        # point every prompt passes through, rather than threaded into each
+        # template — any rule that relies on every prompt author remembering it
+        # would eventually be missed.
+        prompt = spec.prompt.replace(WORKSPACE_TOKEN, str(self.workspace_path(run)))
+        (path / PROMPT_FILENAME).write_text(prompt)
         return path
 
     def _read_result(self, run: Run) -> dict | None:

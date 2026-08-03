@@ -154,12 +154,15 @@ SELECT seq, type, left(payload::text, 90) FROM agent_events WHERE run_id = 2 ORD
 | Path | Contents |
 |---|---|
 | `/srv/repos/<repo>` | host template clone; each job gets a standalone `git clone --local` off it (#33 — a worktree's `.git` links at a host path the sandbox can't see) |
-| `/srv/worktrees/ma-run-<id>-<attempt>` | the job's standalone clone, `origin` pointed at GitHub, mounted at `/workspace` (directory keeps its worktree-era name) |
+| `/srv/worktrees/ma-run-<id>-<attempt>` | the job's standalone clone, `origin` pointed at GitHub, mounted at the SAME path inside the container (#43 — the host daemon resolves bind mounts against its own filesystem, so a container-only `/workspace` made repo tooling that mounts the repo into a sibling container silently mount empty dirs; directory keeps its worktree-era name) |
 | `/srv/jobs/ma-run-<id>-<attempt>` | `prompt.txt` in, `result.json` out, mounted at `/work` |
 
 The prompt lives outside the repo on purpose, so a job cannot commit its own
-instructions. A workspace with no commits is deleted when the run finishes; one
-with commits is kept, because #7 still has to push that branch.
+instructions. Prompts reference the workspace as `/workspace`; the runner
+rewrites that to the real per-attempt path when it writes `prompt.txt`. The
+workspace is always deleted when the run finishes — a job's work reaches the
+world by being pushed to origin from inside the sandbox, never by surviving
+on disk.
 
 ## Sentry work source
 
