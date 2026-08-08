@@ -177,6 +177,11 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
         # audit whose silence could mean "clean" or "never ran" is worthless.
         if outcome == "CLEAN":
             return "memory audit: CLEAN"
+        if outcome == "NO_CHANGE":
+            # Re-verified the already-open memory PR and found nothing new.
+            # Said once, like CLEAN, for the same reason; the comment the run
+            # left on that PR carries the detail.
+            return "memory audit: nothing new (an open memory PR already has it)"
         return "memory audit finished without a structured result"
     if cand.kind in (RESEARCH_WRITE_KIND, RESEARCH_REVISE_KIND):
         if outcome in ("WROTE", "REVISED"):

@@ -123,16 +123,123 @@ def test_a_dry_run_enqueues_nothing(conn):
         assert cur.fetchone()["n"] == 0
 
 
+# --- finding the still-open memory PR (#45) -------------------------------------
+
+
+BOT = "wanderindev-managed-agents[bot]"
+
+
+class FakePulls:
+    def __init__(self, pulls=()):
+        self._pulls = list(pulls)
+        self.asked = []
+
+    def open_pulls(self, full_repo):
+        self.asked.append(full_repo)
+        return self._pulls
+
+
+def pull(number, *, head, author=BOT):
+    return {
+        "number": number,
+        "user": {"login": author},
+        "head": {"ref": head},
+        "html_url": f"https://github.com/wanderindev/feliu-dev/pull/{number}",
+    }
+
+
+def dreamed(conn, subject="dream:feliu-dev:2026-08-06"):
+    """A past dream run, so its branch resolves to a memory PR."""
+    return create_run(conn, jobs.DREAM_KIND, subject, {"repo": "feliu-dev"})
+
+
+def test_the_open_memory_pr_is_found_by_its_branch(conn):
+    run_id = dreamed(conn)
+    client = FakePulls([pull(167, head=f"agent/run-{run_id}")])
+
+    found = dream.open_memory_pr(conn, client, repo="feliu-dev", bot_login=BOT)
+
+    assert found == {
+        "number": 167,
+        "branch": f"agent/run-{run_id}",
+        "url": "https://github.com/wanderindev/feliu-dev/pull/167",
+    }
+    assert client.asked == ["wanderindev/feliu-dev"]
+
+
+def test_only_this_orchestrators_memory_prs_count(conn):
+    dream_id = dreamed(conn)
+    fix_id = create_run(conn, sentry.RUN_KIND, "sentry:DRM-x", {"repo": "feliu-dev"})
+    client = FakePulls(
+        [
+            pull(10, head="feature/hand-written"),  # not an agent branch
+            pull(11, head=f"agent/run-{fix_id}"),  # a fix PR, not a memory PR
+            pull(12, head=f"agent/run-{dream_id}", author="wanderindev"),  # a human's
+            pull(13, head="agent/run-999999"),  # no such run
+        ]
+    )
+
+    assert dream.open_memory_pr(conn, client, repo="feliu-dev", bot_login=BOT) is None
+
+
+def test_the_oldest_memory_pr_wins(conn):
+    first, second = dreamed(conn, "dream:feliu-dev:d1"), dreamed(conn, "dream:x:d2")
+    client = FakePulls(
+        [pull(9, head=f"agent/run-{second}"), pull(4, head=f"agent/run-{first}")]
+    )
+
+    found = dream.open_memory_pr(conn, client, repo="feliu-dev", bot_login=BOT)
+
+    assert found["number"] == 4
+
+
+def test_an_unreachable_github_does_not_stop_the_audit(conn):
+    class Broken:
+        def open_pulls(self, full_repo):
+            raise OSError("connection reset")
+
+    assert dream.open_memory_pr(conn, Broken(), repo="feliu-dev") is None
+
+
+def test_the_open_pr_is_recorded_in_the_payload(conn):
+    triage_run(conn, "sentry:DRM-8")
+    run_id = dreamed(conn)
+    client = FakePulls([pull(167, head=f"agent/run-{run_id}")])
+
+    subject = dream.enqueue(conn, repo="feliu-dev", days=7, pulls=client)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM agent_runs WHERE kind = %s AND subject = %s",
+            (jobs.DREAM_KIND, subject),
+        )
+        run = get_run(conn, cur.fetchone()["id"])
+    assert run.payload["open_pr"]["number"] == 167
+
+
+def test_no_open_pr_leaves_the_payload_alone(conn):
+    triage_run(conn, "sentry:DRM-9")
+    subject = dream.enqueue(conn, repo="feliu-dev", days=7, pulls=FakePulls())
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM agent_runs WHERE kind = %s AND subject = %s",
+            (jobs.DREAM_KIND, subject),
+        )
+        run = get_run(conn, cur.fetchone()["id"])
+    assert "open_pr" not in run.payload
+
+
 # --- the job spec --------------------------------------------------------------
 
 
-def dream_run(conn):
+def dream_run(conn, *, open_pr=None):
     triage_run(
         conn,
         "sentry:DRM-7",
         result={"outcome": "NOT_A_BUG", "reason": "already fixed on main"},
     )
-    subject = dream.enqueue(conn, repo="feliu-dev", days=7)
+    pulls = FakePulls([open_pr]) if open_pr else None
+    subject = dream.enqueue(conn, repo="feliu-dev", days=7, pulls=pulls)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM agent_runs WHERE kind = %s AND subject = %s",
@@ -157,8 +264,32 @@ def test_the_dream_prompt_states_the_classes_and_the_no_delete_rule(conn):
     assert "NEVER delete or" in prompt
     assert "Edit ONLY CLAUDE.md" in prompt
     assert "already fixed on main" in prompt, "the digest evidence is in the brief"
-    assert '"outcome": "CLEAN" | "FINDINGS"' in prompt
+    assert '"outcome": "CLEAN" | "FINDINGS" | "NO_CHANGE"' in prompt
     assert "# Durability markers (MANDATORY)" in prompt
+
+
+def test_without_an_open_pr_the_dream_opens_one(conn):
+    prompt = jobs.build_spec(dream_run(conn)).prompt
+    assert "gh pr create --draft" in prompt
+    assert "An earlier audit's pull request is still open" not in prompt
+    assert "gh pr edit" not in prompt and "NO_CHANGE" not in prompt.split("# Result")[0]
+
+
+def test_an_open_pr_makes_the_dream_accumulate_onto_its_branch(conn):
+    earlier = dreamed(conn)
+    run = dream_run(conn, open_pr=pull(167, head=f"agent/run-{earlier}"))
+    spec = jobs.build_spec(run)
+
+    # The branch is the PR's, checked out as-is: the audit has to see the
+    # edits already applied or it derives them a second time.
+    assert spec.branch == f"agent/run-{earlier}"
+    assert spec.reuse_branch is True
+    assert "PR #167" in spec.prompt
+    assert "git merge --no-edit origin/main" in spec.prompt
+    assert "gh pr edit 167" in spec.prompt
+    assert "gh pr comment 167" in spec.prompt
+    assert "do NOT open a second pull" in spec.prompt
+    assert "gh pr create" not in spec.prompt
 
 
 # --- the chain ------------------------------------------------------------------
@@ -191,6 +322,21 @@ def test_a_pr_alone_still_parks(conn):
 def test_clean_completes_quietly(conn):
     decision = jobs.followups(
         dream_run(conn), {"outcome": "CLEAN", "applied": [], "flagged": []}
+    )
+    assert decision.enqueue == () and decision.human_gate is None
+
+
+def test_no_change_does_not_re_park_the_same_findings(conn):
+    # The run that only re-verified an open PR must not park: the same flags
+    # would otherwise be emailed every night the PR sits unmerged.
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "NO_CHANGE",
+            "pr_url": "https://github.com/x/pull/167",
+            "flagged": [{"class": "DELETION", "claim": "/search row"}],
+            "summary": "re-verified; nothing new",
+        },
     )
     assert decision.enqueue == () and decision.human_gate is None
 
@@ -240,6 +386,25 @@ def test_a_clean_dream_still_says_so_once(conn):
     sent = []
     assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
     assert "memory audit: CLEAN" in sent[0].subject
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 0, "exactly once"
+
+
+def test_a_no_change_dream_says_so_once_and_quietly(conn):
+    run = dream_run(conn)
+    notify.pass_once(conn, lambda e: None, to="j@x", cap=10)  # flush the fixture run
+    _finish_dream(
+        conn,
+        run,
+        {
+            "outcome": "NO_CHANGE",
+            "pr_url": "https://github.com/x/pull/167",
+            "flagged": [{"class": "DELETION", "claim": "/search row"}],
+            "summary": "re-verified the open PR; nothing new",
+        },
+    )
+    sent = []
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
+    assert "nothing new" in sent[0].subject
     assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 0, "exactly once"
 
 

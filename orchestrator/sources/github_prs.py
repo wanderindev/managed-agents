@@ -206,6 +206,17 @@ def _cursor(conn: psycopg.Connection, subject: str) -> tuple[str, int]:
     return row["cursor"] or "", row["n"]
 
 
+def agent_branch_run_id(head_ref: str) -> int | None:
+    """The run id an ``agent/run-N`` branch name carries, or None.
+
+    Public because the dreaming job resolves its own open pull request the same
+    way (#45): a branch name is the only link from a PR back to the run that
+    cut it, and two modules parsing it two ways is how they drift apart.
+    """
+    match = _AGENT_BRANCH.match(head_ref)
+    return int(match.group(1)) if match else None
+
+
 def _origin_payload(conn: psycopg.Connection, head_ref: str) -> dict | None:
     """The issue facts from the run whose branch this PR is, or None.
 
@@ -213,11 +224,11 @@ def _origin_payload(conn: psycopg.Connection, head_ref: str) -> dict | None:
     already holds everything the revision prompt needs to say about the Sentry
     issue — no second Sentry call, and the chain stays traceable in the log.
     """
-    match = _AGENT_BRANCH.match(head_ref)
-    if match is None:
+    run_id = agent_branch_run_id(head_ref)
+    if run_id is None:
         return None
     try:
-        origin = get_run(conn, int(match.group(1)))
+        origin = get_run(conn, run_id)
     except LookupError:
         return None
     return origin.payload or {}

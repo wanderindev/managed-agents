@@ -27,7 +27,8 @@ PR, `NOT_A_BUG` with evidence, or `NEEDS_HUMAN` with a brief. Every FIX is
 attacked by a fresh-context adversarial reviewer that must return STANDS before
 the PR leaves draft. The change-request loop turns human review comments on the
 orchestrator's own PRs into guarded revision runs. A nightly dreaming job
-audits each repo's memory file against digests of recent runs. On Saturdays a
+audits each repo's memory file against digests of recent runs, accumulating its
+findings onto one open pull request until a human merges it. On Saturdays a
 driver works PIC's agent-task queue through a weekly article series, with a
 rubric verifier grading output against a rubric written at planning time.
 Nothing merges without a person.
