@@ -9,6 +9,12 @@ Boundaries, stated up front because each one is a guard against a real failure:
 
 * Only PRs authored by the App's bot login are considered. A human's PR is
   never touched, however reviewable it looks.
+* Only PRs whose originating run was a ``sentry_triage`` are considered. This
+  loop's revision prompt is written for a Sentry fix; pointing it at a memory
+  audit's pull request (markdown only, no Sentry issue behind it) would ask an
+  agent to revise a fix that does not exist. An allowlist rather than a
+  denylist, so any future kind that learns to open a PR is opted out until
+  someone writes a prompt that fits it.
 * A PR with commits by a human (Javier pushing to the agent's branch) is left
   alone entirely: the human has taken the wheel, and an agent appending to —
   let alone rewriting — their work is the exact incident this check prevents.
@@ -36,7 +42,8 @@ import psycopg
 
 from orchestrator import config, queue
 from orchestrator.log import create_run
-from orchestrator.queue import get_run
+from orchestrator.queue import Run, get_run
+from orchestrator.sources.sentry import RUN_KIND as TRIAGE_KIND
 from orchestrator.sources.sentry import PollReport
 
 logger = logging.getLogger(__name__)
@@ -217,21 +224,22 @@ def agent_branch_run_id(head_ref: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _origin_payload(conn: psycopg.Connection, head_ref: str) -> dict | None:
-    """The issue facts from the run whose branch this PR is, or None.
+def _origin_run(conn: psycopg.Connection, head_ref: str) -> Run | None:
+    """The run whose branch this pull request is, or None.
 
-    The branch name carries the run id, and that run's ``run_queued`` payload
-    already holds everything the revision prompt needs to say about the Sentry
-    issue — no second Sentry call, and the chain stays traceable in the log.
+    The branch name carries the run id, and that run supplies two things: its
+    *kind*, which decides whether this loop may touch the PR at all, and its
+    ``run_queued`` payload, which already holds everything the revision prompt
+    needs to say about the Sentry issue — no second Sentry call, and the chain
+    stays traceable in the log.
     """
     run_id = agent_branch_run_id(head_ref)
     if run_id is None:
         return None
     try:
-        origin = get_run(conn, run_id)
+        return get_run(conn, run_id)
     except LookupError:
         return None
-    return origin.payload or {}
 
 
 def poll(
@@ -276,6 +284,25 @@ def poll(
                 report.drop(f"over the {max_per_poll}-per-poll cap")
                 continue
 
+            # Which run cut this branch decides whether this loop may touch the
+            # PR at all, so resolve it before spending three API calls on
+            # reviews, comments and commits.
+            head_ref = (pull.get("head") or {}).get("ref") or ""
+            origin_run = _origin_run(conn, head_ref)
+            if origin_run is None:
+                report.drop("head branch is not an agent branch")
+                continue
+            if origin_run.kind != TRIAGE_KIND:
+                # An allowlist, not a denylist: the revision prompt is written
+                # for a Sentry fix (address the refutation, keep the failing-
+                # then-passing test green). Pointing it at a memory-audit PR —
+                # a markdown-only diff with no Sentry issue behind it — asks an
+                # agent to revise a fix that does not exist. Every other kind
+                # that learns to open a PR is opted out by default rather than
+                # needing a new deny entry here.
+                report.drop(f"{origin_run.kind} PR; the revision prompt does not fit")
+                continue
+
             subject = _subject(repo, number)
             cursor, rounds = _cursor(conn, subject)
             requests = _change_requests(
@@ -312,11 +339,7 @@ def poll(
                 report.drop("a revision is already in flight")
                 continue
 
-            origin = _origin_payload(conn, (pull.get("head") or {}).get("ref") or "")
-            if origin is None:
-                report.drop("head branch is not an agent branch")
-                continue
-
+            origin = origin_run.payload or {}
             payload = {
                 **{
                     k: origin[k]
@@ -331,7 +354,7 @@ def poll(
                     if k in origin
                 },
                 "repo": repo,
-                "branch": (pull.get("head") or {}).get("ref") or "",
+                "branch": head_ref,
                 "pr_url": pull.get("html_url") or "",
                 "number": number,
                 "change_requests": [r.as_payload() for r in fresh],
