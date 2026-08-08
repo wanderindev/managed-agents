@@ -83,6 +83,26 @@ class FakePulls:
         return self._commits
 
 
+class CountingPulls(FakePulls):
+    """Records which per-PR detail endpoints the poll actually hits."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.calls = []
+
+    def reviews(self, full_repo, number):
+        self.calls.append(("reviews", number))
+        return super().reviews(full_repo, number)
+
+    def review_comments(self, full_repo, number):
+        self.calls.append(("review_comments", number))
+        return super().review_comments(full_repo, number)
+
+    def commits(self, full_repo, number):
+        self.calls.append(("commits", number))
+        return super().commits(full_repo, number)
+
+
 def origin_run(conn):
     """The triage run whose branch the PR under test is."""
     run_id = create_run(conn, sentry.RUN_KIND, "sentry:PRS-origin", ISSUE_FACTS)
@@ -218,6 +238,53 @@ def test_a_foreign_head_branch_is_dropped(conn):
 
     assert report.enqueued == []
     assert report.dropped == {"head branch is not an agent branch": 1}
+
+
+def test_a_memory_audit_pr_is_left_alone(conn):
+    """A dream's PR is bot-authored and on an agent/run-N branch, so every
+    other filter passes it. Revising it would point a prompt written for a
+    Sentry fix at a markdown-only diff with no Sentry issue behind it."""
+    dream_id = create_run(
+        conn, jobs.DREAM_KIND, "dream:panama-in-context:2026-08-08", {"repo": REPO}
+    )
+    client = FakePulls(
+        pulls=[pr(607, head=f"agent/run-{dream_id}")],
+        reviews=[review(at="2026-07-27T10:00:00Z")],
+    )
+
+    report = poll(conn, client)
+
+    assert report.enqueued == []
+    assert report.dropped == {"memory_dream PR; the revision prompt does not fit": 1}
+
+
+def test_only_triage_prs_are_revised(conn):
+    """The filter is an allowlist: a kind nobody has written a revision prompt
+    for is opted out by default, not by being named here."""
+    other = create_run(conn, jobs.RESEARCH_WRITE_KIND, "research-gate:x", {})
+    client = FakePulls(
+        pulls=[pr(608, head=f"agent/run-{other}")],
+        reviews=[review(at="2026-07-27T10:00:00Z")],
+    )
+
+    report = poll(conn, client)
+
+    assert report.enqueued == []
+    assert "research_write PR; the revision prompt does not fit" in report.dropped
+
+
+def test_a_skipped_pr_costs_no_api_calls(conn):
+    """The kind check runs before reviews/comments/commits are fetched: an
+    accumulating memory PR sits open for days and every hourly poll would
+    otherwise spend three calls re-reading it."""
+    dream_id = create_run(
+        conn, jobs.DREAM_KIND, "dream:panama-in-context:2026-08-09", {"repo": REPO}
+    )
+    client = CountingPulls(pulls=[pr(609, head=f"agent/run-{dream_id}")])
+
+    poll(conn, client)
+
+    assert client.calls == [], "no per-PR detail calls for a PR we will not touch"
 
 
 # --- the cursor and the bound --------------------------------------------------
