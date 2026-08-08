@@ -136,6 +136,29 @@ evidence, not direction.
         --body-file <file>`. The body must state what broke, why, what the
         patch does, which test now covers it, and link {permalink}.
 
+   - MITIGATION — the whole remedy is a capacity, architecture, or ops call
+     that belongs to a human, but there is a specific self-contained change
+     that provably reduces the problem without pretending to resolve it. Then:
+     a. Write ONLY that change. Do not smuggle in the broad refactor you just
+        decided against.
+     b. Add or extend a test that FAILS before and PASSES after for the narrow
+        property you improved — not for the issue as a whole.
+     c. Get the repository gates green (below).
+     d. Commit WITHOUT any `Fixes {short_id}` trailer. The issue stays open
+        because it is not resolved, and the trailer would auto-resolve it on
+        merge. State in the commit body what remains unfixed.
+     e. Push the branch: `git push -u origin {branch}`
+     f. Open a DRAFT pull request against main whose body states three things
+        plainly: what this reduces, what it does NOT fix, and what decision a
+        human still owes. Link {permalink}.
+
+     Choose MITIGATION over NEEDS_HUMAN only when the partial change is
+     independently correct — one you would defend on its own merits even if the
+     rest of the issue were never fixed. If the only partial change available is
+     a workaround someone must undo later, or one that makes the real fix
+     harder, that is NEEDS_HUMAN. Never let MITIGATION become a way to look
+     productive on an issue you should have declined.
+
    - NOT_A_BUG — third-party noise, expected behaviour (e.g. an expected 4xx),
      or already fixed on main. Explain the specific evidence in the result and
      make no code changes.
@@ -145,7 +168,7 @@ evidence, not direction.
      migrations, pricing or payments, authentication or authorization, or
      published content. Explain exactly what a human needs to look at.
 
-# Repository gates (for FIX)
+# Repository gates (for FIX and MITIGATION)
 
 {gate}
 
@@ -157,7 +180,8 @@ weaken or skip an existing test to get to green.
 
 - Never merge anything. Never push to main. Never force-push.
 - Draft pull requests only, and only from `{branch}`.
-- Do not touch Sentry itself; resolution happens via the commit message.
+- Do not touch Sentry itself; resolution happens via the commit message, which
+  is exactly why MITIGATION must not carry a `Fixes` trailer.
 - Stay inside /workspace and /work.
 
 {markers}# Result contract (MANDATORY)
@@ -166,13 +190,15 @@ Before you finish — whatever the outcome, even on failure — write
 /work/result.json:
 
 {{
-  "outcome": "FIX" | "NOT_A_BUG" | "NEEDS_HUMAN",
+  "outcome": "FIX" | "MITIGATION" | "NOT_A_BUG" | "NEEDS_HUMAN",
   "sentry_short_id": "{short_id}",
   "summary": "one paragraph: what broke, why, and what you did about it",
   "reason": "for NOT_A_BUG / NEEDS_HUMAN: the specific justification",
-  "pr_url": "for FIX: the draft PR URL",
+  "pr_url": "for FIX / MITIGATION: the draft PR URL",
   "branch": "{branch}",
-  "test": "for FIX: the test id that fails before and passes after"
+  "test": "for FIX / MITIGATION: the test id that fails before and passes after",
+  "remaining": "for MITIGATION: what this does NOT fix, and the decision a
+                human still owes"
 }}
 
 A run that ends without /work/result.json is treated as a failure regardless of
@@ -260,8 +286,7 @@ only the evidence. If you cannot convince yourself the patch is correct, your
 verdict is REFUTED. A false refutation costs one retry; a false pass costs a
 bad merge to production.
 
-An unattended agent claims to have fixed this Sentry issue and opened a draft
-pull request:
+{claim}
 
 - Repository: {repo}
 - Sentry short ID: {short_id}
@@ -286,7 +311,7 @@ Read the repository's CLAUDE.md, then examine the change: `git diff main...HEAD`
 from /workspace. Attack along at least these four lines, and say what you found
 on each:
 
-1. Does this fix the actual cause, or a symptom that merely silences Sentry?
+{attack_one}
 2. Is the new test asserting the bug is fixed, or asserting the new code's
    behaviour tautologically? Prove it: restore the changed implementation files
    to main (`git checkout main -- <impl files>`, leaving the new test in
@@ -327,6 +352,43 @@ Write /work/result.json before you finish:
 REFUTED is the default. STANDS requires that you tried all four attack lines
 and failed. UNCERTAIN is for evidence you could not obtain, not for mixed
 feelings.
+{stands_means}"""
+
+#: What the review is being asked to refute. A fix and a mitigation make
+#: different claims, and an adversary pointed at the wrong one is useless:
+#: attack line 1 ("does this fix the cause?") refutes every mitigation by
+#: construction, since a mitigation openly does not fix the cause.
+_REVIEW_CLAIM_FIX = """\
+An unattended agent claims to have fixed this Sentry issue and opened a draft
+pull request:"""
+
+_REVIEW_CLAIM_MITIGATION = """\
+An unattended agent judged that this Sentry issue cannot be fully resolved
+without a human decision, and opened a draft pull request containing a PARTIAL
+mitigation. Read what it claims in the pull request body and in the commit
+message; that claim, not "the issue is fixed", is what you are attacking. The
+issue is expected to stay open, and the commit is expected to carry NO `Fixes`
+trailer."""
+
+_REVIEW_ATTACK_ONE_FIX = """\
+1. Does this fix the actual cause, or a symptom that merely silences Sentry?"""
+
+_REVIEW_ATTACK_ONE_MITIGATION = """\
+1. Does the change deliver the reduction it claims, and does it claim no more
+   than it delivers? Check specifically: (a) the commit carries no `Fixes`
+   trailer and nothing else would auto-resolve the issue on merge; (b) the PR
+   body states what remains unfixed rather than implying resolution; (c) the
+   change is independently correct — it would still be right if the rest of
+   the issue were never fixed; (d) it is not a workaround that makes the real
+   fix harder or that someone must undo later. Any of these failing is a
+   refutation, and (a) and (d) are the ones that cost the most later."""
+
+_REVIEW_STANDS_MITIGATION = """
+For a mitigation, STANDS means "this is a correct, honestly-scoped partial
+improvement worth merging with the issue left open". It does NOT mean the issue
+is resolved, and you must not treat the remaining problem as a refutation — the
+agent already declined to fix it and said so. Refute what it claims, not what
+it explicitly declined to claim.
 """
 
 _REVISION_PROMPT = """\
@@ -343,6 +405,7 @@ alone, REFUTED that patch:
 
 The pull request branch `{branch}` is checked out at /workspace with the
 refuted patch on it. Read the repository's CLAUDE.md first.
+{mode_note}
 
 # Your job
 
@@ -402,6 +465,11 @@ def _chained_payload(payload: dict) -> dict:
         "pr_url",
         "branch",
         "round",
+        # Carried so a refuted mitigation stays a mitigation through revision
+        # and re-review: losing it would put a `Fixes` trailer back on a patch
+        # that must not resolve its issue.
+        "mode",
+        "remaining",
     )
     return {k: payload[k] for k in keys if k in payload}
 
@@ -412,6 +480,7 @@ def _adversarial_review(run: Run) -> JobSpec:
     branch = payload.get("branch")
     if not repo or not branch:
         raise RuntimeError(f"review run {run.id} lacks repo/branch in its payload")
+    mitigation = payload.get("mode") == "mitigation"
     prompt = _REVIEW_PROMPT.format(
         repo=repo,
         branch=branch,
@@ -422,6 +491,11 @@ def _adversarial_review(run: Run) -> JobSpec:
         pr_url=payload.get("pr_url") or "?",
         round=payload.get("round", 1),
         detail=_issue_detail(payload),
+        claim=_REVIEW_CLAIM_MITIGATION if mitigation else _REVIEW_CLAIM_FIX,
+        attack_one=(
+            _REVIEW_ATTACK_ONE_MITIGATION if mitigation else _REVIEW_ATTACK_ONE_FIX
+        ),
+        stands_means=_REVIEW_STANDS_MITIGATION if mitigation else "",
     )
     return JobSpec(
         prompt=prompt,
@@ -432,6 +506,22 @@ def _adversarial_review(run: Run) -> JobSpec:
         needs_github=True,  # `gh pr ready` on STANDS; nothing else
         needs_docker=True,  # proving the test fails on main needs the suite
     )
+
+
+#: Spliced into a revision whose patch is a mitigation, not a fix. Without it
+#: the reviser reads "fix the Sentry issue" literally and either widens scope
+#: into the refactor the triage deliberately declined, or starts claiming a
+#: resolution the patch does not deliver.
+_REVISION_MITIGATION_NOTE = """
+IMPORTANT — this patch is a MITIGATION, not a fix. The agent that wrote it
+judged the full remedy to be a human decision and deliberately scoped down.
+What it does NOT fix: {remaining}
+
+So: address the refutation within that scope. Do NOT widen the patch into the
+broader change that was declined, do NOT add a `Fixes` trailer, and keep the
+pull request body honest about what remains. If the refutation can only be
+answered by exceeding that scope, say so and use NEEDS_HUMAN.
+"""
 
 
 def _fix_revision(run: Run) -> JobSpec:
@@ -449,6 +539,13 @@ def _fix_revision(run: Run) -> JobSpec:
         round=payload.get("round", 2),
         refutation=payload.get("refutation") or "(refutation text missing)",
         gate=_REPO_GATES.get(repo, _GENERIC_GATE),
+        mode_note=(
+            _REVISION_MITIGATION_NOTE.format(
+                remaining=payload.get("remaining") or "(not recorded)"
+            )
+            if payload.get("mode") == "mitigation"
+            else ""
+        ),
         markers=_STAGE_MARKERS.format(branch=branch),
     )
     return JobSpec(
@@ -1150,11 +1247,12 @@ def followups(run: Run, result: dict | None) -> Followups:
         return Followups()
     payload = run.payload or {}
 
-    if run.kind == sentry.RUN_KIND and result.get("outcome") == "FIX":
+    if run.kind == sentry.RUN_KIND and result.get("outcome") in ("FIX", "MITIGATION"):
+        outcome = result["outcome"]
         if not result.get("pr_url"):
-            # Claimed a fix but produced no PR: nothing to review, and nothing
+            # Claimed a patch but produced no PR: nothing to review, and nothing
             # a human could act on beyond reading the run. Leave it DONE.
-            logger.warning("run %s claims FIX but has no pr_url", run.id)
+            logger.warning("run %s claims %s but has no pr_url", run.id, outcome)
             return Followups()
         return Followups(
             enqueue=(
@@ -1167,6 +1265,10 @@ def followups(run: Run, result: dict | None) -> Followups:
                         "branch": result.get("branch") or f"agent/run-{run.id}",
                         "round": 1,
                         "fixed_by_run": run.id,
+                        # A mitigation makes a narrower claim, and the reviewer
+                        # has to attack that claim rather than "is it fixed?".
+                        "mode": "mitigation" if outcome == "MITIGATION" else "fix",
+                        "remaining": result.get("remaining") or "",
                     },
                 ),
             )
@@ -1337,12 +1439,26 @@ def followups(run: Run, result: dict | None) -> Followups:
         verdict = result.get("verdict")
         round_ = payload.get("round", 1)
         if verdict == "STANDS":
+            mitigation = payload.get("mode") == "mitigation"
             return Followups(
                 human_gate={
-                    "why": "adversarial review passed; PR marked ready",
+                    # Say which claim survived. Merging a mitigation leaves the
+                    # Sentry issue open on purpose, and a human reading only
+                    # "review passed" would expect the opposite.
+                    "why": (
+                        "adversarial review passed on a MITIGATION; PR marked"
+                        " ready — the Sentry issue stays open by design"
+                        if mitigation
+                        else "adversarial review passed; PR marked ready"
+                    ),
                     "verdict": verdict,
                     "reasoning": result.get("reasoning") or "",
                     "pr_url": payload.get("pr_url"),
+                    **(
+                        {"remaining": payload.get("remaining") or ""}
+                        if mitigation
+                        else {}
+                    ),
                 }
             )
         if verdict == "REFUTED" and round_ < MAX_FIX_ROUNDS:

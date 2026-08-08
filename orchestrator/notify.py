@@ -155,6 +155,12 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
     if cand.status == "AWAITING_HUMAN":
         verdict = gate.get("verdict")
         if verdict == "STANDS":
+            if gate.get("remaining"):
+                # A mitigation: merging it does not close the Sentry issue, and
+                # the subject line is the only part some readers get.
+                return (
+                    "mitigation ready for review (adversary: STANDS, issue stays open)"
+                )
             return "fix ready for review (adversary: STANDS)"
         if verdict == "UNCERTAIN":
             return "adversary UNCERTAIN — read the doubt before merging"
@@ -168,7 +174,7 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
     if cand.kind in (TRIAGE_KIND, REVISION_KIND, PR_REVISION_KIND):
         if outcome in ("NOT_A_BUG", "NEEDS_HUMAN"):
             return outcome
-        if outcome == "FIX":
+        if outcome in ("FIX", "MITIGATION"):
             return None  # the chain continues; the review run will email
         return "finished without a structured result"
     if cand.kind == DREAM_KIND:
@@ -229,6 +235,9 @@ def _body(cand: _Candidate, result: dict, gate: dict) -> str:
         ]
     elif gate.get("why"):
         lines += [f"Parked because: {gate['why']}", gate.get("reason") or "", ""]
+    if gate.get("remaining"):
+        # A mitigation's whole point: what merging this does NOT solve.
+        lines += ["Still unfixed after this merges:", gate["remaining"], ""]
     if gate.get("flagged"):
         # The dreamer's contradictions and deletion candidates. Listed in
         # full: these are precisely the edits nothing will apply for you.

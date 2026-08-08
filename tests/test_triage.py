@@ -226,7 +226,7 @@ def test_the_prompt_states_the_contract_and_the_hard_rules(conn, detail):
     assert "--draft" in prompt and "--body-file" in prompt
     assert "Never merge anything. Never push to main. Never force-push." in prompt
     assert "/work/result.json" in prompt
-    assert '"outcome": "FIX" | "NOT_A_BUG" | "NEEDS_HUMAN"' in prompt
+    assert '"outcome": "FIX" | "MITIGATION" | "NOT_A_BUG" | "NEEDS_HUMAN"' in prompt
     assert "DOWNGRADE the outcome to NEEDS_HUMAN" in prompt
     assert f"agent/run-{run.id}" in prompt
 
