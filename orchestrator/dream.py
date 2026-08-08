@@ -15,19 +15,30 @@ module builds the *digest* of those transcripts — mechanically, no LLM —
 at enqueue time, so the run's payload is a durable, self-contained record of
 the evidence the dreamer was shown, exactly like the triage prompt's Sentry
 detail (#7).
+
+One memory pull request at a time, accumulating (#45). A dream used to cut its
+branch from main unconditionally, so while a memory PR sat unmerged every later
+run re-derived the same edits onto a rival branch — feliu-dev's runs 21, 23 and
+25 opened three PRs, two of them byte-identical. Now the enqueue looks for the
+open one and points the run at its branch: the audit sees yesterday's edits as
+already applied, adds only what is new, and either commits onto that branch or
+just comments. The human merges one PR whenever they get to it.
 """
 
 import argparse
 import logging
 import sys
+import urllib.error
 from typing import Any
 
 import psycopg
 
-from orchestrator import jobs, queue
+from orchestrator import config, github, jobs, queue
 from orchestrator.db import connect
 from orchestrator.enums import EventType
 from orchestrator.log import create_run, load_events
+from orchestrator.queue import get_run
+from orchestrator.sources import github_prs
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +61,72 @@ def _clip_dict(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if payload is None:
         return None
     return {k: _clip(v) for k, v in payload.items()}
+
+
+def open_memory_pr(
+    conn: psycopg.Connection,
+    client: github_prs.PullsClient,
+    *,
+    repo: str,
+    bot_login: str | None = None,
+) -> dict[str, Any] | None:
+    """The still-open memory pull request an earlier dream opened, or None.
+
+    Without this the dreamer re-derives the same edits every night: each run
+    cuts a fresh branch from main, main still lacks yesterday's unmerged fix,
+    so the audit finds the same gap and opens another pull request. Runs 21,
+    23 and 25 on feliu-dev produced three PRs, two of which were byte-identical
+    (#45). Finding the open one lets the run add to it instead.
+
+    Identified by the branch, not by the title or body: ``agent/run-N`` names
+    the run that cut it, and that run's kind is what makes it a *memory* PR
+    rather than a fix PR the same bot opened. The oldest wins — with the
+    accumulating branch there should only ever be one, and if history left
+    several, the earliest is the one carrying the edits.
+    """
+    bot_login = bot_login or config.GITHUB_BOT_LOGIN
+    owner = config.GITHUB_REMOTE_BASE.rstrip("/").rsplit("/", 1)[-1]
+    full_repo = f"{owner}/{repo}"
+    try:
+        pulls = client.open_pulls(full_repo)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        # Unreachable GitHub must not stop the audit: the run still has value
+        # without the branch reuse, it just risks a duplicate PR a human closes.
+        logger.warning("could not list open PRs for %s: %s", full_repo, exc)
+        return None
+
+    found: list[dict[str, Any]] = []
+    for pull in pulls:
+        if ((pull.get("user") or {}).get("login") or "") != bot_login:
+            continue
+        head_ref = (pull.get("head") or {}).get("ref") or ""
+        run_id = github_prs.agent_branch_run_id(head_ref)
+        if run_id is None:
+            continue
+        try:
+            origin = get_run(conn, run_id)
+        except LookupError:
+            continue
+        if origin.kind != jobs.DREAM_KIND:
+            continue
+        found.append(
+            {
+                "number": pull.get("number"),
+                "branch": head_ref,
+                "url": pull.get("html_url"),
+            }
+        )
+
+    if not found:
+        return None
+    if len(found) > 1:
+        logger.warning(
+            "%s has %s open memory PRs (%s); accumulating onto the oldest",
+            full_repo,
+            len(found),
+            ", ".join(f"#{p['number']}" for p in found),
+        )
+    return min(found, key=lambda p: p["number"])
 
 
 def recent_repos(conn: psycopg.Connection, days: int) -> list[str]:
@@ -116,8 +193,15 @@ def enqueue(
     repo: str,
     days: int,
     dry_run: bool = False,
+    pulls: github_prs.PullsClient | None = None,
 ) -> str | None:
-    """One dream run per repo per day; returns the subject, or None if skipped."""
+    """One dream run per repo per day; returns the subject, or None if skipped.
+
+    ``pulls`` is optional: given a client, the run is pointed at whatever memory
+    pull request is still open so it accumulates onto that branch instead of
+    opening a rival one (#45). Without it — no GitHub App configured, or a
+    caller that does not care — the run behaves exactly as it always has.
+    """
     today = queue.db_now(conn).date().isoformat()
     subject = f"dream:{repo}:{today}"
     with conn.cursor() as cur:
@@ -136,15 +220,21 @@ def enqueue(
         logger.info("skipping %s: no run activity in the last %s day(s)", repo, days)
         return None
 
-    payload = {"repo": repo, "days": days, "digest": entries}
+    payload: dict[str, Any] = {"repo": repo, "days": days, "digest": entries}
+    open_pr = open_memory_pr(conn, pulls, repo=repo) if pulls else None
+    if open_pr:
+        # Recorded in the payload, like the digest, so the run stays a durable
+        # self-contained account of what the dreamer was pointed at.
+        payload["open_pr"] = open_pr
     if not dry_run:
         with conn.transaction():
             create_run(conn, jobs.DREAM_KIND, subject, payload)
     logger.info(
-        "%s %s (%s recent run(s) in the digest)",
+        "%s %s (%s recent run(s) in the digest%s)",
         "would enqueue" if dry_run else "enqueued",
         subject,
         len(entries),
+        f"; accumulating onto PR #{open_pr['number']}" if open_pr else "",
     )
     return subject
 
@@ -166,13 +256,32 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s %(message)s"
     )
+    pulls = _pulls_client()
     with connect() as conn:
         repos = [args.repo] if args.repo else recent_repos(conn, args.days)
         if not repos:
             logger.info("no repos with run activity in the last %s day(s)", args.days)
         for repo in repos:
-            enqueue(conn, repo=repo, days=args.days, dry_run=args.dry_run)
+            enqueue(conn, repo=repo, days=args.days, dry_run=args.dry_run, pulls=pulls)
     return 0
+
+
+def _pulls_client() -> github_prs.PullsClient | None:
+    """A read-only pulls client, or None when the App is not usable.
+
+    Degrading is correct rather than fatal — the audit itself needs no GitHub
+    API, only the branch-reuse lookup does — but it is said out loud, because
+    the silent version of this failure is a duplicate PR every night.
+    """
+    try:
+        return github_prs.PullsClient(github.from_config().installation_token())
+    except github.GitHubAppError as exc:
+        logger.warning(
+            "no open-PR lookup (GitHub App not usable: %s); a dream may open a"
+            " second memory PR alongside one already open",
+            exc,
+        )
+        return None
 
 
 if __name__ == "__main__":

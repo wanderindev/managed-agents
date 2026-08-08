@@ -594,7 +594,7 @@ every future agent session loads before touching this codebase. Your job is
 to audit that memory against two sources of truth: the repository as it
 exists today in the working tree, and the evidence below from the last
 {days} day(s) of unattended runs.
-
+{open_pr}
 # Evidence from recent runs
 
 {digest}
@@ -618,20 +618,18 @@ exists today in the working tree, and the evidence below from the last
   citations whose correct value you can verify in the working tree. Edit
   CLAUDE.md in place, keeping its structure and voice, with the smallest
   change that fixes the memory. Then commit, push
-  (`git push -u origin {branch}`), and open a DRAFT pull request against main
-  (write the body to a file, `gh pr create --draft --base main --title "..."
-  --body-file <file>`) whose body lists each edit and its evidence.
+  (`git push -u origin {branch}`), and {pr_step}
 - FLAGS (never apply): deletions, and CONTRADICTED claims. NEVER delete or
   rewrite a memory whose correction you cannot positively verify — deletion
   is the one operation here with no recovery path. Record each flag in the
   result with its specific evidence; a human reviews those.
 
-If there are no safe edits, make no commit and no pull request.
+{no_edits}
 
 # Hard rules
 
 - Edit ONLY CLAUDE.md. Never touch code, tests, or configuration.
-- Never merge anything. Never push to main. Never force-push.
+- Never merge a pull request. Never push to main. Never force-push.
 - Stay inside /workspace and /work.
 
 {markers}# Result contract (MANDATORY)
@@ -639,7 +637,7 @@ If there are no safe edits, make no commit and no pull request.
 Write /work/result.json before you finish:
 
 {{
-  "outcome": "CLEAN" | "FINDINGS",
+  "outcome": "CLEAN" | "FINDINGS" | "NO_CHANGE",
   "applied": [
     {{"class": "STALE" | "MISSING", "claim": "the memory line touched",
       "edit": "what changed", "evidence": "why this is correct"}}
@@ -648,12 +646,65 @@ Write /work/result.json before you finish:
     {{"class": "CONTRADICTED" | "DELETION", "claim": "the memory line",
       "evidence": "what contradicts it"}}
   ],
-  "pr_url": "the draft PR URL, when safe edits were applied",
+  "pr_url": "the pull request URL, when safe edits were applied",
   "summary": "one paragraph: the state of this repository's memory"
 }}
 
 CLEAN means both lists are empty and nothing needed changing.
+NO_CHANGE means an open pull request already carries everything you found:
+you commented on it and changed nothing. Use it only in that case.
 """
+
+#: Spliced into the brief when a memory PR from an earlier run is still open.
+#: The whole point of #45: the branch already carries yesterday's edits, so the
+#: run must add to it rather than re-derive them onto a rival branch.
+_DREAM_OPEN_PR = """
+# An earlier audit's pull request is still open
+
+PR #{number} ({url}) carries the memory edits earlier runs applied, and no
+human has merged it yet. You are on its branch, `{branch}`, so those edits are
+already present in the CLAUDE.md you are auditing — that is what "already
+fixed" looks like here. Do not re-apply them, and do NOT open a second pull
+request.
+
+First, bring the branch up to date with main:
+
+    git merge --no-edit origin/main
+
+main may have moved since this branch was cut, and merging is what stops you
+re-reporting something a human has already fixed there. If the merge
+conflicts, resolve it by taking main's version and re-applying this branch's
+additions on top. Merge only origin/main INTO this branch, never the reverse.
+
+Then audit as normal, but report only what is NEW relative to what this branch
+already carries.
+"""
+
+#: The pull-request step, which differs entirely depending on whether one is
+#: already open. Both continue the "Then commit, push ..., and" sentence.
+_DREAM_PR_STEP_NEW = """\
+open a DRAFT pull
+  request against main (write the body to a file, `gh pr create --draft
+  --base main --title "..." --body-file <file>`) whose body lists each edit
+  and its evidence."""
+
+_DREAM_PR_STEP_OPEN = """\
+rewrite PR #{number}'s body
+  (`gh pr edit {number} --body-file <file>`) so it describes the CUMULATIVE
+  state: every edit the branch now carries and every flag still outstanding,
+  written as the current state of this repository's memory rather than a
+  changelog of this one run. Keep the title accurate for everything the
+  branch carries."""
+
+_DREAM_NO_EDITS_NEW = "If there are no safe edits, make no commit and no pull request."
+
+_DREAM_NO_EDITS_OPEN = """\
+If you find no NEW safe edits, make no commit and no push. Instead post one
+comment on PR #{number} (`gh pr comment {number} --body-file <file>`) recording
+that this run independently re-verified the edits the branch already carries,
+that it found nothing new, and which flags are still outstanding. Then set
+"outcome": "NO_CHANGE". A comment is the whole output of that run; adding an
+empty commit to look busy is worse than silence."""
 
 
 def _memory_dream(run: Run) -> JobSpec:
@@ -661,7 +712,11 @@ def _memory_dream(run: Run) -> JobSpec:
     repo = payload.get("repo")
     if not repo:
         raise RuntimeError(f"dream run {run.id} has no repo in its payload")
-    branch = f"agent/run-{run.id}"
+    # An unmerged memory PR means its branch, not a fresh one: the audit has to
+    # see yesterday's edits as already applied or it derives them again (#45).
+    open_pr = payload.get("open_pr") or {}
+    branch = open_pr.get("branch") or f"agent/run-{run.id}"
+    number = open_pr.get("number")
     entries = payload.get("digest") or []
     digest = "\n".join(json.dumps(e) for e in entries) or "(no recent run evidence)"
     prompt = _DREAM_PROMPT.format(
@@ -669,6 +724,21 @@ def _memory_dream(run: Run) -> JobSpec:
         branch=branch,
         days=payload.get("days", 7),
         digest=digest,
+        open_pr=(
+            _DREAM_OPEN_PR.format(
+                number=number, url=open_pr.get("url", "?"), branch=branch
+            )
+            if open_pr
+            else ""
+        ),
+        pr_step=(
+            _DREAM_PR_STEP_OPEN.format(number=number) if open_pr else _DREAM_PR_STEP_NEW
+        ),
+        no_edits=(
+            _DREAM_NO_EDITS_OPEN.format(number=number)
+            if open_pr
+            else _DREAM_NO_EDITS_NEW
+        ),
         markers=_STAGE_MARKERS.format(branch=branch),
     )
     return JobSpec(
@@ -677,6 +747,7 @@ def _memory_dream(run: Run) -> JobSpec:
         branch=branch,
         model=_TRIAGE_MODEL,
         needs_github=True,
+        reuse_branch=bool(open_pr),
         # No docker: the audit reads code and edits one markdown file. A
         # memory PR that somehow needs the test suite is a memory PR that is
         # editing more than memory.
@@ -1145,6 +1216,12 @@ def followups(run: Run, result: dict | None) -> Followups:
         )
 
     if run.kind == DREAM_KIND:
+        # A run that only re-verified an open PR has nothing new to say, and
+        # parking it would re-park the same findings every night for as long as
+        # the PR sits unmerged — the noise that trains a human to ignore the
+        # mailbox. The comment it left on the PR is the whole notification.
+        if result.get("outcome") == "NO_CHANGE":
+            return Followups()
         # Anything worth a human's eyes — a PR of safe edits, or flags that
         # must never be auto-applied — parks the run; #9 emails the report.
         # CLEAN completes quietly and the notifier says so once.
