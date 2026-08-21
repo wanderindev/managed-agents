@@ -11,6 +11,7 @@ from orchestrator.queue import (
     claim_next_queued,
     extend_lease,
     get_run,
+    open_run,
     queued_count,
 )
 
@@ -126,3 +127,38 @@ def test_runs_carry_their_opening_payload(conn):
     assert get_run(conn, run_id).payload == {"repo": "feliu-dev"}
     claimed = claim_next_queued(conn)
     assert claimed is not None and claimed.payload == {"repo": "feliu-dev"}
+
+
+# --- open_run (#51) ----------------------------------------------------------
+
+
+def test_open_run_is_none_for_an_unknown_subject(conn):
+    assert open_run(conn, "sentry:O-0") is None
+
+
+def test_open_run_finds_any_non_terminal_run(conn):
+    run_id = create_run(conn, "adversarial_review", "sentry:O-1")
+    append(conn, run_id, EventType.HUMAN_GATE, {"why": "review passed"})
+
+    found = open_run(conn, "sentry:O-1")
+    assert found is not None and found.id == run_id
+    assert found.status is RunStatus.AWAITING_HUMAN
+
+
+def test_open_run_ignores_terminal_runs(conn):
+    """Same predicate as the partial unique index: DONE, FAILED, and ABANDONED
+    have released the subject's slot."""
+    for event in (EventType.RUN_DONE, EventType.RUN_FAILED):
+        run_id = create_run(conn, "sentry_triage", "sentry:O-2")
+        append(conn, run_id, event)
+    assert open_run(conn, "sentry:O-2") is None
+
+
+def test_open_run_filters_by_kind(conn):
+    triage = create_run(conn, "sentry_triage", "sentry:O-3")
+    review = create_run(conn, "adversarial_review", "sentry:O-3")
+
+    assert open_run(conn, "sentry:O-3", kind="adversarial_review").id == review
+    assert open_run(conn, "sentry:O-3", exclude_kind="sentry_triage").id == review
+    assert open_run(conn, "sentry:O-3", exclude_kind="adversarial_review").id == triage
+    assert open_run(conn, "sentry:O-3", kind="fix_revision") is None
