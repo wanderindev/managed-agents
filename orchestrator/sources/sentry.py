@@ -302,6 +302,20 @@ def poll(
                 report.drop("already queued or recently handled")
                 continue
 
+            # The cooldown and the human gate run on different clocks (#51): a
+            # chained review can park AWAITING_HUMAN far past cooldown_days,
+            # and re-triaging a subject whose reviewed fix is waiting on a
+            # human only manufactures a duplicate PR. Any open chained run —
+            # review, revision, whatever the chain grows next — suppresses the
+            # subject for as long as it stays open.
+            chained = queue.open_run(conn, issue.subject, exclude_kind=RUN_KIND)
+            if chained is not None:
+                report.drop(
+                    f"an open {chained.kind} run"
+                    f" ({chained.status.value}) holds this subject"
+                )
+                continue
+
             if not dry_run:
                 with conn.transaction():
                     create_run(conn, RUN_KIND, issue.subject, _payload(issue))

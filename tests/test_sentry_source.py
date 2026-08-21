@@ -251,6 +251,59 @@ def test_the_same_issue_can_come_back_after_the_cooldown(conn):
     assert report.enqueued == ["sentry:PIC-PYTHON-FASTAPI-1Q"]
 
 
+def test_an_open_chained_run_suppresses_the_subject_past_the_cooldown(conn):
+    """The cooldown and the human gate run on different clocks (#51): a review
+    parked AWAITING_HUMAN for weeks means a human owes a decision, and
+    re-triaging in that state manufactures a duplicate PR every 7 days."""
+    client = FakeSentry({"pic-python-fastapi": [issue()]})
+    poll(conn, client, projects=["pic-python-fastapi"])
+    triage_id = conn.execute(
+        "SELECT id FROM agent_runs WHERE subject = %s",
+        ("sentry:PIC-PYTHON-FASTAPI-1Q",),
+    ).fetchone()["id"]
+    append(conn, triage_id, EventType.RUN_DONE)
+    review_id = create_run(
+        conn, "adversarial_review", "sentry:PIC-PYTHON-FASTAPI-1Q", {"round": 1}
+    )
+    append(conn, review_id, EventType.HUMAN_GATE, {"why": "review passed"})
+    # Both runs far older than cooldown_days: only the open review suppresses.
+    conn.execute(
+        "UPDATE agent_runs SET updated_at = now() - interval '30 days'"
+        " WHERE subject = %s",
+        ("sentry:PIC-PYTHON-FASTAPI-1Q",),
+    )
+
+    report = poll(conn, client, projects=["pic-python-fastapi"])
+
+    assert report.enqueued == []
+    assert report.dropped == {
+        "an open adversarial_review run (AWAITING_HUMAN) holds this subject": 1
+    }
+
+
+def test_the_chain_suppression_lifts_when_the_review_finishes(conn):
+    client = FakeSentry({"pic-python-fastapi": [issue()]})
+    poll(conn, client, projects=["pic-python-fastapi"])
+    triage_id = conn.execute(
+        "SELECT id FROM agent_runs WHERE subject = %s",
+        ("sentry:PIC-PYTHON-FASTAPI-1Q",),
+    ).fetchone()["id"]
+    append(conn, triage_id, EventType.RUN_DONE)
+    review_id = create_run(
+        conn, "adversarial_review", "sentry:PIC-PYTHON-FASTAPI-1Q", {"round": 1}
+    )
+    append(conn, review_id, EventType.RUN_DONE)
+    conn.execute(
+        "UPDATE agent_runs SET updated_at = now() - interval '30 days'"
+        " WHERE subject = %s",
+        ("sentry:PIC-PYTHON-FASTAPI-1Q",),
+    )
+
+    report = poll(conn, client, projects=["pic-python-fastapi"])
+
+    assert report.enqueued == ["sentry:PIC-PYTHON-FASTAPI-1Q"]
+
+
 def test_a_storm_cannot_spawn_a_fleet(conn):
     """The cap is the thing standing between an incident and 40 containers."""
     storm = [

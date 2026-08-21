@@ -447,19 +447,29 @@ def test_a_refuted_verdict_enqueues_the_revision_through_the_loop(conn):
     assert get_run(conn, revision["id"]).payload["refutation"] == "test passes on main"
 
 
-def test_an_already_open_chain_run_is_tolerated(conn):
-    """The partial unique index is the backstop; hitting it is not an error."""
+def test_a_refused_chain_parks_the_run_for_a_human(conn):
+    """The partial unique index is still the backstop, but its firing is loud
+    now (#51): the duplicate PR this run just opened has no follow-up that owns
+    it, so the run parks AWAITING_HUMAN for the notifier — instead of the INFO
+    line that stranded PIC's #473 as an orphaned draft."""
     runner = FakeRunner(
         result={"outcome": "FIX", "pr_url": "https://x/pr/9", "branch": "b"}
     )
     orchestrator = chain_orchestrator(runner)
     fix_id = create_run(conn, sentry.RUN_KIND, "sentry:L-4", PAYLOAD)
-    create_run(conn, jobs.REVIEW_KIND, "sentry:L-4", CHAIN_PAYLOAD)  # already open
+    blocking = create_run(conn, jobs.REVIEW_KIND, "sentry:L-4", CHAIN_PAYLOAD)
 
     finish_one(conn, runner, orchestrator)
 
-    assert get_run(conn, fix_id).status is RunStatus.DONE
+    assert get_run(conn, fix_id).status is RunStatus.AWAITING_HUMAN
     assert len(runs_of_kind(conn, jobs.REVIEW_KIND)) == 1
+    (gate,) = [e for e in load_events(conn, fix_id) if e.type is EventType.HUMAN_GATE]
+    assert "refused" in gate.payload["why"]
+    assert gate.payload["pr_url"] == "https://x/pr/9"
+    (refusal,) = gate.payload["refused"]
+    assert refusal["blocking_run"] == blocking
+    assert refusal["kind"] == jobs.REVIEW_KIND
+    assert refusal["blocking_status"] == RunStatus.QUEUED.value
     assert verify_replay(conn, fix_id)
 
 

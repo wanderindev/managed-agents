@@ -156,6 +156,42 @@ def queued_count(conn: psycopg.Connection) -> int:
         return cur.fetchone()["n"]
 
 
+def open_run(
+    conn: psycopg.Connection,
+    subject: str,
+    *,
+    kind: str | None = None,
+    exclude_kind: str | None = None,
+) -> Run | None:
+    """The oldest non-terminal run for a subject, if any.
+
+    Same status predicate as the partial unique index
+    ``agent_runs_open_subject_key``, so "open" here means exactly "holds the
+    uniqueness slot". Two callers, two filters: the Sentry poll asks with
+    ``exclude_kind`` to see whether a *chained* run (review, revision) still
+    owns the subject — an AWAITING_HUMAN review means a human owes a decision,
+    and re-triaging can never be the right move in that state (#51). The loop
+    asks with ``kind`` to name the run that just refused a chained insert.
+    """
+    clauses = ["subject = %s", "status <> ALL(%s)"]
+    params: list = [subject, [s.value for s in TERMINAL_STATUSES]]
+    if kind is not None:
+        clauses.append("kind = %s")
+        params.append(kind)
+    if exclude_kind is not None:
+        clauses.append("kind <> %s")
+        params.append(exclude_kind)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_COLUMNS} FROM agent_runs"
+            f" WHERE {' AND '.join(clauses)}"
+            " ORDER BY id LIMIT 1",
+            params,
+        )
+        row = cur.fetchone()
+    return _to_run(row) if row else None
+
+
 def has_recent_run(
     conn: psycopg.Connection, kind: str, subject: str, cooldown: timedelta
 ) -> bool:

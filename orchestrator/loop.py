@@ -257,6 +257,7 @@ class Orchestrator:
             return
         try:
             decision = self.followups(run, job_result)
+            refused: list[dict[str, Any]] = []
             for new_run in decision.enqueue:
                 try:
                     with conn.transaction():
@@ -271,13 +272,48 @@ class Orchestrator:
                         created,
                     )
                 except psycopg.errors.UniqueViolation:
-                    # An open run for this (kind, subject) already exists. The
-                    # partial unique index is doing its job; nothing to do.
-                    logger.info(
-                        "run %s: %s %s already open, not chaining",
+                    # An open run for this (kind, subject) already exists, so
+                    # the partial unique index refused the chain. The index is
+                    # doing its job, but the *consequence* — this run's work
+                    # (often a fresh PR) now has no follow-up that owns it —
+                    # must not vanish into an INFO line (#51): the refusal is
+                    # collected and parks this run AWAITING_HUMAN below, so
+                    # the notifier says it out loud.
+                    blocking = queue.open_run(conn, new_run.subject, kind=new_run.kind)
+                    refused.append(
+                        {
+                            "kind": new_run.kind,
+                            "subject": new_run.subject,
+                            "pr_url": (new_run.payload or {}).get("pr_url"),
+                            "blocking_run": blocking.id if blocking else None,
+                            "blocking_status": (
+                                blocking.status.value if blocking else None
+                            ),
+                        }
+                    )
+                    logger.warning(
+                        "run %s: %s %s already open (run %s), not chaining;"
+                        " parking for a human",
                         run.id,
                         new_run.kind,
                         new_run.subject,
+                        blocking.id if blocking else "?",
+                    )
+            if refused:
+                with conn.transaction():
+                    log.append(
+                        conn,
+                        run.id,
+                        EventType.HUMAN_GATE,
+                        {
+                            "why": (
+                                "duplicate work produced: a follow-up was"
+                                " refused because an earlier run for this"
+                                " subject is still open"
+                            ),
+                            "refused": refused,
+                            "pr_url": refused[0].get("pr_url"),
+                        },
                     )
             if decision.human_gate is not None:
                 with conn.transaction():
