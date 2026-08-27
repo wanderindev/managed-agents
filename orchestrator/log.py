@@ -286,6 +286,26 @@ def latest_event(
     )
 
 
+def latest_auth_failure(conn: psycopg.Connection) -> str | None:
+    """The credential fingerprint pinned by the newest auth-failed run, if any.
+
+    Across all runs, not one: a dead login is a host condition. Returns the
+    ``credentials`` value the loop stored (see orchestrator.auth) so dispatch
+    can compare it with the file now on disk.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT payload FROM agent_events"
+            " WHERE type = %s AND payload->>'reason' = 'auth'"
+            " ORDER BY id DESC LIMIT 1",
+            (EventType.RUN_FAILED.value,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return row["payload"].get("credentials")
+
+
 def last_completed_stage(
     conn: psycopg.Connection, run_id: int
 ) -> dict[str, Any] | None:

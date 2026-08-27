@@ -91,6 +91,24 @@ around it because running the CLI is the entire point. #11 gets GitHub down to
 1-hour scoped tokens; this credential cannot be reduced the same way, which is
 worth stating plainly rather than pretending the container solves it.
 
+### When the login dies anyway
+
+The refresh can fail for good (it did on 2026-08-22: the CLI rewrote the file
+with `expiresAt: 0`, and every sandbox afterwards died in a second with
+`authentication_failed`). The loop recognises that transcript
+(`orchestrator/auth.py`): the `run_failed` event is stamped `reason: auth` plus
+a fingerprint (mtime + size, never content) of the credential file, the email
+for that run says **"Claude login EXPIRED"** in the subject, and dispatch
+**pauses** while the file on disk still matches the fingerprint — queued runs
+wait instead of each burning a daily failure. Fix, by hand:
+
+```bash
+ssh -t wanderindev@159.223.174.185 claude auth login
+```
+
+That rewrites the file; the next tick sees the new fingerprint and drains the
+queue. No restart, nothing to reset in the database.
+
 ### `bypassPermissions`, and what the Docker socket costs
 
 The entrypoint defaults to `--permission-mode bypassPermissions`. That is right
