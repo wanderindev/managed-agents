@@ -20,11 +20,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import psycopg
 
-from orchestrator import config, db, log, queue
+from orchestrator import auth, config, db, log, queue
 from orchestrator.enums import EventType, Outcome
 from orchestrator.queue import Run
 from orchestrator.runner import Runner
@@ -81,6 +82,8 @@ class TickResult:
     heartbeated: list[int] = field(default_factory=list)
     abandoned: list[int] = field(default_factory=list)
     finished: list[int] = field(default_factory=list)
+    #: Set when dispatch refused to lease because the Claude login is dead.
+    paused: str | None = None
 
     @property
     def idle(self) -> bool:
@@ -102,8 +105,14 @@ class Orchestrator:
         jitter: Callable[[], float] = random.random,
         followups: Callable[[Run, dict[str, Any] | None], Any] | None = None,
         notify: Callable[[psycopg.Connection], int] | None = None,
+        credentials: str | Path | None = None,
     ) -> None:
         self.runner = runner
+        #: The Claude credential the sandbox mounts. Only fingerprinted here,
+        #: never read: it decides whether dispatch may resume after a login
+        #: failure (see orchestrator.auth).
+        self.credentials = Path(credentials or config.CLAUDE_CREDENTIALS)
+        self._paused_for: str | None = None
         self.worker_id = worker_id or config.WORKER_ID
         self.max_concurrent = (
             config.MAX_CONCURRENT_RUNS if max_concurrent is None else max_concurrent
@@ -216,6 +225,20 @@ class Orchestrator:
             return
 
         succeeded = sandbox.outcome is Outcome.SUCCEEDED
+        terminal: dict[str, Any] = {"exit_code": sandbox.exit_code}
+        if not succeeded and auth.failed_auth(sandbox.events):
+            # Not this run's fault and not the next run's either: until someone
+            # logs in again on the host every sandbox dies the same way. Name
+            # it, and pin the credential version so dispatch can wait for the
+            # file to change rather than burning one run per schedule.
+            terminal[auth.REASON_KEY] = auth.REASON_AUTH
+            terminal[auth.FINGERPRINT_KEY] = auth.fingerprint(self.credentials)
+            logger.error(
+                "run %s: Claude login expired on the host and could not refresh;"
+                " dispatch pauses until %s is rewritten (claude auth login)",
+                run.id,
+                self.credentials,
+            )
         with conn.transaction():
             log.append(
                 conn,
@@ -233,7 +256,7 @@ class Orchestrator:
                 conn,
                 run.id,
                 EventType.RUN_DONE if succeeded else EventType.RUN_FAILED,
-                {"exit_code": sandbox.exit_code},
+                terminal,
                 worker_id=None,
                 lease_expires_at=None,
             )
@@ -485,6 +508,9 @@ class Orchestrator:
     # --- dispatch ------------------------------------------------------------
 
     def _dispatch(self, conn: psycopg.Connection, result: TickResult) -> None:
+        result.paused = self._auth_pause(conn)
+        if result.paused is not None:
+            return
         slots = self.max_concurrent - len(queue.active_runs(conn))
         for _ in range(max(slots, 0)):
             run = self._lease_one(conn)
@@ -497,6 +523,31 @@ class Orchestrator:
                 # through the same failure. Also stops a requeued run from being
                 # picked straight back up inside this same tick.
                 return
+
+    def _auth_pause(self, conn: psycopg.Connection) -> str | None:
+        """Why nothing should be leased right now, or None.
+
+        Stateless like everything else: the evidence is the most recent
+        ``run_failed`` that named a dead login, and the credential file's
+        fingerprint it recorded. While the file on disk still matches, the
+        login is still dead and leasing a run would only burn it. A re-login
+        rewrites the file, the fingerprint moves, and the queue drains on the
+        next tick with nothing to reset. Logged once per pause, not per tick.
+        """
+        stamped = log.latest_auth_failure(conn)
+        if stamped is None or stamped != auth.fingerprint(self.credentials):
+            if self._paused_for is not None:
+                logger.info("Claude credential changed; resuming dispatch")
+                self._paused_for = None
+            return None
+        reason = (
+            f"Claude login expired; run `claude auth login` on the host"
+            f" (waiting for {self.credentials} to change)"
+        )
+        if self._paused_for != stamped:
+            logger.warning("dispatch paused: %s", reason)
+            self._paused_for = stamped
+        return reason
 
     def _lease_one(self, conn: psycopg.Connection) -> Run | None:
         """Claim the oldest queued run. Claim and lease share one transaction.

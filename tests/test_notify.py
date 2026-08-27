@@ -445,3 +445,35 @@ def test_the_cli_send_path_respects_a_disabled_notifier(conn, monkeypatch, capsy
     monkeypatch.setattr(notify.config, "NOTIFY_TO", "")
     assert notify.main([]) == 0
     assert "sent 0 email(s)" in capsys.readouterr().out
+
+
+# --- a dead Claude login gets its own subject ----------------------------------
+
+
+def test_an_auth_failure_emails_the_login_fix_not_a_generic_nonzero_exit(conn):
+    run_id = create_run(
+        conn, jobs.DREAM_KIND, "dream:feliu-dev:2026-08-22", {"repo": "feliu-dev"}
+    )
+    append(conn, run_id, EventType.RUN_LEASED, worker_id="w", attempts=1)
+    append(conn, run_id, EventType.SANDBOX_STARTED, {"container": "c"})
+    append(
+        conn,
+        run_id,
+        EventType.STAGE_COMPLETED,
+        {"exit_code": 1, "outcome": "FAILED", "result": None},
+    )
+    append(
+        conn,
+        run_id,
+        EventType.RUN_FAILED,
+        {"exit_code": 1, "reason": "auth", "credentials": "0:281"},
+        worker_id=None,
+        lease_expires_at=None,
+    )
+    transport = FakeTransport()
+    assert send_pass(conn, transport) == 1
+    [email] = transport.sent
+    assert "Claude login EXPIRED" in email.subject
+    assert "sandbox exited nonzero" not in email.subject
+    assert "claude auth login" in email.body
+    assert "PAUSED dispatch" in email.body

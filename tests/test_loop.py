@@ -558,3 +558,145 @@ def test_run_forever_survives_a_failing_tick(conn, orchestrator, monkeypatch):
         sleep=lambda _: calls.append(1),
     )
     assert calls, "the loop kept going rather than raising"
+
+
+# --- a dead Claude login (auth expiry guard) -----------------------------------
+
+AUTH_DEAD_TRANSCRIPT = [
+    {"type": "system", "subtype": "init"},
+    {
+        "type": "assistant",
+        "error": "authentication_failed",
+        "message": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Failed to authenticate: OAuth session expired"
+                    " and could not be refreshed",
+                }
+            ]
+        },
+    },
+    {
+        "type": "result",
+        "is_error": True,
+        "result": "Failed to authenticate: OAuth session expired and could not"
+        " be refreshed",
+    },
+]
+
+
+@pytest.fixture()
+def credential(tmp_path):
+    path = tmp_path / ".credentials.json"
+    path.write_text('{"claudeAiOauth": {"expiresAt": 0}}')
+    return path
+
+
+def _auth_dead(credential):
+    from orchestrator.enums import Outcome
+
+    runner = FakeRunner(
+        outcome=Outcome.FAILED, exit_code=1, events=AUTH_DEAD_TRANSCRIPT
+    )
+    orch = Orchestrator(
+        runner,
+        worker_id=WORKER,
+        max_concurrent=1,
+        lease_seconds=300,
+        max_attempts=3,
+        backoff_base_seconds=0,
+        credentials=credential,
+    )
+    return runner, orch
+
+
+def test_a_login_failure_is_named_on_the_run_failed_event(conn, credential):
+    from orchestrator import auth
+
+    runner, orch = _auth_dead(credential)
+    run_id = create_run(conn, "smoke", "s1")
+    orch.tick(conn)  # lease + start
+    runner.kill_all()  # container stops; finish() reports FAILED
+    orch.tick(conn)
+
+    assert get_run(conn, run_id).status is RunStatus.FAILED
+    failed = [e for e in load_events(conn, run_id) if e.type is EventType.RUN_FAILED]
+    assert failed[0].payload["reason"] == "auth"
+    assert failed[0].payload["credentials"] == auth.fingerprint(credential)
+
+
+def test_a_dead_login_pauses_dispatch_instead_of_burning_the_queue(
+    conn, credential, caplog
+):
+    runner, orch = _auth_dead(credential)
+    first = create_run(conn, "smoke", "s1")
+    second = create_run(conn, "smoke", "s2")
+    orch.tick(conn)
+    runner.kill_all()
+    result = orch.tick(conn)
+
+    assert result.finished == [first]
+    assert result.leased == []
+    assert "claude auth login" in result.paused
+    assert get_run(conn, second).status is RunStatus.QUEUED
+    assert runner.started == [first]
+
+    # The pause is stated once, not once per 15-second tick.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="orchestrator.loop"):
+        for _ in range(3):
+            assert orch.tick(conn).paused is not None
+    assert sum("dispatch paused" in r.message for r in caplog.records) == 0
+    assert runner.started == [first]
+
+
+def test_a_rewritten_credential_resumes_dispatch_with_no_restart(conn, credential):
+    import os
+
+    runner, orch = _auth_dead(credential)
+    create_run(conn, "smoke", "s1")
+    second = create_run(conn, "smoke", "s2")
+    orch.tick(conn)
+    runner.kill_all()
+    assert orch.tick(conn).paused is not None
+
+    # `claude auth login` rewrites the file: new mtime and/or size.
+    credential.write_text('{"claudeAiOauth": {"expiresAt": 1893456000000}}')
+    os.utime(credential, ns=(1, 1))
+    result = orch.tick(conn)
+
+    assert result.paused is None
+    assert result.leased == [second]
+
+
+def test_a_restarted_orchestrator_stays_paused_from_the_log_alone(conn, credential):
+    runner, orch = _auth_dead(credential)
+    create_run(conn, "smoke", "s1")
+    create_run(conn, "smoke", "s2")
+    orch.tick(conn)
+    runner.kill_all()
+    orch.tick(conn)
+
+    fresh_runner, fresh = _auth_dead(credential)
+    assert fresh.tick(conn).paused is not None
+    assert fresh_runner.started == []
+
+
+def test_an_ordinary_failure_does_not_pause_dispatch(conn, credential):
+    from orchestrator.enums import Outcome
+
+    runner = FakeRunner(outcome=Outcome.FAILED, exit_code=1, events=[])
+    orch = Orchestrator(
+        runner, worker_id=WORKER, max_concurrent=1, credentials=credential
+    )
+    create_run(conn, "smoke", "s1")
+    second = create_run(conn, "smoke", "s2")
+    orch.tick(conn)
+    runner.kill_all()
+    result = orch.tick(conn)
+
+    assert result.paused is None
+    assert result.leased == [second]
+    failed = [e for e in load_events(conn, 1) if e.type is EventType.RUN_FAILED]
+    assert "reason" not in failed[0].payload if failed else True

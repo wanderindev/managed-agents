@@ -148,10 +148,22 @@ def _latest_gate(conn: psycopg.Connection, run_id: int) -> dict[str, Any]:
     return event.payload if event else {}
 
 
-def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
+def _failed_payload(conn: psycopg.Connection, cand: _Candidate) -> dict[str, Any]:
+    """The ``run_failed`` payload of a FAILED run: it carries the reason when
+    the loop classified the failure (a dead login, see orchestrator.auth)."""
+    if cand.status != "FAILED":
+        return {}
+    event = log.latest_event(conn, cand.run_id, EventType.RUN_FAILED)
+    return event.payload if event else {}
+
+
+def _headline(
+    cand: _Candidate, result: dict, gate: dict, failed: dict | None = None
+) -> str | None:
     """One line saying why this email exists, or None to suppress (with the
     reason recorded). Suppression means the chain already carried the outcome
     forward, not that nothing happened."""
+    failed = failed or {}
     if cand.status == "AWAITING_HUMAN":
         verdict = gate.get("verdict")
         if verdict == "STANDS":
@@ -166,6 +178,11 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
             return "adversary UNCERTAIN — read the doubt before merging"
         return gate.get("why") or "awaiting a human decision"
     if cand.status == "FAILED":
+        if failed.get("reason") == "auth":
+            # The one failure that is not about this run at all. Said in the
+            # subject, because the fix is a human typing a login on the host
+            # and every queued run waits for it (the loop pauses dispatch).
+            return "Claude login EXPIRED on the agents droplet — re-run `claude auth login`"
         return "run FAILED (sandbox exited nonzero)"
     if cand.status == "ABANDONED":
         return f"run ABANDONED after {cand.attempts} attempts"
@@ -208,8 +225,25 @@ def _headline(cand: _Candidate, result: dict, gate: dict) -> str | None:
     return None  # a DONE review chained a revision; that run will email
 
 
-def _body(cand: _Candidate, result: dict, gate: dict) -> str:
+def _body(
+    cand: _Candidate, result: dict, gate: dict, failed: dict | None = None
+) -> str:
     payload = cand.payload
+    failed = failed or {}
+    if failed.get("reason") == "auth":
+        return (
+            "The sandbox could not authenticate: the host's Claude OAuth session"
+            " expired and could not be refreshed. This is a host condition, not a"
+            " problem with this run.\n\n"
+            "The orchestrator has PAUSED dispatch. Every queued run (and every one"
+            " the schedules enqueue meanwhile) waits; nothing else will be burned"
+            " and this is the only email about it.\n\n"
+            "Fix (interactive, cannot be automated):\n"
+            "  ssh -t wanderindev@<agents droplet> claude auth login\n\n"
+            "Dispatch resumes on the next tick after the credential file is"
+            " rewritten; no restart needed.\n\n"
+            f"(run {cand.run_id}, kind {cand.kind}, subject {cand.subject}.)"
+        )
     pr_url = gate.get("pr_url") or result.get("pr_url") or payload.get("pr_url")
     lines = [
         f"Repository:  {payload.get('repo', '?')}",
@@ -322,7 +356,8 @@ def pass_once(
         stage = log.last_completed_stage(conn, cand.run_id) or {}
         result = stage.get("result") or {}
         gate = _latest_gate(conn, cand.run_id)
-        headline = _headline(cand, result, gate)
+        failed = _failed_payload(conn, cand)
+        headline = _headline(cand, result, gate, failed)
 
         if headline is None:
             with conn.transaction():
@@ -344,7 +379,7 @@ def pass_once(
                 f"[managed-agents] {cand.payload.get('repo', '?')}"
                 f" {cand.payload.get('short_id', cand.subject)}: {headline}"
             ),
-            body=_body(cand, result, gate),
+            body=_body(cand, result, gate, failed),
         )
         try:
             transport(email)
@@ -406,12 +441,13 @@ def main(argv: list[str] | None = None) -> int:
                 stage = log.last_completed_stage(conn, cand.run_id) or {}
                 result = stage.get("result") or {}
                 gate = _latest_gate(conn, cand.run_id)
-                headline = _headline(cand, result, gate)
+                failed = _failed_payload(conn, cand)
+                headline = _headline(cand, result, gate, failed)
                 marker = headline or "(suppressed: chain carried it forward)"
                 print(f"run {cand.run_id}  {cand.subject}: {marker}")
                 if headline:
                     print("---")
-                    print(_body(cand, result, gate))
+                    print(_body(cand, result, gate, failed))
                     print("===")
             return 0
         sent = pass_once(conn)
