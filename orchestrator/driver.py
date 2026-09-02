@@ -80,11 +80,16 @@ class PicClient:
         *,
         body: dict | None = None,
         query: dict | None = None,
+        timeout: int = 60,
     ) -> tuple[int, Any]:
         """One call; non-2xx comes back as data, not an exception.
 
         The driver treats HTTP failure as a *task* outcome to report, so only
-        transport-level trouble (network down, DNS) is allowed to raise.
+        transport-level trouble (network down, DNS, a timed-out read) is
+        allowed to raise — and ``execute_calls`` catches that for task calls,
+        because a slow endpoint must fail the *task*, not the session (the
+        2026-09-01 drive died to an uncaught ``TimeoutError`` from a >60s
+        ``generate-outlines`` call, stranding the whole week).
         """
         url = f"{self.base_url}{path}"
         if query:
@@ -101,7 +106,7 @@ class PicClient:
             },
         )
         try:
-            with self._open(request, timeout=60) as response:
+            with self._open(request, timeout=timeout) as response:
                 raw = response.read().decode()
                 return response.status, json.loads(raw) if raw.strip() else None
         except urllib.error.HTTPError as exc:
@@ -194,7 +199,10 @@ def execute_calls(
                 return False, prev, "call plan expected a job id but none was returned"
             deadline = now() + timeout_seconds
             while True:
-                status, job = client.job(job_id)
+                try:
+                    status, job = client.job(job_id)
+                except OSError as exc:
+                    return False, prev, f"job {job_id} poll transport failure: {exc!r}"
                 if status != 200:
                     return False, job, f"job {job_id} poll answered {status}"
                 if job.get("status") == "SUCCEEDED":
@@ -218,9 +226,23 @@ def execute_calls(
             edits = (prev or {}).get("edits") if isinstance(prev, dict) else None
             body = {"edits": edits or []}
 
-        status, data = client.request(
-            call["method"], path, body=body, query=call.get("query")
-        )
+        try:
+            status, data = client.request(
+                call["method"],
+                path,
+                body=body,
+                query=call.get("query"),
+                timeout=config.DRIVER_CALL_TIMEOUT_SECONDS,
+            )
+        except OSError as exc:
+            # TimeoutError and URLError are both OSError. A dead or slow
+            # endpoint is a task outcome (PIC re-queues or parks it), never a
+            # session crash — that stranded W36 on 2026-09-01.
+            return (
+                False,
+                prev,
+                f"{call['method']} {path} transport failure: {exc!r}",
+            )
         if not 200 <= status < 300:
             return (
                 False,
@@ -309,9 +331,17 @@ def drive(
             heartbeat=extend_lease,
         )
         status = "DONE" if ok else "FAILED"
-        report_status, report_body = client.report(
-            task["id"], status, result=_clip_payload(result), error=error
-        )
+        try:
+            report_status, report_body = client.report(
+                task["id"], status, result=_clip_payload(result), error=error
+            )
+        except OSError as exc:
+            # An unreportable outcome is a protocol problem like a rejected
+            # report: count the failure and let the lease sweep re-queue.
+            report_status, report_body = (
+                0,
+                {"detail": f"report transport failure: {exc!r}"},
+            )
         if not 200 <= report_status < 300:
             # A rejected report is a protocol problem, not a task problem.
             logger.warning(
