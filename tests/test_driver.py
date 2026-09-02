@@ -7,7 +7,7 @@ read — a summary email for a complete week, a parked run listing the stuck
 tasks for anything less.
 """
 
-from orchestrator import driver, notify
+from orchestrator import config, driver, notify
 from orchestrator.driver import PicClient, execute_calls
 from orchestrator.enums import EventType, RunStatus
 from orchestrator.log import load_events
@@ -48,7 +48,9 @@ class FakePic:
         self.report_status = report_status
         self.reports = []
         self.requests = []
+        self.timeouts = []
         self.planned = 0
+        self.report_raises = None
 
     def next_task(self):
         return self.next_responses.pop(0) if self.next_responses else None
@@ -59,6 +61,8 @@ class FakePic:
 
     def report(self, task_id, status, *, result=None, error=None):
         self.reports.append((task_id, status, error))
+        if self.report_raises is not None:
+            raise self.report_raises
         return self.report_status, {}
 
     def job(self, job_id):
@@ -67,9 +71,13 @@ class FakePic:
     def goal_tasks(self, goal_key):
         return self.goal
 
-    def request(self, method, path, *, body=None, query=None):
+    def request(self, method, path, *, body=None, query=None, timeout=60):
         self.requests.append((method, path, body))
-        return self.call_responses.pop(0) if self.call_responses else (200, {})
+        self.timeouts.append(timeout)
+        response = self.call_responses.pop(0) if self.call_responses else (200, {})
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def task_response(task_id=1, kind="GENERATE_TAGS", calls=None):
@@ -198,6 +206,21 @@ def test_a_success_false_flag_fails_the_task():
     assert "success=false" in error
 
 
+def test_a_transport_timeout_fails_the_task_not_the_session():
+    """The 2026-09-01 drive: generate-outlines outlived the read timeout and
+    the raw TimeoutError killed the whole session. It must be a task outcome."""
+    pic = FakePic(call_responses=[TimeoutError("The read operation timed out")])
+    ok, _, error = execute_calls(pic, [call(path="/api/v1/generate-outlines")])
+    assert not ok
+    assert "transport failure" in error and "timed out" in error
+
+
+def test_task_calls_get_the_long_llm_timeout():
+    pic = FakePic(call_responses=[(200, {})])
+    execute_calls(pic, [call(path="/api/v1/generate-outlines")])
+    assert pic.timeouts == [config.DRIVER_CALL_TIMEOUT_SECONDS]
+
+
 # --- the session ----------------------------------------------------------------
 
 
@@ -272,6 +295,19 @@ def test_the_task_cap_stops_a_looping_session(conn):
     assert len(pic.reports) == 3
     assert "3-task session cap" in summary["stopped_early"]
     assert drive_run(conn).status is RunStatus.AWAITING_HUMAN
+
+
+def test_an_unreportable_outcome_counts_as_a_failure(conn):
+    """A report that dies in transport must not crash the session; the lease
+    sweep re-queues the row, and the session records the failure."""
+    pic = FakePic(
+        next_responses=[task_response(1), None, None],
+        goal=[goal_row(1, "LEASED")],
+    )
+    pic.report_raises = TimeoutError("The read operation timed out")
+    summary = run_drive(conn, pic)
+    assert summary["tasks_failed"] == 1
+    assert summary["outcome"] == "INCOMPLETE"
 
 
 def test_a_rejected_report_counts_as_a_failure(conn):

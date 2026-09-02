@@ -218,3 +218,11 @@ DRIVER_JOB_POLL_SECONDS = int(
 DRIVER_JOB_TIMEOUT_SECONDS = int(
     os.environ.get("ORCHESTRATOR_DRIVER_JOB_TIMEOUT_SECONDS", "1800")
 )
+
+#: HTTP read timeout for one task call. Some task endpoints run an LLM
+#: synchronously (generate-outlines took >60s on 2026-09-01 and the old 60s
+#: timeout killed the whole drive session); queue plumbing (claim, report,
+#: job polls) keeps the default 60s.
+DRIVER_CALL_TIMEOUT_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_DRIVER_CALL_TIMEOUT_SECONDS", "600")
+)
