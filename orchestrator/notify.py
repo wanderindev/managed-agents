@@ -28,7 +28,7 @@ from typing import Any
 
 import psycopg
 
-from orchestrator import config, log
+from orchestrator import config, driver, log
 from orchestrator.db import connect
 from orchestrator.driver import RUN_KIND as DRIVE_KIND
 from orchestrator.enums import EventType
@@ -183,6 +183,16 @@ def _headline(
             # subject, because the fix is a human typing a login on the host
             # and every queued run waits for it (the loop pauses dispatch).
             return "Claude login EXPIRED on the agents droplet — re-run `claude auth login`"
+        if failed.get("reason") == driver.REASON_NO_RESEARCH:
+            # The queue has nothing to plan from. The fix is a human approving
+            # (or adding) research in PIC, and every scheduled drive fails the
+            # same way until then — so the subject says what to do, not "FAILED".
+            return "daily drive: NO APPROVED RESEARCH in PIC — approve or add research"
+        if failed.get("reason") == driver.REASON_PROTOCOL:
+            return (
+                f"daily drive stopped: {failed.get('what', 'queue')}"
+                f" answered {failed.get('status', '?')}"
+            )
         return "run FAILED (sandbox exited nonzero)"
     if cand.status == "ABANDONED":
         return f"run ABANDONED after {cand.attempts} attempts"
@@ -244,6 +254,39 @@ def _body(
             " rewritten; no restart needed.\n\n"
             f"(run {cand.run_id}, kind {cand.kind}, subject {cand.subject}.)"
         )
+    if failed.get("reason") in (driver.REASON_NO_RESEARCH, driver.REASON_PROTOCOL):
+        what = failed.get("what", "queue")
+        lines = [
+            (
+                f"PIC's agent-task queue ({payload.get('base_url', '?')}) would not"
+                f" let the drive proceed: {what} answered {failed.get('status', '?')}."
+            ),
+            "",
+            "Response:",
+            str(failed.get("detail") or "(empty)"),
+            "",
+        ]
+        if failed.get("reason") == driver.REASON_NO_RESEARCH:
+            lines += [
+                (
+                    "plan-week only plans from APPROVED research. Research that was"
+                    " written but never approved does not count. Approve it (or add"
+                    " more) in the PIC admin, and the next scheduled drive plans"
+                    " that day's series on its own; nothing to restart here."
+                ),
+                "",
+                "Until then this email repeats once per scheduled drive.",
+                "",
+            ]
+        if result.get("summary"):
+            lines += ["Session:", result["summary"], ""]
+        lines += [
+            (
+                f"(run {cand.run_id}, kind {cand.kind}, subject {cand.subject}."
+                " Full history: agent_events in the orchestrator database.)"
+            )
+        ]
+        return "\n".join(lines)
     pr_url = gate.get("pr_url") or result.get("pr_url") or payload.get("pr_url")
     lines = [
         f"Repository:  {payload.get('repo', '?')}",
