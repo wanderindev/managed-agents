@@ -58,6 +58,35 @@ _TASKS = "/api/v1/admin/dashboard/agent-tasks"
 #: How much of a response body to keep in reports and events.
 _CLIP = 2000
 
+#: ``run_failed`` payload reasons for a drive session that could not claim
+#: work at all. Distinct from a task failing: nothing about the pipeline is
+#: wrong, the queue itself would not talk to us.
+REASON_NO_RESEARCH = "no_research"
+REASON_PROTOCOL = "protocol"
+
+
+class ProtocolError(RuntimeError):
+    """The queue surface (``next``, ``plan-week``) answered something other
+    than success. A task-call failure is a *task* outcome; this is the session
+    itself being unable to proceed, and it ends the drive as FAILED with the
+    answer preserved — the 2026-09-07/08 drives died on plan-week's 404
+    ("No research available for planning") as an uncaught traceback, and
+    since the session's transaction was never committed, the run did not even
+    exist afterwards. Two days of silence, discovered by a missing series.
+    """
+
+    def __init__(self, what: str, status: int, detail: Any) -> None:
+        self.what = what
+        self.status = status
+        self.detail = json.dumps(detail, default=str)[:_CLIP]
+        super().__init__(f"{what} answered {status}: {self.detail[:200]}")
+
+    @property
+    def reason(self) -> str:
+        if self.what == "plan-week" and self.status == 404:
+            return REASON_NO_RESEARCH
+        return REASON_PROTOCOL
+
 
 class PicClient:
     """Minimal client for PIC's agent-tasks API. stdlib urllib, as ever."""
@@ -124,13 +153,13 @@ class PicClient:
         if status == 204 or data is None:
             return None
         if status != 200:
-            raise RuntimeError(f"next answered {status}: {json.dumps(data)[:200]}")
+            raise ProtocolError("next", status, data)
         return data
 
     def plan_week(self) -> dict:
         status, data = self.request("POST", f"{_TASKS}/plan-week")
         if status != 200:
-            raise RuntimeError(f"plan-week answered {status}: {json.dumps(data)[:200]}")
+            raise ProtocolError("plan-week", status, data)
         return data
 
     def report(
@@ -258,6 +287,58 @@ def execute_calls(
     return True, prev, None
 
 
+def _fail(
+    conn: psycopg.Connection,
+    run_id: int,
+    subject: str,
+    exc: ProtocolError,
+    *,
+    done: int,
+    failed: int,
+) -> dict[str, Any]:
+    """End the session FAILED because the queue would not talk to us.
+
+    Whatever tasks ran were already reported to PIC, so nothing is lost on
+    that side; what must not be lost is the fact that the drive stopped, and
+    why. The reason rides on ``run_failed`` (like ``auth`` does) so the
+    notifier can name the fix in the subject line — for ``no_research`` that
+    fix is a human approving research in PIC, and every scheduled drive will
+    fail the same way until they do.
+    """
+    summary: dict[str, Any] = {
+        "outcome": "FAILED",
+        "reason": exc.reason,
+        "what": exc.what,
+        "status": exc.status,
+        "detail": exc.detail,
+        "tasks_done": done,
+        "tasks_failed": failed,
+        "summary": f"drive stopped: {exc} ({done} task(s) done, {failed} failed)",
+    }
+    with conn.transaction():
+        log.append(
+            conn,
+            run_id,
+            EventType.STAGE_COMPLETED,
+            {"outcome": "FAILED", "result": summary},
+        )
+        log.append(
+            conn,
+            run_id,
+            EventType.RUN_FAILED,
+            {
+                "reason": exc.reason,
+                "what": exc.what,
+                "status": exc.status,
+                "detail": exc.detail,
+            },
+            worker_id=None,
+            lease_expires_at=None,
+        )
+    logger.error("drive session %s failed: %s", subject, summary["summary"])
+    return summary
+
+
 def drive(
     conn: psycopg.Connection,
     client: PicClient,
@@ -306,11 +387,26 @@ def drive(
 
     while True:
         extend_lease()
-        task_response = client.next_task()
+        try:
+            task_response = client.next_task()
+            if task_response is None:
+                if planned_when_empty:
+                    break  # empty even after an ensure-pass: the week can go no further
+                planned = client.plan_week()
+        except ProtocolError as exc:
+            return _fail(conn, run_id, subject, exc, done=done, failed=failed)
+        except OSError as exc:
+            # Transport trouble on the queue surface itself: no task to fail,
+            # so the session fails, with the error text instead of a traceback.
+            return _fail(
+                conn,
+                run_id,
+                subject,
+                ProtocolError("queue", 0, f"transport failure: {exc!r}"),
+                done=done,
+                failed=failed,
+            )
         if task_response is None:
-            if planned_when_empty:
-                break  # empty even after an ensure-pass: the week can go no further
-            planned = client.plan_week()
             goal_key = planned.get("goal_key") or goal_key
             planned_when_empty = True
             logger.info(
@@ -481,8 +577,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     with connect() as conn:
-        drive(conn, client, max_tasks=args.max_tasks)
-    return 0
+        # Autocommit, so each ``conn.transaction()`` block in the session is a
+        # real transaction. With it off, the first SELECT opens an implicit
+        # transaction that every later block nests into as a savepoint, and
+        # nothing reaches the database until this ``with`` exits cleanly: the
+        # lease and heartbeats were invisible to the loop all session, and a
+        # crash rolled the whole run out of existence (runs 108 and 111 never
+        # existed). Committed as it goes, a crash leaves a leased run whose
+        # expired lease the loop's reconcile abandons and emails.
+        conn.autocommit = True
+        summary = drive(conn, client, max_tasks=args.max_tasks)
+    return 1 if summary.get("outcome") == "FAILED" else 0
 
 
 if __name__ == "__main__":

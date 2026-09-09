@@ -371,3 +371,135 @@ def test_the_client_treats_http_errors_as_data():
     status, data = client.request("GET", "/api/v1/x")
     assert status == 401
     assert data == {"detail": "bad token"}
+
+
+# --- the queue surface refusing the session (#55) ------------------------------
+
+
+class RefusingPic(FakePic):
+    """PIC whose plan-week (or next) answers with something other than 200."""
+
+    def __init__(self, *, plan_status=None, next_status=None, **kw):
+        super().__init__(**kw)
+        self.plan_status = plan_status
+        self.next_status = next_status
+
+    def next_task(self):
+        if self.next_status is not None:
+            raise driver.ProtocolError("next", self.next_status, {"detail": "nope"})
+        return super().next_task()
+
+    def plan_week(self):
+        self.planned += 1
+        if self.plan_status is not None:
+            raise driver.ProtocolError(
+                "plan-week",
+                self.plan_status,
+                {"detail": "No research available for planning"},
+            )
+        return super().plan_week()
+
+
+def test_an_empty_research_backlog_fails_the_session_and_names_the_fix(conn):
+    pic = RefusingPic(plan_status=404)
+
+    summary = run_drive(conn, pic)
+
+    assert summary["outcome"] == "FAILED"
+    assert summary["reason"] == driver.REASON_NO_RESEARCH
+    run = drive_run(conn)
+    assert run.status is RunStatus.FAILED
+    failed = [e for e in load_events(conn, run.id) if e.type is EventType.RUN_FAILED]
+    assert failed[-1].payload["reason"] == driver.REASON_NO_RESEARCH
+    assert "No research available" in failed[-1].payload["detail"]
+    from orchestrator.log import verify_replay
+
+    assert verify_replay(conn, run.id)
+
+    sent = []
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
+    email = sent[0]
+    assert "NO APPROVED RESEARCH" in email.subject
+    assert "APPROVED research" in email.body
+    assert "No research available for planning" in email.body
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 0, "said once"
+
+
+def test_a_refusal_mid_session_keeps_the_work_already_reported(conn):
+    # One task runs and is reported DONE; then the ensure-pass 404s.
+    pic = RefusingPic(next_responses=[task_response(1), None], plan_status=404)
+
+    summary = run_drive(conn, pic)
+
+    assert [(t, s) for t, s, _ in pic.reports] == [(1, "DONE")]
+    assert summary["outcome"] == "FAILED"
+    assert summary["tasks_done"] == 1
+    assert drive_run(conn).status is RunStatus.FAILED
+
+
+def test_any_other_queue_refusal_is_a_protocol_failure_not_a_traceback(conn):
+    pic = RefusingPic(next_status=401)
+
+    summary = run_drive(conn, pic)
+
+    assert summary["outcome"] == "FAILED"
+    assert summary["reason"] == driver.REASON_PROTOCOL
+    sent = []
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
+    assert "next answered 401" in sent[0].subject
+    assert "nope" in sent[0].body
+
+
+def test_transport_trouble_on_the_queue_surface_fails_the_session(conn):
+    class DeadPic(FakePic):
+        def next_task(self):
+            raise TimeoutError("read timed out")
+
+    summary = run_drive(conn, DeadPic())
+
+    assert summary["outcome"] == "FAILED"
+    assert summary["reason"] == driver.REASON_PROTOCOL
+    assert "read timed out" in summary["detail"]
+    assert drive_run(conn).status is RunStatus.FAILED
+
+
+def test_the_client_raises_a_typed_error_on_a_refused_plan_week():
+    import io
+    import urllib.error
+
+    def opener(request, timeout=0):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            404,
+            "nope",
+            None,
+            io.BytesIO(b'{"detail": "No research available for planning"}'),
+        )
+
+    client = PicClient("https://pic.test", "tok", opener=opener)
+    try:
+        client.plan_week()
+    except driver.ProtocolError as exc:
+        assert exc.status == 404
+        assert exc.reason == driver.REASON_NO_RESEARCH
+        assert "No research available" in str(exc)
+    else:
+        raise AssertionError("plan-week 404 must raise ProtocolError")
+
+
+def test_main_exits_nonzero_and_commits_as_it_goes(monkeypatch, migrated_dsn):
+    """A failed drive must (a) exit 1 for cron, and (b) have committed its run
+    before returning: the 2026-09-07 crash rolled the whole run back because
+    the session's connection never committed until a clean exit."""
+    seen = {}
+
+    def fake_drive(conn, client, **kw):
+        seen["autocommit"] = conn.autocommit
+        return {"outcome": "FAILED"}
+
+    monkeypatch.setattr(driver, "drive", fake_drive)
+    monkeypatch.setattr(config, "PIC_DRIVER_TOKEN", "tok")
+    monkeypatch.setattr(config, "DATABASE_URL", migrated_dsn)
+
+    assert driver.main([]) == 1
+    assert seen["autocommit"] is True
