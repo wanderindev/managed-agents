@@ -43,7 +43,9 @@ class FakePic:
         self.next_responses = list(next_responses)
         self.call_responses = list(call_responses)
         self.jobs = list(jobs)
-        self.goal = list(goal)
+        self.goal = goal if isinstance(goal, dict) else list(goal)
+        self.goals_read = []
+        self.waiting_for = []
         self.plan = plan or {"goal_key": "weekly_series:2026-W31", "created": 0}
         self.report_status = report_status
         self.reports = []
@@ -59,8 +61,9 @@ class FakePic:
         self.planned += 1
         return self.plan
 
-    def report(self, task_id, status, *, result=None, error=None):
+    def report(self, task_id, status, *, result=None, error=None, waiting_for=None):
         self.reports.append((task_id, status, error))
+        self.waiting_for.append(waiting_for)
         if self.report_raises is not None:
             raise self.report_raises
         return self.report_status, {}
@@ -69,6 +72,9 @@ class FakePic:
         return self.jobs.pop(0)
 
     def goal_tasks(self, goal_key):
+        self.goals_read.append(goal_key)
+        if isinstance(self.goal, dict):
+            return self.goal.get(goal_key, [])
         return self.goal
 
     def request(self, method, path, *, body=None, query=None, timeout=60):
@@ -80,12 +86,14 @@ class FakePic:
         return response
 
 
-def task_response(task_id=1, kind="GENERATE_TAGS", calls=None):
+def task_response(
+    task_id=1, kind="GENERATE_TAGS", calls=None, goal_key="weekly_series:2026-W31"
+):
     return {
         "task": {
             "id": task_id,
             "kind": kind,
-            "goal_key": "weekly_series:2026-W31",
+            "goal_key": goal_key,
             "subject_type": "ARTICLE",
             "subject_id": 7,
             "attempts": 1,
@@ -94,7 +102,7 @@ def task_response(task_id=1, kind="GENERATE_TAGS", calls=None):
     }
 
 
-def goal_row(task_id, status, kind="WRITE_ARTICLE", error=None):
+def goal_row(task_id, status, kind="WRITE_ARTICLE", error=None, waiting_for=None):
     return {
         "id": task_id,
         "status": status,
@@ -102,7 +110,21 @@ def goal_row(task_id, status, kind="WRITE_ARTICLE", error=None):
         "subject_type": "ARTICLE",
         "subject_id": 7,
         "error": error,
+        "waiting_for": waiting_for,
     }
+
+
+def wait_task(task_id, kind):
+    return task_response(
+        task_id,
+        kind=kind,
+        calls=[
+            call(
+                "GET",
+                f"/api/v1/admin/dashboard/agent-tasks/wait-check/{kind}/7",
+            )
+        ],
+    )
 
 
 def run_drive(conn, pic, **kw):
@@ -338,7 +360,7 @@ def test_an_incomplete_drive_emails_the_parked_tasks(conn):
     sent = []
     assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
     body = sent[0].body
-    assert "weekly drive needs attention" in body
+    assert "daily drive needs attention" in body
     assert "task 1" in body and "WRITE_ARTICLE" in body and "boom" in body
 
 
@@ -351,7 +373,7 @@ def test_a_complete_drive_still_says_so_once(conn):
 
     sent = []
     assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
-    assert "weekly drive: COMPLETE" in sent[0].subject
+    assert "daily drive: COMPLETE" in sent[0].subject
     assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 0
 
 
@@ -503,3 +525,274 @@ def test_main_exits_nonzero_and_commits_as_it_goes(monkeypatch, migrated_dsn):
 
     assert driver.main([]) == 1
     assert seen["autocommit"] is True
+
+
+# --- wait tasks (#62, PIC's #553) ------------------------------------------------
+
+
+def test_an_unmet_wait_reports_waiting_not_failed(conn):
+    pic = FakePic(
+        next_responses=[wait_task(1, "WAIT_GRAMMAR_EN"), None, None],
+        call_responses=[
+            (200, {"satisfied": False, "waiting_for": "Grammarly EN on article 7"})
+        ],
+        goal=[
+            goal_row(
+                1,
+                "WAITING",
+                kind="WAIT_GRAMMAR_EN",
+                waiting_for="Grammarly EN on article 7",
+            ),
+            goal_row(2, "PENDING"),
+        ],
+    )
+
+    summary = run_drive(conn, pic)
+
+    assert pic.reports == [(1, "WAITING", None)]
+    assert pic.waiting_for == ["Grammarly EN on article 7"]
+    assert summary["tasks_failed"] == 0 and summary["tasks_waiting"] == 1
+    assert summary["outcome"] == "INCOMPLETE"
+    assert not summary["needs_attention"], "a dependent behind a wait is expected"
+    run = drive_run(conn)
+    assert run.status is RunStatus.AWAITING_HUMAN
+    artifacts = [e for e in load_events(conn, run.id) if e.type is EventType.ARTIFACT]
+    assert artifacts[0].payload["reported"] == "WAITING"
+    assert artifacts[0].payload["waiting_for"] == "Grammarly EN on article 7"
+
+    sent = []
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
+    assert "waiting on you: Grammarly EN" in sent[0].subject
+    body = sent[0].body
+    assert "Waiting on you" in body
+    assert "  Grammarly EN:" in body
+    assert "task 1  WAIT_GRAMMAR_EN" in body and "Grammarly EN on article 7" in body
+
+
+def test_a_met_wait_reports_done(conn):
+    pic = FakePic(
+        next_responses=[wait_task(1, "WAIT_RESEARCH_READY"), None, None],
+        call_responses=[(200, {"satisfied": True, "waiting_for": None})],
+        goal=[goal_row(1, "DONE")],
+    )
+    summary = run_drive(conn, pic)
+    assert pic.reports == [(1, "DONE", None)]
+    assert pic.waiting_for == [None]
+    assert summary["outcome"] == "COMPLETE"
+
+
+def test_a_malformed_wait_check_fails_the_task(conn):
+    pic = FakePic(
+        next_responses=[wait_task(1, "WAIT_GRAMMAR_ES"), None, None],
+        call_responses=[(200, {"something": "else"})],
+        goal=[goal_row(1, "READY")],
+    )
+    summary = run_drive(conn, pic)
+    assert pic.reports[0][1] == "FAILED"
+    assert "satisfied" in pic.reports[0][2]
+    assert summary["tasks_failed"] == 1
+
+
+def test_waiting_items_group_by_kind_in_the_email(conn):
+    pic = FakePic(
+        next_responses=[
+            wait_task(1, "WAIT_GRAMMAR_ES"),
+            wait_task(2, "WAIT_ARTICLE_DEEP_RESEARCH"),
+            wait_task(3, "WAIT_SOMETHING_NEW"),
+            None,
+            None,
+        ],
+        call_responses=[
+            (200, {"satisfied": False, "waiting_for": "es"}),
+            (200, {"satisfied": False, "waiting_for": "deep"}),
+            (200, {"satisfied": False}),
+        ],
+        goal=[
+            goal_row(1, "WAITING", kind="WAIT_GRAMMAR_ES", waiting_for="es"),
+            goal_row(2, "WAITING", kind="WAIT_ARTICLE_DEEP_RESEARCH", waiting_for="d"),
+            goal_row(3, "WAITING", kind="WAIT_SOMETHING_NEW", waiting_for="x"),
+        ],
+    )
+    run_drive(conn, pic)
+    assert pic.waiting_for[2] == "operator action", "a blank text still reports"
+
+    sent = []
+    notify.pass_once(conn, sent.append, to="j@x", cap=10)
+    body = sent[0].body
+    assert body.index("  Deep research:") < body.index("  Grammarly ES:")
+    assert "  wait something new:" in body, "an unknown wait kind still groups"
+
+
+def test_a_failure_alongside_waits_still_needs_attention(conn):
+    pic = FakePic(
+        next_responses=[wait_task(1, "WAIT_GRAMMAR_EN"), task_response(2), None, None],
+        call_responses=[(200, {"satisfied": False, "waiting_for": "g"}), (500, {})],
+        goal=[
+            goal_row(1, "WAITING", kind="WAIT_GRAMMAR_EN", waiting_for="g"),
+            goal_row(2, "FAILED", error="boom"),
+        ],
+    )
+    summary = run_drive(conn, pic)
+    assert summary["needs_attention"]
+    sent = []
+    notify.pass_once(conn, sent.append, to="j@x", cap=10)
+    assert "daily drive needs attention" in sent[0].subject
+    assert "Grammarly EN" in sent[0].body and "Parked tasks" in sent[0].body
+
+
+def test_waits_count_toward_the_task_cap(conn):
+    pic = FakePic(
+        next_responses=[wait_task(n, "WAIT_GRAMMAR_EN") for n in range(1, 10)],
+        call_responses=[(200, {"satisfied": False, "waiting_for": "g"})] * 9,
+    )
+    summary = run_drive(conn, pic, max_tasks=2)
+    assert len(pic.reports) == 2
+    assert "2-task session cap" in summary["stopped_early"]
+
+
+def test_wait_labels_match_loosely_and_fall_back_to_the_kind():
+    assert driver.wait_label("WAIT_GRAMMAR_EN") == "Grammarly EN"
+    assert driver.wait_label("GRAMMARLY_ES") == "Grammarly ES"
+    assert driver.wait_label("GRAMMAR_CHECK") == "Grammarly"
+    assert driver.wait_label("WAIT_RESEARCH_READY") == "Deep research"
+    assert driver.wait_label("WAIT_ARTICLE_CLAIMS") == "Deep research"
+    assert driver.wait_label("WAIT_FOR_PHOTO") == "wait for photo"
+    assert driver.wait_label(None) == "unknown"
+
+
+def test_the_client_sends_waiting_for_only_with_a_waiting_report():
+    import json
+
+    sent = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def opener(request, timeout=0):
+        sent.append(json.loads(request.data))
+        return Response()
+
+    client = PicClient("https://pic.test", "tok", opener=opener)
+    client.report(1, "WAITING", waiting_for="Grammarly EN")
+    client.report(2, "DONE")
+    assert sent[0]["waiting_for"] == "Grammarly EN"
+    assert "waiting_for" not in sent[1]
+
+
+# --- the summary covers every goal touched (#62) ---------------------------------
+
+
+def test_the_summary_covers_every_goal_the_session_touched(conn):
+    old, new = "daily_series:2026-10-04", "daily_series:2026-10-05"
+    pic = FakePic(
+        next_responses=[
+            task_response(1, goal_key=old),
+            None,
+            task_response(2, goal_key=new),
+            None,
+            None,
+        ],
+        call_responses=[(500, {"detail": "boom"}), (200, {})],
+        plan={"goal_key": new, "created": 30},
+        goal={
+            old: [goal_row(1, "FAILED", error="boom")],
+            new: [goal_row(2, "DONE"), goal_row(3, "PENDING")],
+        },
+    )
+
+    summary = run_drive(conn, pic)
+
+    assert [g["goal_key"] for g in summary["goals"]] == [old, new]
+    assert summary["parked"][0]["goal_key"] == old, "the older goal is not hidden"
+    assert summary["unfinished"] == 1
+    assert old in summary["summary"] and new in summary["summary"]
+    sent = []
+    notify.pass_once(conn, sent.append, to="j@x", cap=10)
+    assert f"- {old}: 1 task(s)" in sent[0].body
+    assert f"- {new}: 2 task(s)" in sent[0].body
+
+
+# --- plan-week at capacity (#62, PIC's #559) -------------------------------------
+
+
+def test_at_capacity_is_a_normal_end_not_an_error(conn):
+    pic = FakePic(plan={"goal_key": None, "at_capacity": True, "created": 0})
+
+    summary = run_drive(conn, pic)
+
+    assert pic.planned == 1
+    assert summary["outcome"] == "AT_CAPACITY"
+    assert summary["goals"] == []
+    run = drive_run(conn)
+    assert run.status is RunStatus.DONE
+    sent = []
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
+    assert "at capacity" in sent[0].subject
+    assert "needs attention" not in sent[0].subject
+
+
+def test_at_capacity_after_working_a_goal_reports_that_goal(conn):
+    pic = FakePic(
+        next_responses=[task_response(1), None],
+        plan={"detail": "At capacity: 2 series in flight"},
+        goal=[goal_row(1, "DONE")],
+    )
+    summary = run_drive(conn, pic)
+    assert summary["outcome"] == "COMPLETE"
+    assert summary["at_capacity"]
+    assert "at capacity" in summary["summary"]
+
+
+def test_capacity_detection():
+    assert driver.at_capacity({"at_capacity": True})
+    assert driver.at_capacity({"status": "AT_CAPACITY"})
+    assert driver.at_capacity({"message": "plan-week at capacity"})
+    assert not driver.at_capacity({"goal_key": "daily_series:2026-10-05"})
+
+
+def test_a_session_with_no_goal_and_no_capacity_still_parks(conn):
+    pic = FakePic(plan={"created": 0})
+    summary = run_drive(conn, pic)
+    assert summary["outcome"] == "INCOMPLETE"
+    assert drive_run(conn).status is RunStatus.AWAITING_HUMAN
+
+
+# --- dry run uses the cadence's goal key (#62) -----------------------------------
+
+
+def test_goal_keys_follow_the_cadence():
+    from datetime import date
+
+    assert driver.goal_key_for(date(2026, 10, 5), "daily") == "daily_series:2026-10-05"
+    assert driver.goal_key_for(date(2026, 10, 5), "weekly") == "weekly_series:2026-W41"
+    # ISO year, not calendar year: 2027-01-01 is in 2026's week 53.
+    assert driver.goal_key_for(date(2027, 1, 1), "weekly") == "weekly_series:2026-W53"
+
+
+def test_dry_run_reads_the_cadence_goal_and_claims_nothing(monkeypatch, capsys):
+    class DryPic(FakePic):
+        def __init__(self, *a, **kw):
+            super().__init__(goal=[goal_row(4, "WAITING", waiting_for="Grammarly EN")])
+
+        def next_task(self):
+            raise AssertionError("dry run must not claim")
+
+    made = []
+    monkeypatch.setattr(
+        driver, "PicClient", lambda *a: made.append(DryPic()) or made[0]
+    )
+    monkeypatch.setattr(config, "PIC_DRIVER_TOKEN", "tok")
+    monkeypatch.setattr(config, "DRIVER_CADENCE", "daily")
+
+    assert driver.main(["--dry-run"]) == 0
+    assert made[0].goals_read[0].startswith("daily_series:")
+    assert "waiting for: Grammarly EN" in capsys.readouterr().out

@@ -1,9 +1,12 @@
-"""The weekly-series driver (#13): a dumb consumer of PIC's agent-task queue.
+"""The series driver (#13): a dumb consumer of PIC's agent-task queue.
 
     python -m orchestrator.driver [--dry-run] [--max-tasks N]
 
-Scheduled for Saturdays (a systemd timer or cron), separate from the loop for
-the same reason poll and dream are: scheduling is the operating system's job.
+Run daily from cron, separate from the loop for the same reason poll and dream
+are: scheduling is the operating system's job. PIC decides the cadence (one
+series per day or per ISO week, its ``WEEKLY_PLAN_DAILY_CADENCE``); the driver
+works whatever goal each claim and plan-week answer names, so one session can
+touch several goals (yesterday's waiting gate re-checked, today's new plan).
 
 The division of labor is the design (PIC's epic #422, our #13): PIC owns the
 pipeline logic, the dependency graph, the leases, the per-task retry budget,
@@ -21,6 +24,14 @@ The two multi-call shapes, a prose contract with PIC's ``build_calls``:
 * A path ending in ``/corrections/apply`` takes ``{"edits": [...]}`` from the
   preceding preview response.
 
+And one report shape (#62, PIC's #553): a **wait task**, any kind whose plan
+calls ``/agent-tasks/wait-check/{kind}/{subject_id}``, answers
+``{satisfied, waiting_for}``. Unsatisfied is not a failure: the driver reports
+``WAITING`` with PIC's ``waiting_for`` text, PIC refunds the attempt and hands
+the row out again on a later drive, and the session email lists what waits on
+the operator. Which kinds are wait kinds is PIC's business; the driver keys off
+the call path, never off a list of kind names.
+
 Each drive session is one run in the event log (kind ``weekly_series_drive``),
 executed in-process rather than in a sandbox: the work is HTTP calls that PIC
 executes server-side, so a container would be ceremony. The run is created and
@@ -28,7 +39,7 @@ leased in one transaction (the loop can never see it QUEUED and try to
 dispatch it), heartbeated while the session works, and finished with a summary
 the notifier emails. If a drive session crashes, its lease expires and the
 loop's reconcile surfaces the corpse through the normal abandon-and-email
-path — a dead Saturday is never silent.
+path — a dead drive is never silent.
 """
 
 import argparse
@@ -40,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -54,6 +65,14 @@ logger = logging.getLogger(__name__)
 RUN_KIND = "weekly_series_drive"
 
 _TASKS = "/api/v1/admin/dashboard/agent-tasks"
+
+#: The one call of every wait kind (PIC's #553). Its presence in a call plan
+#: is how the driver learns a task is a wait task.
+_WAIT_CHECK = f"{_TASKS}/wait-check/"
+
+#: Goal-row statuses: blocked on the operator, and not yet runnable.
+_WAITING = "WAITING"
+_UNFINISHED = ("PENDING", "READY", "LEASED")
 
 #: How much of a response body to keep in reports and events.
 _CLIP = 2000
@@ -169,12 +188,12 @@ class PicClient:
         *,
         result: dict | None = None,
         error: str | None = None,
+        waiting_for: str | None = None,
     ) -> tuple[int, Any]:
-        return self.request(
-            "PATCH",
-            f"{_TASKS}/{task_id}",
-            body={"status": status, "result": result, "error": error},
-        )
+        body: dict[str, Any] = {"status": status, "result": result, "error": error}
+        if waiting_for is not None:
+            body["waiting_for"] = waiting_for
+        return self.request("PATCH", f"{_TASKS}/{task_id}", body=body)
 
     def job(self, job_id: int) -> tuple[int, Any]:
         return self.request("GET", f"{_TASKS}/jobs/{job_id}")
@@ -182,6 +201,64 @@ class PicClient:
     def goal_tasks(self, goal_key: str) -> list[dict]:
         status, data = self.request("GET", _TASKS, query={"goal_key": goal_key})
         return data if status == 200 and isinstance(data, list) else []
+
+
+def is_wait_plan(calls: list[dict]) -> bool:
+    """Whether a call plan is a wait kind's condition check."""
+    return any(_WAIT_CHECK in (c.get("path") or "") for c in calls)
+
+
+def wait_label(kind: str | None) -> str:
+    """A readable group name for a wait kind, for the session email.
+
+    The concrete gates are PIC's #554-#556 (research ready and article deep
+    research, Grammarly EN and ES) and their kind names are PIC's to choose,
+    so this matches loosely and falls back to the kind itself: a wait kind
+    nobody anticipated still groups, just under its own name.
+    """
+    upper = (kind or "").upper()
+    if "GRAMMAR" in upper:
+        for lang in ("EN", "ES"):
+            if upper.endswith(f"_{lang}"):
+                return f"Grammarly {lang}"
+        return "Grammarly"
+    if "RESEARCH" in upper or "CLAIM" in upper:
+        return "Deep research"
+    return upper.replace("_", " ").lower() or "unknown"
+
+
+def group_waiting(waiting: list[dict]) -> dict[str, list[dict]]:
+    """Waiting tasks grouped by :func:`wait_label`, groups in sorted order."""
+    groups: dict[str, list[dict]] = {}
+    for item in waiting:
+        label = item.get("label") or wait_label(item.get("kind"))
+        groups.setdefault(label, []).append(item)
+    return dict(sorted(groups.items()))
+
+
+def at_capacity(planned: dict) -> bool:
+    """Whether plan-week declined to start a series because enough are in
+    flight (PIC's #559: a success answer saying "at capacity", not a 404).
+
+    That is a normal end of a session, not a protocol problem. The exact
+    shape is PIC's to settle, so accept an ``at_capacity`` flag or the word
+    in any of the usual text fields.
+    """
+    if planned.get("at_capacity"):
+        return True
+    text = " ".join(
+        str(planned.get(k) or "") for k in ("status", "detail", "message", "reason")
+    )
+    return "capacity" in text.lower()
+
+
+def goal_key_for(day: date, cadence: str) -> str:
+    """PIC's ``goal_key_for``, mirrored for ``--dry-run`` only (see
+    ``config.DRIVER_CADENCE``)."""
+    if cadence == "weekly":
+        iso = day.isocalendar()
+        return f"weekly_series:{iso.year}-W{iso.week:02d}"
+    return f"daily_series:{day.isoformat()}"
 
 
 def _clip_payload(data: Any) -> Any:
@@ -339,6 +416,103 @@ def _fail(
     return summary
 
 
+def _summarize(
+    client: PicClient,
+    goals: list[str],
+    *,
+    done: int,
+    failed: int,
+    waited: int,
+    stopped_early: str | None,
+    capacity: bool,
+) -> dict[str, Any]:
+    """The session's result: the state of every goal it touched.
+
+    ``COMPLETE`` needs every touched goal finished. ``AT_CAPACITY`` is the
+    other normal end: no goal touched because PIC would not start a new
+    series, and nothing of an in-flight one was due. Anything else is
+    ``INCOMPLETE`` and parks the run for a human, listing what is parked and
+    what is waiting on the operator.
+    """
+    per_goal: list[dict[str, Any]] = []
+    parked: list[dict] = []
+    waiting: list[dict] = []
+    unfinished = 0
+    for goal_key in goals:
+        rows = client.goal_tasks(goal_key)
+        goal_parked = [t for t in rows if t.get("status") == "FAILED"]
+        goal_waiting = [t for t in rows if t.get("status") == _WAITING]
+        goal_unfinished = [t for t in rows if t.get("status") in _UNFINISHED]
+        per_goal.append(
+            {
+                "goal_key": goal_key,
+                "tasks": len(rows),
+                "parked": len(goal_parked),
+                "waiting": len(goal_waiting),
+                "unfinished": len(goal_unfinished),
+            }
+        )
+        unfinished += len(goal_unfinished)
+        parked += [
+            {
+                "task_id": t["id"],
+                "kind": t.get("kind"),
+                "subject": f"{t.get('subject_type')}/{t.get('subject_id')}",
+                "goal_key": goal_key,
+                "error": (t.get("error") or "")[:300],
+            }
+            for t in goal_parked
+        ]
+        waiting += [
+            {
+                "task_id": t["id"],
+                "kind": t.get("kind"),
+                "label": wait_label(t.get("kind")),
+                "subject": f"{t.get('subject_type')}/{t.get('subject_id')}",
+                "goal_key": goal_key,
+                "waiting_for": (t.get("waiting_for") or "")[:500],
+                "next_check_at": t.get("next_check_at"),
+            }
+            for t in goal_waiting
+        ]
+
+    if not goals:
+        outcome = "AT_CAPACITY" if capacity and not stopped_early else "INCOMPLETE"
+    elif parked or unfinished or waiting or stopped_early:
+        outcome = "INCOMPLETE"
+    else:
+        outcome = "COMPLETE"
+    # Waiting rows hold their dependents PENDING, so "unfinished" alongside
+    # "waiting" is expected; unfinished with nothing waiting is a stuck row.
+    needs_attention = bool(parked or stopped_early or (unfinished and not waiting))
+
+    text = (
+        f"daily drive over {', '.join(goals) or '(no goal)'}: {done} task(s) done, "
+        f"{waited} waiting on the operator, {failed} failed; "
+        f"{len(parked)} parked, {len(waiting)} waiting, "
+        f"{unfinished} not yet runnable"
+    )
+    if capacity:
+        text += "; plan-week at capacity, no new series started"
+    if stopped_early:
+        text += f"; {stopped_early}"
+
+    return {
+        "outcome": outcome,
+        "goals": per_goal,
+        "tasks_done": done,
+        "tasks_failed": failed,
+        "tasks_waiting": waited,
+        "parked": parked,
+        "waiting": waiting,
+        "unfinished": unfinished,
+        "needs_attention": needs_attention,
+        "at_capacity": capacity,
+        "stopped_early": stopped_early,
+        "summary": text,
+    }
+
+
 def drive(
     conn: psycopg.Connection,
     client: PicClient,
@@ -380,10 +554,19 @@ def drive(
         with conn.transaction():
             queue.extend_lease(conn, run_id, worker_id, lease_seconds)
 
-    goal_key: str | None = None
-    done = failed = 0
+    # Every goal the session touched, in first-seen order: under daily
+    # cadence one drive re-checks yesterday's waiting gates *and* plans today,
+    # so "the last goal key seen" would hide the older goal's state (#62).
+    goals: list[str] = []
+
+    def touch(goal_key: str | None) -> None:
+        if goal_key and goal_key not in goals:
+            goals.append(goal_key)
+
+    done = failed = waited = 0
     stopped_early: str | None = None
     planned_when_empty = False
+    capacity = False
 
     while True:
         extend_lease()
@@ -407,29 +590,51 @@ def drive(
                 failed=failed,
             )
         if task_response is None:
-            goal_key = planned.get("goal_key") or goal_key
             planned_when_empty = True
+            if at_capacity(planned):
+                # Enough series in flight: nothing new to start, and nothing
+                # left to claim. A normal end, not a failure (#62, PIC's #559).
+                capacity = True
+                logger.info("queue empty; plan-week is at capacity")
+                break
+            touch(planned.get("goal_key"))
             logger.info(
                 "queue empty; plan-week ensured goal %s (created %s)",
-                goal_key,
+                planned.get("goal_key"),
                 planned.get("created"),
             )
             continue
         planned_when_empty = False
 
         task = task_response["task"]
-        goal_key = task.get("goal_key") or goal_key
+        touch(task.get("goal_key"))
+        calls = task_response.get("calls") or []
         ok, result, error = execute_calls(
             client,
-            task_response.get("calls") or [],
+            calls,
             sleep=sleep,
             now=now,
             heartbeat=extend_lease,
         )
         status = "DONE" if ok else "FAILED"
+        waiting_for: str | None = None
+        if ok and is_wait_plan(calls):
+            satisfied = result.get("satisfied") if isinstance(result, dict) else None
+            if satisfied is False:
+                # Blocked on the operator, not broken: PIC refunds the attempt
+                # and re-offers the row on a later drive.
+                status = _WAITING
+                waiting_for = str(result.get("waiting_for") or "operator action")[:500]
+            elif satisfied is not True:
+                ok, status = False, "FAILED"
+                error = "wait-check answered without a satisfied flag"
         try:
             report_status, report_body = client.report(
-                task["id"], status, result=_clip_payload(result), error=error
+                task["id"],
+                status,
+                result=_clip_payload(result),
+                error=error,
+                waiting_for=waiting_for,
             )
         except OSError as exc:
             # An unreportable outcome is a protocol problem like a rejected
@@ -461,9 +666,15 @@ def drive(
                     "attempt": task.get("attempts"),
                     "reported": status,
                     "error": error,
+                    **({"waiting_for": waiting_for} if waiting_for else {}),
                 },
             )
-        if ok:
+        if ok and status == _WAITING:
+            waited += 1
+            logger.info(
+                "task %s %s: WAITING (%s)", task["id"], task.get("kind"), waiting_for
+            )
+        elif ok:
             done += 1
             logger.info("task %s %s: DONE", task["id"], task.get("kind"))
         else:
@@ -475,41 +686,20 @@ def drive(
         if failed >= max_failures:
             stopped_early = f"stopped after {failed} failures this session"
             break
-        if done + failed >= max_tasks:
+        if done + failed + waited >= max_tasks:
             stopped_early = f"stopped at the {max_tasks}-task session cap"
             break
 
-    remaining = client.goal_tasks(goal_key) if goal_key else []
-    parked = [t for t in remaining if t.get("status") == "FAILED"]
-    unfinished = [
-        t for t in remaining if t.get("status") in ("PENDING", "READY", "LEASED")
-    ]
-    complete = (
-        goal_key is not None and not parked and not unfinished and not stopped_early
+    summary = _summarize(
+        client,
+        goals,
+        done=done,
+        failed=failed,
+        waited=waited,
+        stopped_early=stopped_early,
+        capacity=capacity,
     )
-
-    summary: dict[str, Any] = {
-        "outcome": "COMPLETE" if complete else "INCOMPLETE",
-        "goal_key": goal_key,
-        "tasks_done": done,
-        "tasks_failed": failed,
-        "parked": [
-            {
-                "task_id": t["id"],
-                "kind": t.get("kind"),
-                "subject": f"{t.get('subject_type')}/{t.get('subject_id')}",
-                "error": (t.get("error") or "")[:300],
-            }
-            for t in parked
-        ],
-        "unfinished": len(unfinished),
-        "stopped_early": stopped_early,
-        "summary": (
-            f"weekly drive for {goal_key or '(no goal)'}: {done} task(s) done, "
-            f"{failed} failed, {len(parked)} parked, {len(unfinished)} not yet runnable"
-            + (f"; {stopped_early}" if stopped_early else "")
-        ),
-    }
+    complete = summary["outcome"] in ("COMPLETE", "AT_CAPACITY")
 
     with conn.transaction():
         log.append(
@@ -527,17 +717,24 @@ def drive(
             lease_expires_at=None,
         )
         if not complete:
-            # Parked or unfinished work is a human's Saturday now; the gate is
-            # what #9 emails, with the admin queue page as the fixing tool.
+            # Parked, unfinished or waiting work is a human's now; the gate is
+            # what #9 emails, with the admin queue page as the fixing tool for
+            # parked rows and the laptop (extension, Grammarly) for waiting ones.
+            if summary["needs_attention"] or not summary["waiting"]:
+                why = "daily drive needs attention"
+            else:
+                labels = ", ".join(group_waiting(summary["waiting"]))
+                why = f"daily drive waiting on you: {labels}"
             log.append(
                 conn,
                 run_id,
                 EventType.HUMAN_GATE,
                 {
-                    "why": "weekly drive needs attention",
+                    "why": why,
                     "reason": summary["summary"],
                     "parked_tasks": summary["parked"],
-                    "goal_key": goal_key,
+                    "waiting_tasks": summary["waiting"],
+                    "goal_keys": [g["goal_key"] for g in summary["goals"]],
                 },
             )
     logger.info("drive session %s finished: %s", subject, summary["summary"])
@@ -564,16 +761,19 @@ def main(argv: list[str] | None = None) -> int:
     client = PicClient(config.PIC_API_BASE, config.PIC_DRIVER_TOKEN)
 
     if args.dry_run:
-        # Read-only: no claim, no plan. The ISO week key mirrors PIC's planner.
-        today = datetime.now(UTC).date()
-        goal_key = f"weekly_series:{today.year}-W{today.isocalendar().week:02d}"
+        # Read-only: no claim, no plan. The key mirrors PIC's planner, which
+        # anchors on the UTC date and keys by day or ISO week per its cadence.
+        goal_key = goal_key_for(datetime.now(UTC).date(), config.DRIVER_CADENCE)
         tasks = client.goal_tasks(goal_key)
         print(f"{goal_key}: {len(tasks)} task(s)")
         for task in tasks:
-            print(
+            line = (
                 f"  {task['id']:>5} {task.get('status', ''):8} {task.get('kind', ''):28}"
                 f" {task.get('subject_type', '')}/{task.get('subject_id', '')}"
             )
+            if task.get("waiting_for"):
+                line += f"  waiting for: {task['waiting_for']}"
+            print(line)
         return 0
 
     with connect() as conn:

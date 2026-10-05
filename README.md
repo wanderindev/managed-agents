@@ -29,8 +29,10 @@ the PR leaves draft. The change-request loop turns human review comments on the
 orchestrator's own PRs into guarded revision runs. A weekly dreaming job
 audits each repo's memory file against the week's runs and merged pull
 requests, accumulating its findings onto one open pull request until a human
-merges it. On Saturdays a
-driver works PIC's agent-task queue through a weekly article series, with a
+merges it. Every day a
+driver works PIC's agent-task queue through its article series (one a day or
+one a week, as PIC's cadence says), reporting steps that wait on the operator
+(deep research, Grammarly) as WAITING and emailing what they wait for, with a
 rubric verifier grading output against a rubric written at planning time.
 Nothing merges without a person.
 
@@ -42,7 +44,7 @@ orchestrator/
   config.py          environment, read once
   db.py              psycopg3 connection helper
   dream.py           weekly memory-audit ("dreaming") entry point
-  driver.py          Saturday driver for PIC's agent-task queue
+  driver.py          daily driver for PIC's agent-task queue
   enums.py           run statuses and event types
   github.py          GitHub App auth, per-job installation tokens
   jobs.py            job specs, prompts, and the followup chain
@@ -138,6 +140,7 @@ the full set (loop, sandbox, Sentry poll, GitHub App, notifier, PIC driver);
 | `ORCHESTRATOR_GITHUB_APP_ID` (+ key path, installation id) | empty | mints the per-job installation tokens |
 | `ORCHESTRATOR_NOTIFY_TO` / `_FROM` | empty | where outcome emails go |
 | `ORCHESTRATOR_PIC_DRIVER_TOKEN` | empty | scoped token for PIC's agent-task queue |
+| `ORCHESTRATOR_DRIVER_CADENCE` | `daily` | goal-key shape `driver --dry-run` lists (`daily_series:` or `weekly_series:`); mirror PIC's `WEEKLY_PLAN_DAILY_CADENCE`. A real drive takes goal keys from PIC |
 | `ORCHESTRATOR_DREAM_REPOS` | empty | comma list of repos the weekly dream audits; empty = every repo with orchestrator runs in the window. Each needs the App installed and a `/srv/repos` clone (runbook: "Dreaming") |
 | `ORCHESTRATOR_DREAM_MODEL` | `claude-opus-5-5` | model the dreaming job runs on; set `claude-opus-5` to roll back |
 | `ORCHESTRATOR_DREAM_CLAUDE_MD_MAX_CHARS` | `40000` | largest CLAUDE.md a dream may leave; over it the dreamer splits detail into `docs/claude/<topic>.md`, and a run still over it parks for a human (runbook: "Dreaming") |
