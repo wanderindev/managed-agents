@@ -27,8 +27,10 @@ pytest -q --cov          # enforces fail_under = 90 from .coveragerc
 **What merging does** — nothing on the droplet. There is no deploy-on-merge:
 `/srv/orchestrator` is a plain copy of `orchestrator/`, `migrations/`, `docs/`,
 `scripts/` and `requirements.txt` (not a git checkout), run from
-`/srv/orchestrator/.venv`. Cron there runs `orch-loop-keepalive.sh` every 5 min
-(starts `orchestrator.main` if it is not running) and `orch-run.sh
+`/srv/orchestrator/.venv`. Cron there runs `~/bin/orch-loop-keepalive.sh` every 5 min
+(starts `orchestrator.main` if it is not running; the cron copy runs from
+`~/bin`, so a change to `scripts/orch-loop-keepalive.sh` is deployed by copying it
+there) and `orch-run.sh
 orchestrator.poll` / `orchestrator.dream` as one-shots; all log to `~/logs/`.
 
 **Deploy / verify** — read-only checks you may run yourself:
