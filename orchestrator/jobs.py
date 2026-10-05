@@ -680,6 +680,11 @@ def _pr_revision(run: Run) -> JobSpec:
 
 DREAM_KIND = "memory_dream"
 
+#: ``(kind, payload key)`` pairs the loop coalesces before dispatch (#59): of
+#: several queued dreams for one repo only the newest runs, since each audit
+#: re-reads the same history and the older ones would only repeat it.
+COALESCED = ((DREAM_KIND, "repo"),)
+
 _DREAM_PROMPT = """\
 You are an unattended memory auditor — the "dreaming job" — for the
 repository {repo}. Nobody is watching this session and nobody will answer

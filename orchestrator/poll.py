@@ -13,7 +13,7 @@ import argparse
 import logging
 import sys
 
-from orchestrator import config, github
+from orchestrator import auth, config, github
 from orchestrator.db import connect
 from orchestrator.sources import github_prs, sentry
 
@@ -48,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
         cooldown_days=config.SENTRY_COOLDOWN_DAYS,
     )
     with connect() as conn:
+        if auth.skip_enqueue(conn, "Sentry issues or PR change requests"):
+            # Not a failure: the timer has nothing to alert on, and the loop's
+            # own email already says what the human has to do.
+            return 0
         report = sentry.poll(
             conn,
             client,

@@ -1,16 +1,36 @@
-"""Queue reads against ``agent_runs``.
+"""Queue reads against ``agent_runs``, and the supported way to cancel (#59).
 
 The queue is a table, not a data structure. Nothing here caches: every question
 is asked of the database, because the orchestrator has to be able to die and come
 back without noticing.
+
+Cancelling stale queued work is an operator command, not a hand-written row
+(``agent_events`` is append-only, and a status edit would break the replay):
+
+    python -m orchestrator.queue cancel --kind memory_dream --older-than 1d --dry-run
+    python -m orchestrator.queue cancel --kind memory_dream --older-than 1d
+
+A cancel is a ``run_abandoned`` event with ``requeued: false`` and
+``cancelled: true`` (so the status fold lands on ABANDONED with no new
+vocabulary), plus an ``email_sent`` marker saying why no outcome email follows.
+Only QUEUED runs are touched; a run already leased or running is left alone.
 """
 
+import argparse
+import logging
+import re
+import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import psycopg
 
-from orchestrator.enums import TERMINAL_STATUSES, RunStatus
+from orchestrator import log
+from orchestrator.db import connect
+from orchestrator.enums import TERMINAL_STATUSES, EventType, RunStatus
+
+logger = logging.getLogger(__name__)
 
 #: Statuses where a sandbox is supposed to exist.
 ACTIVE_STATUSES = (RunStatus.LEASED.value, RunStatus.RUNNING.value)
@@ -220,3 +240,213 @@ def has_recent_run(
             ),
         )
         return cur.fetchone() is not None
+
+
+# --- cancelling ---------------------------------------------------------------
+
+#: ``run_abandoned`` payload key marking an operator or coalescing cancel, as
+#: distinct from a run the loop gave up on after its attempts.
+CANCELLED_KEY = "cancelled"
+
+_DURATION = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$")
+_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+
+
+def parse_age(text: str) -> timedelta:
+    """``30m``, ``12h``, ``1d``, ``2w`` -> a timedelta. Anything else is an error."""
+    match = _DURATION.match(text)
+    if not match:
+        raise ValueError(f"not a duration (want e.g. 30m, 12h, 1d, 2w): {text!r}")
+    return timedelta(**{_UNITS[match.group(2)]: int(match.group(1))})
+
+
+def _cancel(conn: psycopg.Connection, run_id: int, reason: str) -> None:
+    """Cancel one QUEUED run. Caller owns the transaction and the row lock.
+
+    The ``email_sent`` marker goes in with it: a cancelled run is a deliberate
+    non-outcome, and without the marker the notifier would mail "run ABANDONED
+    after 0 attempts" for every one of them.
+    """
+    log.append(
+        conn,
+        run_id,
+        EventType.RUN_ABANDONED,
+        {"requeued": False, CANCELLED_KEY: True, "reason": reason},
+        worker_id=None,
+        lease_expires_at=None,
+    )
+    log.append(
+        conn, run_id, EventType.EMAIL_SENT, {"suppressed": f"cancelled: {reason}"}
+    )
+
+
+def cancel_queued(
+    conn: psycopg.Connection,
+    *,
+    reason: str,
+    kind: str | None = None,
+    older_than: timedelta | None = None,
+    run_ids: Iterable[int] | None = None,
+    dry_run: bool = False,
+) -> list[dict]:
+    """Cancel the QUEUED runs matching every given filter; return what matched.
+
+    At least one filter is required, so a bare call can never empty the queue.
+    ``older_than`` is measured from ``created_at`` on the database clock. Rows
+    are locked ``SKIP LOCKED``, the same way the loop claims, so a run the loop
+    is leasing at this instant is skipped rather than cancelled under it. A dry
+    run takes the same path and writes nothing.
+    """
+    run_ids = list(run_ids or [])
+    if kind is None and older_than is None and not run_ids:
+        raise ValueError("refusing to cancel without a filter (kind, age or run id)")
+    clauses = ["status = %s"]
+    params: list = [RunStatus.QUEUED.value]
+    if kind is not None:
+        clauses.append("kind = %s")
+        params.append(kind)
+    if older_than is not None:
+        clauses.append("created_at < now() - %s::interval")
+        params.append(f"{int(older_than.total_seconds())} seconds")
+    if run_ids:
+        clauses.append("id = ANY(%s)")
+        params.append(run_ids)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, kind, subject, created_at FROM agent_runs"
+                f" WHERE {' AND '.join(clauses)}"
+                " ORDER BY created_at, id"
+                " FOR UPDATE SKIP LOCKED",
+                params,
+            )
+            rows = cur.fetchall()
+        if not dry_run:
+            for row in rows:
+                _cancel(conn, row["id"], reason)
+    return rows
+
+
+def coalesce(conn: psycopg.Connection, kind: str, key: str) -> list[int]:
+    """Keep only the newest QUEUED run of ``kind`` per ``payload[key]``.
+
+    The rest are cancelled with a reason naming the run that superseded them.
+    Built for dreaming (#59): each audit re-reads the same history, so after a
+    pause eleven queued dreams for one repo are eleven copies of the newest
+    one. Runs whose payload lacks ``key`` are left alone. Returns the ids
+    cancelled.
+    """
+    cancelled: list[int] = []
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_COLUMNS} FROM agent_runs"
+                " WHERE kind = %s AND status = %s"
+                " ORDER BY created_at DESC, id DESC"
+                " FOR UPDATE SKIP LOCKED",
+                (kind, RunStatus.QUEUED.value),
+            )
+            runs = [_to_run(row) for row in cur.fetchall()]
+        newest: dict[str, Run] = {}
+        for run in runs:
+            group = (run.payload or {}).get(key)
+            if group is None:
+                continue
+            keeper = newest.setdefault(group, run)
+            if keeper is run:
+                continue
+            _cancel(
+                conn,
+                run.id,
+                f"superseded by newer queued run {keeper.id} ({keeper.subject})",
+            )
+            cancelled.append(run.id)
+    if cancelled:
+        logger.info(
+            "coalesced %s: cancelled %s superseded queued run(s) %s",
+            kind,
+            len(cancelled),
+            cancelled,
+        )
+    return cancelled
+
+
+def queued_by_kind(conn: psycopg.Connection) -> dict[str, int]:
+    """QUEUED run counts per kind, for the paused-login reminder."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind, count(*) AS n FROM agent_runs WHERE status = %s"
+            " GROUP BY kind ORDER BY kind",
+            (RunStatus.QUEUED.value,),
+        )
+        return {row["kind"]: row["n"] for row in cur.fetchall()}
+
+
+# --- the command --------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m orchestrator.queue",
+        description="Operate on the run queue. Always --dry-run first.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    cancel = sub.add_parser(
+        "cancel",
+        help="cancel QUEUED runs (never leased or running ones)",
+        description=(
+            "Cancel QUEUED runs matching every filter given. At least one filter"
+            " is required. Writes run_abandoned (cancelled) + email_sent events."
+        ),
+    )
+    cancel.add_argument("--kind", help="only this run kind, e.g. memory_dream")
+    cancel.add_argument(
+        "--older-than",
+        type=parse_age,
+        metavar="AGE",
+        help="only runs queued longer ago than this: 30m, 12h, 1d, 2w",
+    )
+    cancel.add_argument(
+        "--run",
+        type=int,
+        action="append",
+        dest="runs",
+        metavar="ID",
+        help="only this run id (repeatable)",
+    )
+    cancel.add_argument(
+        "--reason",
+        default="cancelled by the operator (python -m orchestrator.queue cancel)",
+        help="recorded on each cancelled run",
+    )
+    cancel.add_argument(
+        "--dry-run", action="store_true", help="list what would be cancelled"
+    )
+    args = parser.parse_args(argv)
+    if args.kind is None and args.older_than is None and not args.runs:
+        parser.error("cancel needs at least one of --kind, --older-than, --run")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s %(message)s"
+    )
+
+    with connect() as conn:
+        rows = cancel_queued(
+            conn,
+            reason=args.reason,
+            kind=args.kind,
+            older_than=args.older_than,
+            run_ids=args.runs,
+            dry_run=args.dry_run,
+        )
+    for row in rows:
+        print(
+            f"run {row['id']}  {row['kind']}  {row['subject']}"
+            f"  queued {row['created_at'].isoformat(timespec='seconds')}"
+        )
+    verb = "would cancel" if args.dry_run else "cancelled"
+    print(f"{verb} {len(rows)} queued run(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
