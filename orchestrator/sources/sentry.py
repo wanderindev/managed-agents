@@ -337,7 +337,7 @@ def poll(
     filters: Filters | None = None,
     dry_run: bool = False,
     stats_period: str = "14d",
-    base_branch: Callable[[str], str] | None = None,
+    base_branch: Callable[[str], str | None] | None = None,
 ) -> PollReport:
     """Fetch, filter, and enqueue. Returns what happened.
 
@@ -352,7 +352,12 @@ def poll(
     ``base_branch`` maps a repo to the branch its fix PR targets. It is resolved
     here, at enqueue time as the dream does, and carried in the payload,
     because not every repo is on ``main`` (atelier-new-cli is on ``master``).
-    Without one, every repo is assumed to be on ``main``.
+    When it returns None — the App is unusable, or GitHub did not answer —
+    that repo's issues are deferred to the next poll rather than enqueued
+    against a guessed base: a wrong guess fails the sandbox's fetch and then
+    costs the issue its whole cooldown. Passing no resolver at all means
+    "every repo here is on ``main``", which only a caller polling such repos
+    may claim; ``orchestrator.poll`` always passes one.
     """
     filters = filters or Filters()
     resolve_base = base_branch or (lambda _repo: DEFAULT_BRANCH)
@@ -400,14 +405,15 @@ def poll(
                 )
                 continue
 
+            base = resolve_base(PROJECT_REPOS[issue.project])
+            if base is None:
+                # Not enqueued, so no cooldown starts: the next poll retries.
+                report.drop("base branch unresolved; retried next poll")
+                continue
+
             if not dry_run:
                 with conn.transaction():
-                    create_run(
-                        conn,
-                        RUN_KIND,
-                        issue.subject,
-                        _payload(issue, resolve_base(PROJECT_REPOS[issue.project])),
-                    )
+                    create_run(conn, RUN_KIND, issue.subject, _payload(issue, base))
             report.enqueued.append(issue.subject)
             logger.info(
                 "%s %s (%s events)",

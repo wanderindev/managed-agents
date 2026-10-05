@@ -13,9 +13,10 @@ import argparse
 import functools
 import logging
 import sys
+import urllib.error
 from collections.abc import Callable
 
-from orchestrator import auth, config, dream, github
+from orchestrator import auth, config, github
 from orchestrator.db import connect
 from orchestrator.sources import github_prs, sentry
 
@@ -74,14 +75,16 @@ def _pulls_client() -> github_prs.PullsClient | None:
     """The GitHub App's read client, or None when the App is not usable.
 
     Optional: without the App there are no orchestrator PRs to poll and no
-    repo metadata to read, so skipping is correct, not a degradation — but it
-    is said out loud, never silently."""
+    base branch to read, so the PR poll is skipped and Sentry issues are
+    deferred — said out loud, never silently. A network failure while minting
+    counts as "not usable" too: ``installation_token`` only wraps HTTP errors,
+    and an unwrapped one here would cost the hour's Sentry poll as well."""
     try:
         token = github.from_config().installation_token()
-    except github.GitHubAppError as exc:
+    except (github.GitHubAppError, urllib.error.URLError, OSError) as exc:
         logger.warning(
-            "GitHub App not usable (%s): skipping the PR poll, and assuming"
-            " every Sentry fix targets main",
+            "GitHub App not usable (%s): skipping the PR poll, and deferring"
+            " Sentry issues until their base branch can be resolved",
             exc,
         )
         return None
@@ -90,14 +93,30 @@ def _pulls_client() -> github_prs.PullsClient | None:
 
 def _base_branch_resolver(
     pulls: github_prs.PullsClient | None,
-) -> Callable[[str], str] | None:
+) -> Callable[[str], str | None]:
     """Each repo's default branch as GitHub reports it, read once per poll.
 
     The base a triage fix targets (#68): atelier-new-cli is on ``master``.
+    None when it cannot be read, which defers that repo's issues to the next
+    poll; never a guessed ``main``, which would fail the sandbox's fetch and
+    put the issue on cooldown for a week.
     """
-    if pulls is None:
-        return None
-    return functools.cache(lambda repo: dream.default_branch(pulls, repo=repo))
+    owner = config.GITHUB_REMOTE_BASE.rstrip("/").rsplit("/", 1)[-1]
+
+    @functools.cache
+    def resolve(repo: str) -> str | None:
+        if pulls is None:
+            return None
+        try:
+            branch = pulls.repository(f"{owner}/{repo}").get("default_branch")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            logger.warning(
+                "could not read %s/%s's default branch: %s", owner, repo, exc
+            )
+            return None
+        return branch or None
+
+    return resolve
 
 
 def _poll_prs(conn, pulls: github_prs.PullsClient | None, *, dry_run: bool) -> None:

@@ -55,6 +55,13 @@ DEFAULT_BRANCH = "main"
 
 DOCKER_SOCKET = "/var/run/docker.sock"
 
+#: Label key for containers a sandbox starts on the host daemon (#68), e.g. the
+#: loyalty app's throwaway Postgres. Its value is the sandbox's attempt-scoped
+#: container name, handed in as $AGENT_SIBLING_LABEL; finish() removes exactly
+#: the containers carrying it, so a timed-out or killed agent cannot leak one
+#: whose memory sits outside the sandbox's --memory cap.
+SIBLING_LABEL = "managed-agents.run"
+
 
 @dataclass(frozen=True, slots=True)
 class JobSpec:
@@ -218,6 +225,7 @@ class DockerRunner:
             # a manual `docker rm` gets here, and it is a retryable loss rather
             # than a verdict on the work.
             logger.warning("run %s: container %s has vanished", run.id, handle)
+            self._reap_siblings(handle)
             self._cleanup(run, keep_workspace=True)
             return SandboxResult(outcome=Outcome.GONE)
 
@@ -239,6 +247,7 @@ class DockerRunner:
 
         outcome = Outcome.SUCCEEDED if exit_code == 0 else Outcome.FAILED
         self._run([self.docker_bin, "rm", "-f", handle])
+        self._reap_siblings(handle)
         # The workspace always goes. A job's work reaches the world by being
         # pushed to origin from inside the sandbox; the standalone clone is
         # disposable and holds nothing else, so removal loses nothing.
@@ -254,6 +263,27 @@ class DockerRunner:
 
     def kill(self, handle: str) -> None:
         self._run([self.docker_bin, "kill", handle])
+
+    def _reap_siblings(self, handle: str) -> None:
+        """Remove the containers this sandbox started, and only those.
+
+        Filtered on the exact ``SIBLING_LABEL=<handle>`` pair, so nothing
+        another run (or a human) started can match. Best effort: a failed
+        listing leaves them for the next look rather than failing the finish.
+        """
+        listing = self._run(
+            [
+                self.docker_bin,
+                "ps",
+                "-aq",
+                "--filter",
+                f"label={SIBLING_LABEL}={handle}",
+            ]
+        )
+        ids = listing.stdout.split() if listing.returncode == 0 else []
+        if ids:
+            logger.warning("removing %s container(s) left by %s", len(ids), handle)
+            self._run([self.docker_bin, "rm", "-f", *ids])
 
     # --- docker --------------------------------------------------------------
 
@@ -309,6 +339,7 @@ class DockerRunner:
             argv += ["--env", f"GH_TOKEN={token}"]
         if spec.needs_docker or self.with_docker:
             argv += ["--volume", f"{self.docker_socket}:{self.docker_socket}"]
+            argv += ["--env", f"AGENT_SIBLING_LABEL={SIBLING_LABEL}={name}"]
             # The mount alone is not enough (#26): the socket is root:docker
             # mode 660 and the container's `agent` user is uid 1000 with no
             # supplementary groups, so without the group the mount is present

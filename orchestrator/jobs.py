@@ -70,10 +70,13 @@ Mirror .github/workflows/ci.yml (job "Typecheck, lint, test") from /workspace:
 then the migrations and `npm test`. The tests need a real Postgres 17. Do NOT
 use the repo's `docker compose up -d db`: localhost in this sandbox is not the
 docker host, and its fixed port and named volume collide with other sandboxes.
-Start a throwaway sibling container and reach it by its bridge IP instead:
+Start a throwaway sibling container and reach it by its bridge IP instead,
+always with `--rm` and the `$AGENT_SIBLING_LABEL` label (the orchestrator
+removes anything carrying it when this sandbox ends, however it ends):
 
-    docker run -d --name "pg-$(hostname)" -e POSTGRES_USER=loyalty \\
-      -e POSTGRES_PASSWORD=localdev -e POSTGRES_DB=loyalty postgres:17-alpine
+    docker run -d --rm --label "$AGENT_SIBLING_LABEL" --name "pg-$(hostname)" \\
+      -e POSTGRES_USER=loyalty -e POSTGRES_PASSWORD=localdev \\
+      -e POSTGRES_DB=loyalty postgres:17-alpine
     PGIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "pg-$(hostname)")
     until docker exec "pg-$(hostname)" pg_isready -U loyalty; do sleep 1; done
     export DATABASE_URL="postgresql://loyalty:localdev@$PGIP:5432/loyalty"
@@ -426,6 +429,12 @@ You may run the repository's test suite and linter (the docker socket is
 mounted for the testcontainers suite). Your working-tree experiments are
 discarded with this sandbox.
 
+# Running the repository's checks
+
+The same gate the fixer had to pass, and how to run it from this sandbox:
+
+{gate}
+
 # Hard rules
 
 - Make NO commits. Push NOTHING. Never merge, never close the pull request.
@@ -626,6 +635,10 @@ def _adversarial_review(run: Run) -> JobSpec:
             _REVIEW_ATTACK_ONE_MITIGATION if mitigation else _REVIEW_ATTACK_ONE_FIX
         ),
         attack_two=attack_two.replace("{base}", base).replace("{pr_url}", pr_url),
+        # The gate tells the reviewer how to run the suite from a sandbox and
+        # repeats the repo's deploy/publish bans, which its CLAUDE.md calls
+        # fine unattended (#68).
+        gate=_gate(repo, base),
         stands_means=_REVIEW_STANDS_MITIGATION if mitigation else "",
     )
     return JobSpec(

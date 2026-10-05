@@ -346,9 +346,21 @@ clone of it here, so an agent could only ever report that it cannot help.
 each repo's default branch (once per poll, through the App) and stores it as
 `base_branch` in the triage payload; the sandbox cuts and fetches from it, the
 prompts name it (`--base`, `git diff <base>...HEAD`) and it rides the whole
-chain. A change-request revision takes the PR's own base. Without a usable App
-the poll logs that it is assuming `main`, which for `atelier-new-cli` makes the
-sandbox fetch fail loudly rather than fix against the wrong history.
+chain. A change-request revision takes the PR's own base. When a repo's base
+cannot be read (App unusable, or GitHub did not answer), its issues are **not**
+enqueued: they are tallied as "base branch unresolved; retried next poll" and
+no cooldown starts, because a guessed `main` would fail the sandbox's fetch on
+`atelier-new-cli` and then cost the issue a week. Sentry itself is still polled
+and repos whose base resolved enqueue as usual. Only runs queued before #68,
+whose payload has no base, fall back to `main`.
+
+**Containers a sandbox starts.** The docker socket lets a job start sibling
+containers on the host daemon (the loyalty app's throwaway Postgres). The runner
+hands each sandbox `AGENT_SIBLING_LABEL=managed-agents.run=<container name>`,
+the loyalty gate starts its Postgres with `--rm --label "$AGENT_SIBLING_LABEL"`,
+and `finish()` removes exactly the containers carrying that label, however the
+sandbox ended. A sibling started without the label is not reaped:
+`docker ps --filter label=managed-agents.run` versus `docker ps` shows strays.
 
 **What "verified" means per repo** lives in `_REPO_GATES` in
 `orchestrator/jobs.py`, quoted into every triage, revision and change-request

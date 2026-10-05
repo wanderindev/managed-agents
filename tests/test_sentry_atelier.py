@@ -9,11 +9,15 @@ import pytest
 
 from orchestrator import config, jobs
 from orchestrator import poll as poll_module
+from orchestrator.enums import Outcome
 from orchestrator.log import create_run, load_events
 from orchestrator.queue import get_run
+from orchestrator.sandbox import JobSpec
 from orchestrator.sources import github_prs, sentry
 from orchestrator.sources.sentry import Filters, classify, poll
+from tests.fakes import FakeCommands
 from tests.test_adversary import CHAIN_PAYLOAD, fake_run
+from tests.test_sandbox import make_run, make_runner
 from tests.test_sentry_source import FakeSentry, issue
 from tests.test_triage import PAYLOAD, FakeDetailClient
 
@@ -247,8 +251,53 @@ def test_the_poll_reads_each_default_branch_from_github_once(monkeypatch):
     assert pulls.asked == ["wanderindev/atelier-new-cli"], "one read per poll"
 
 
-def test_without_the_app_there_is_no_resolver():
-    assert poll_module._base_branch_resolver(None) is None
+def test_without_the_app_no_base_resolves():
+    assert poll_module._base_branch_resolver(None)("atelier-new-cli") is None
+
+
+class FlakyRepoPulls:
+    def repository(self, full_repo):
+        raise OSError("connection reset")
+
+
+def test_a_failed_lookup_resolves_to_nothing_not_main(caplog):
+    with caplog.at_level("WARNING", logger="orchestrator.poll"):
+        resolve = poll_module._base_branch_resolver(FlakyRepoPulls())
+        assert resolve("atelier-new-cli") is None
+    assert "default branch" in caplog.text
+
+
+def test_an_unresolved_base_defers_that_repos_issues_without_a_cooldown(conn):
+    """A guessed main would fail the sandbox fetch and cost a week (#68)."""
+    client = FakeSentry(
+        {
+            "atelier-theme": [issue(project={"slug": "atelier-theme"}, shortId="AT-9")],
+            "pic-python-fastapi": [issue()],
+        }
+    )
+
+    def base_branch(repo):
+        return None if repo == "atelier-new-cli" else "main"
+
+    report = poll(
+        conn,
+        client,
+        projects=["atelier-theme", "pic-python-fastapi"],
+        base_branch=base_branch,
+    )
+
+    assert report.enqueued == ["sentry:PIC-PYTHON-FASTAPI-1Q"]
+    assert report.dropped == {"base branch unresolved; retried next poll": 1}
+    assert not sentry.queue.has_recent_run(
+        conn, sentry.RUN_KIND, "sentry:AT-9", sentry.timedelta(days=7)
+    ), "no run, so no cooldown"
+
+    # The next poll, with GitHub answering, picks it up.
+    report = poll(
+        conn, client, projects=["atelier-theme"], base_branch=lambda r: "master"
+    )
+    assert report.enqueued == ["sentry:AT-9"]
+    assert _payload_of(conn, "sentry:AT-9")["base_branch"] == "master"
 
 
 def test_the_poll_wires_the_resolver_and_the_pr_poll(monkeypatch, migrated_dsn):
@@ -272,15 +321,53 @@ def test_the_poll_wires_the_resolver_and_the_pr_poll(monkeypatch, migrated_dsn):
     assert seen == {"base": "master", "pr_client": pulls}
 
 
-def test_an_unusable_app_skips_the_pr_poll_out_loud(monkeypatch, caplog):
-    def broken():
-        raise poll_module.github.GitHubAppError("no key")
+@pytest.mark.parametrize(
+    "error",
+    [
+        poll_module.github.GitHubAppError("no key"),
+        poll_module.urllib.error.URLError("dns"),
+        TimeoutError("timed out"),
+    ],
+)
+def test_an_unusable_app_skips_the_pr_poll_out_loud(monkeypatch, caplog, error):
+    class App:
+        def installation_token(self):
+            raise error
 
-    monkeypatch.setattr(poll_module.github, "from_config", broken)
+    monkeypatch.setattr(poll_module.github, "from_config", lambda: App())
     with caplog.at_level("WARNING", logger="orchestrator.poll"):
         assert poll_module._pulls_client() is None
     assert "skipping the PR poll" in caplog.text
-    assert "main" in caplog.text
+    assert "deferring Sentry issues" in caplog.text
+
+
+def test_a_network_failure_minting_the_token_still_polls_sentry(
+    monkeypatch, migrated_dsn
+):
+    """installation_token only wraps HTTP errors; an unwrapped one must not
+    cost the hour's Sentry poll."""
+    monkeypatch.setattr(poll_module.config, "SENTRY_TOKEN", "tok")
+    monkeypatch.setattr(poll_module.config, "DATABASE_URL", migrated_dsn)
+
+    class App:
+        def installation_token(self):
+            raise poll_module.urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(poll_module.github, "from_config", lambda: App())
+    seen = {}
+
+    def fake_poll(conn, client, *, base_branch=None, **kwargs):
+        seen["base"] = base_branch("atelier-new-cli")
+        return sentry.PollReport()
+
+    def no_pr_poll(*args, **kwargs):
+        raise AssertionError("no App, no PR poll")
+
+    monkeypatch.setattr(poll_module.sentry, "poll", fake_poll)
+    monkeypatch.setattr(poll_module.github_prs, "poll", no_pr_poll)
+
+    assert poll_module.main([]) == 0
+    assert seen == {"base": None}, "polled, with every base deferred"
 
 
 def test_the_pulls_client_carries_the_installation_token(monkeypatch):
@@ -333,6 +420,8 @@ def test_the_loyalty_app_keeps_the_test_rule_and_gets_a_reachable_postgres(
     assert "{{range .NetworkSettings.Networks}}" in prompt, "Go template intact"
     assert "Do NOT\nuse the repo's `docker compose up -d db`" in prompt
     assert "gitleaks is not installed" in prompt
+    # The Postgres cannot outlive the sandbox (the runner reaps by label).
+    assert '--rm --label "$AGENT_SIBLING_LABEL"' in prompt
 
 
 # --- the chain -------------------------------------------------------------------
@@ -362,6 +451,26 @@ def test_a_review_elsewhere_keeps_the_test_attack(detail):
     assert spec.base_branch == "main"
     assert "git diff main...HEAD" in spec.prompt
     assert "Is the new test asserting the bug is fixed" in spec.prompt
+    assert "Mirror the repo's CI" in spec.prompt, "the repo's gate, not a generic"
+
+
+def test_the_loyalty_review_can_reach_postgres_and_cannot_deploy(detail):
+    """Attack line 2 re-runs the test on unpatched code, which needs the
+    sandbox-safe Postgres recipe, not the repo's compose one."""
+    payload = {**CHAIN_PAYLOAD, **LOYALTY_PAYLOAD}
+    prompt = jobs.build_spec(fake_run(jobs.REVIEW_KIND, payload)).prompt
+    assert "# Running the repository's checks" in prompt
+    assert '--rm --label "$AGENT_SIBLING_LABEL"' in prompt
+    assert "{{range .NetworkSettings.Networks}}" in prompt
+    assert "./scripts/deploy.sh" in prompt and "shopify app deploy" in prompt
+
+
+def test_the_theme_review_runs_the_check_and_cannot_publish(detail):
+    payload = {**CHAIN_PAYLOAD, **THEME_PAYLOAD}
+    prompt = jobs.build_spec(fake_run(jobs.REVIEW_KIND, payload)).prompt
+    assert "theme_check_diff.py" in prompt
+    assert "worktree add /work/base master" in prompt
+    assert "`shopify theme push`, `pull`, `dev` or `publish`" in prompt
 
 
 def test_a_revision_keeps_the_base(detail):
@@ -421,3 +530,63 @@ def test_a_pr_revision_targets_the_prs_own_base(conn):
     spec = jobs.build_spec(run)
     assert spec.base_branch == "master"
     assert "Never push to master." in spec.prompt
+
+
+# --- containers a sandbox starts --------------------------------------------------
+
+
+@pytest.fixture()
+def roots(tmp_path):
+    """Same shape as test_sandbox's fixture of the same name."""
+    creds = tmp_path / "credentials.json"
+    creds.write_text("{}")
+    return {
+        "repos_root": tmp_path / "repos",
+        "worktrees_root": tmp_path / "worktrees",
+        "jobs_root": tmp_path / "jobs",
+        "credentials": creds,
+    }
+
+
+def _finish(roots, commands, run_id=4, attempts=2):
+    return make_runner(roots, commands).finish(
+        make_run(run_id, attempts=attempts), f"ma-run-{run_id}-{attempts}"
+    )
+
+
+def test_a_docker_sandbox_is_told_its_sibling_label(roots):
+    commands = FakeCommands()
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="x", needs_docker=True))
+    runner.start(make_run(4, attempts=2))
+    argv = commands.commands("run")[0]
+    assert "AGENT_SIBLING_LABEL=managed-agents.run=ma-run-4-2" in argv
+
+
+def test_finish_reaps_only_this_attempts_siblings(roots):
+    """A timed-out agent never got to `docker rm` its Postgres."""
+    commands = FakeCommands(
+        {
+            ("inspect",): (0, "124\n", ""),
+            ("ps",): (0, "abc123\ndef456\n", ""),
+        }
+    )
+    _finish(roots, commands)
+
+    (listing,) = commands.commands("ps")
+    assert listing[-2:] == ["--filter", "label=managed-agents.run=ma-run-4-2"]
+    assert ["docker", "rm", "-f", "abc123", "def456"] in commands.calls
+
+
+def test_finish_reaps_siblings_of_a_vanished_sandbox(roots):
+    commands = FakeCommands(
+        {("inspect",): (1, "", "No such object"), ("ps",): (0, "abc123\n", "")}
+    )
+    assert _finish(roots, commands).outcome is Outcome.GONE
+    assert ["docker", "rm", "-f", "abc123"] in commands.calls
+
+
+@pytest.mark.parametrize("listing", [(0, "", ""), (1, "abc123\n", "daemon down")])
+def test_no_siblings_or_a_failed_listing_removes_nothing_else(roots, listing):
+    commands = FakeCommands({("inspect",): (0, "0\n", ""), ("ps",): listing})
+    _finish(roots, commands)
+    assert commands.commands("rm") == [["docker", "rm", "-f", "ma-run-4-2"]]
