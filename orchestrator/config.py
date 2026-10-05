@@ -171,6 +171,10 @@ DREAM_REPOS = tuple(
     if name.strip()
 )
 
+#: Model the dreaming job runs on (#60). An env key so that, if the sandbox
+#: CLI or the API refuses it, falling back is an env edit and a loop restart.
+DREAM_MODEL = os.environ.get("ORCHESTRATOR_DREAM_MODEL", "claude-opus-5-5")
+
 #: What the App is supposed to be able to reach. Used only to warn when setup
 #: granted more than intended; nothing enforces it here, GitHub does. The
 #: dream list is declared intent too, so its repos are expected.

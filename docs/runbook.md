@@ -233,11 +233,34 @@ as `base_branch` in the payload: the sandbox cuts the dream branch from
 `origin/<base>` and the draft PR targets it (atelier-new-cli is on `master`).
 If the App is unusable the dream falls back to `main` and logs a warning; for a
 non-`main` repo the sandbox fetch then fails loudly rather than auditing the
-wrong history. The dream runs on Opus 5.5 (`claude-opus-5-5`); the other kinds
-stay on `claude-opus-5`. The image's pinned CLI (2.1.220) predates that id and
-does not list it, but passes `--model` through to the API, so acceptance is the
-API's call; confirm with the host smoke above using `--model claude-opus-5-5`
-inside the sandbox image before the first Monday run.
+wrong history.
+
+The brief's evidence (runs + merged PRs) is bounded to 64 KB, oldest entries
+trimmed first and counted as `runs_omitted` / `prs_omitted`. The bound is the
+argv limit: the entrypoint passes the whole prompt as one `claude -p` argument,
+and Linux refuses a single argument over 128 KiB ("Argument list too long", on
+every retry). Do not raise `MAX_EVIDENCE_BYTES` without changing how the
+entrypoint hands over the prompt.
+
+The dream runs on Opus 5.5 (`claude-opus-5-5`, `ORCHESTRATOR_DREAM_MODEL`); the
+other kinds stay on `claude-opus-5`. The image's pinned CLI (2.1.220) predates
+that id and does not list it, but passes `--model` through to the API. The
+host's own `claude` is a different (newer) CLI, so test the **image** before
+the first Monday run, with the same credential mount the runner uses:
+
+```bash
+ssh wanderindev@159.223.174.185
+docker run --rm --init \
+    --volume /home/wanderindev/.claude/.credentials.json:/home/agent/.claude/.credentials.json \
+    --env AGENT_MODEL=claude-opus-5-5 \
+    --env AGENT_PROMPT='Reply with exactly: SMOKE OK' \
+    managed-agents/sandbox:latest
+```
+
+The stream's `system` init line should name `claude-opus-5-5` and the result
+should be `SMOKE OK`. If the model is refused, set
+`ORCHESTRATOR_DREAM_MODEL=claude-opus-5` and restart the loop, or bump
+`CLAUDE_CODE_VERSION` and rebuild the image.
 
 ### Adding a repo to the dream list
 

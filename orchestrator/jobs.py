@@ -685,11 +685,6 @@ DREAM_KIND = "memory_dream"
 #: re-reads the same history and the older ones would only repeat it.
 COALESCED = ((DREAM_KIND, "repo"),)
 
-#: Opus 5.5 for the weekly audit (#60): one run per repo per week reads a whole
-#: week of evidence against the code, so it gets the strongest model. The other
-#: kinds stay on ``_TRIAGE_MODEL`` until they are moved deliberately.
-_DREAM_MODEL = "claude-opus-5-5"
-
 _DREAM_PROMPT = """\
 You are an unattended memory auditor — the "dreaming job" — for the
 repository {repo}. Nobody is watching this session and nobody will answer
@@ -714,7 +709,7 @@ run above; these merges are that work. Titles and changed files only — read
 the code in /workspace (`git log`, `git show`) for detail.
 
 {merged_prs}
-
+{prs_omitted}
 # What to look for — three classes
 
 1. CONTRADICTED — a memory claim that the evidence above or the code
@@ -839,6 +834,7 @@ def _memory_dream(run: Run) -> JobSpec:
     digest = "\n".join(json.dumps(e) for e in entries) or "(no recent run evidence)"
     omitted = payload.get("runs_omitted")
     merged = payload.get("merged_prs") or []
+    prs_omitted = payload.get("prs_omitted")
     prompt = _DREAM_PROMPT.format(
         repo=repo,
         branch=branch,
@@ -853,6 +849,12 @@ def _memory_dream(run: Run) -> JobSpec:
         ),
         merged_prs=(
             "\n".join(json.dumps(p) for p in merged) or "(no merged pull requests)"
+        ),
+        prs_omitted=(
+            f"\n({prs_omitted} older merged PR(s) in the window are not shown;"
+            " `git log` in /workspace has them.)\n"
+            if prs_omitted
+            else ""
         ),
         open_pr=(
             _DREAM_OPEN_PR.format(
@@ -878,7 +880,11 @@ def _memory_dream(run: Run) -> JobSpec:
         repo=repo,
         branch=branch,
         base_branch=base,
-        model=_DREAM_MODEL,
+        # Opus 5.5 by default (#60): one run per repo per week reads a whole
+        # week of evidence against the code. Read per build from config so a
+        # rollback (ORCHESTRATOR_DREAM_MODEL) is an env edit; the other kinds
+        # stay on _TRIAGE_MODEL until they are moved deliberately.
+        model=config.DREAM_MODEL,
         needs_github=True,
         reuse_branch=bool(open_pr),
         # No docker: the audit reads code and edits one markdown file. A

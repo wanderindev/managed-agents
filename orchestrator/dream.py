@@ -32,6 +32,7 @@ just comments. The human merges one PR whenever they get to it.
 """
 
 import argparse
+import json
 import logging
 import sys
 import urllib.error
@@ -50,11 +51,20 @@ from orchestrator.sources import github_prs
 
 logger = logging.getLogger(__name__)
 
-#: Most recent runs per repo that make it into the digest. Sized for a busy
-#: week now that dreaming is weekly (#60); a cap because the brief must stay a
-#: readable size. Anything past it is not dropped silently: the payload records
-#: how many runs were left out, and the brief says so.
+#: Most recent runs per repo that make it into the digest, before the byte
+#: bound below. Sized for a busy week now that dreaming is weekly (#60).
+#: Anything past it is not dropped silently: the payload records how many runs
+#: were left out, and the brief says so.
 MAX_DIGEST_RUNS = 40
+
+#: Byte bound on the serialized runs + merged-PR evidence. The entrypoint reads
+#: /work/prompt.txt into one shell variable and passes it as `claude -p
+#: "$PROMPT"`, a single argv string, and Linux caps one argument at 128 KiB
+#: (MAX_ARG_STRLEN). Past that exec fails with "Argument list too long" on every
+#: retry and the repo is never audited. A result-bearing run is ~5 KB (dream
+#: run 168: 47.7 KB for 9 entries), so 40 of them would blow it; 64 KB leaves
+#: the rest of the prompt ample room. Oldest entries are trimmed first.
+MAX_EVIDENCE_BYTES = 64 * 1024
 
 #: Most recent merged pull requests per repo in the digest, same reasoning.
 MAX_MERGED_PRS = 40
@@ -199,8 +209,11 @@ def _files_summary(
 
 def merged_pulls(
     client: github_prs.PullsClient, *, repo: str, since: datetime
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     """Pull requests merged into ``repo`` since ``since``, newest first.
+
+    Returns the digested entries (at most ``MAX_MERGED_PRS``) and how many
+    merges the window actually held, so the caller can say what it omitted.
 
     Whoever opened them: the point (#60) is to show the dreamer the work that
     happens outside this orchestrator — interactive sessions, the epic runner —
@@ -237,7 +250,7 @@ def merged_pulls(
             len(found),
             MAX_MERGED_PRS,
         )
-    return [
+    entries = [
         {
             "number": pull.get("number"),
             "title": _clip(pull.get("title") or ""),
@@ -247,6 +260,34 @@ def merged_pulls(
         }
         for pull in found[:MAX_MERGED_PRS]
     ]
+    return entries, len(found)
+
+
+def _line_bytes(entry: dict[str, Any]) -> int:
+    """Bytes one entry adds to the brief: one JSON line, as jobs.py writes it."""
+    return len(json.dumps(entry).encode()) + 1
+
+
+def fit_evidence(
+    runs: list[dict[str, Any]],
+    prs: list[dict[str, Any]],
+    max_bytes: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Trim both lists, oldest first, until their serialized size fits.
+
+    Runs go first: a PR entry is small and covers work no run saw, while a
+    result-bearing run is ~5 KB. Both lists arrive newest first, so trimming
+    drops from the tail. The caller counts what was dropped into the payload,
+    so the brief always says what it left out.
+    """
+    limit = MAX_EVIDENCE_BYTES if max_bytes is None else max_bytes
+    runs, prs = list(runs), list(prs)
+    size = sum(map(_line_bytes, runs)) + sum(map(_line_bytes, prs))
+    while size > limit and runs:
+        size -= _line_bytes(runs.pop())
+    while size > limit and prs:
+        size -= _line_bytes(prs.pop())
+    return runs, prs
 
 
 def recent_repos(conn: psycopg.Connection, days: int) -> list[str]:
@@ -352,13 +393,19 @@ def enqueue(
 
     entries = digest(conn, repo, days)
     since = queue.db_now(conn) - timedelta(days=days)
-    merged = merged_pulls(pulls, repo=repo, since=since) if pulls else []
+    merged, prs_total = (
+        merged_pulls(pulls, repo=repo, since=since) if pulls else ([], 0)
+    )
     if not entries and not merged:
         logger.info(
             "skipping %s: no runs and no merged PRs in the last %s day(s)", repo, days
         )
         return None
 
+    runs_total = (
+        run_count(conn, repo, days) if len(entries) == MAX_DIGEST_RUNS else len(entries)
+    )
+    entries, merged = fit_evidence(entries, merged)
     payload: dict[str, Any] = {
         "repo": repo,
         "days": days,
@@ -366,10 +413,10 @@ def enqueue(
         "digest": entries,
         "merged_prs": merged,
     }
-    if len(entries) == MAX_DIGEST_RUNS:
-        omitted = run_count(conn, repo, days) - len(entries)
-        if omitted > 0:
-            payload["runs_omitted"] = omitted
+    if runs_total > len(entries):
+        payload["runs_omitted"] = runs_total - len(entries)
+    if prs_total > len(merged):
+        payload["prs_omitted"] = prs_total - len(merged)
     open_pr = open_memory_pr(conn, pulls, repo=repo) if pulls else None
     if open_pr:
         # Recorded in the payload, like the digest, so the run stays a durable

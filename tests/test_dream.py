@@ -5,6 +5,7 @@ transcript, one dream per repo per day ever, flags are never auto-applied,
 and neither a finding nor a clean pass is ever silent.
 """
 
+import json
 from contextlib import nullcontext
 from datetime import timedelta
 
@@ -486,7 +487,9 @@ def test_merged_pulls_keeps_only_merges_inside_the_window(conn):
         },
     )
 
-    found = dream.merged_pulls(client, repo="feliu-dev", since=now - timedelta(days=7))
+    found, total = dream.merged_pulls(
+        client, repo="feliu-dev", since=now - timedelta(days=7)
+    )
 
     assert found == [
         {
@@ -502,6 +505,7 @@ def test_merged_pulls_keeps_only_merges_inside_the_window(conn):
             },
         }
     ]
+    assert total == 1
     assert client.pages == [1], "a short page is the last one"
 
 
@@ -512,10 +516,13 @@ def test_merged_pulls_pages_until_the_window_is_passed(conn):
     full_page = [merged(1000 + n, recent) for n in range(100)]
     client = FakePulls(closed=[full_page, [merged(7, old)] * 100, [merged(8, recent)]])
 
-    found = dream.merged_pulls(client, repo="feliu-dev", since=now - timedelta(days=7))
+    found, total = dream.merged_pulls(
+        client, repo="feliu-dev", since=now - timedelta(days=7)
+    )
 
     assert client.pages == [1, 2], "page 2 reached back past the window"
     assert len(found) == dream.MAX_MERGED_PRS
+    assert total == 100
     assert found[0]["changed"] == {
         "count": 0,
         "additions": 0,
@@ -529,7 +536,7 @@ def test_a_big_pr_lists_some_files_and_counts_the_rest(conn):
     files = [{"filename": f"f{n}.py"} for n in range(20)]
     client = FakePulls(closed=[[merged(1, iso(now))]], files={1: files})
 
-    (entry,) = dream.merged_pulls(client, repo="x", since=now - timedelta(days=1))
+    (entry,), _ = dream.merged_pulls(client, repo="x", since=now - timedelta(days=1))
 
     assert entry["changed"]["count"] == 20
     assert len(entry["changed"]["files"]) == 15
@@ -544,14 +551,14 @@ def test_github_failures_never_stop_the_merged_pr_digest(conn):
             raise OSError("reset")
 
     flaky = Flaky(closed=[[merged(1, iso(now))]])
-    (entry,) = dream.merged_pulls(flaky, repo="x", since=now - timedelta(days=1))
+    (entry,), _ = dream.merged_pulls(flaky, repo="x", since=now - timedelta(days=1))
     assert entry["changed"] is None
 
     class Down(FakePulls):
         def closed_pulls(self, full_repo, page=1):
             raise OSError("down")
 
-    assert dream.merged_pulls(Down(), repo="x", since=now) == []
+    assert dream.merged_pulls(Down(), repo="x", since=now) == ([], 0)
 
 
 def test_the_default_branch_comes_from_github(conn):
@@ -579,6 +586,58 @@ def test_a_repo_with_merges_but_no_runs_still_dreams(conn):
     assert run.payload["digest"] == []
     assert run.payload["merged_prs"][0]["title"] == "Interactive work"
     assert run.payload["base_branch"] == "master"
+
+
+def test_fit_evidence_trims_oldest_runs_before_prs():
+    runs = [{"run": n, "pad": "r" * 90} for n in range(5)]  # newest first
+    prs = [{"run": n, "pad": "p" * 90} for n in range(3)]
+    line = len(json.dumps(runs[0]).encode()) + 1
+
+    kept_runs, kept_prs = dream.fit_evidence(runs, prs, max_bytes=5 * line)
+
+    assert [r["run"] for r in kept_runs] == [0, 1], "the oldest runs go first"
+    assert kept_prs == prs
+
+    kept_runs, kept_prs = dream.fit_evidence(runs, prs, max_bytes=2 * line)
+    assert kept_runs == [] and [p["run"] for p in kept_prs] == [0, 1]
+
+
+def test_an_oversized_week_is_trimmed_under_the_argv_bound(conn):
+    """#60 review: ~5 KB per result-bearing run times 40, plus 40 merged PRs,
+    blew past MAX_ARG_STRLEN (128 KiB) for `claude -p "$PROMPT"`."""
+    big = {"summary": "s" * 590, "reason": "r" * 590, "fix": "f" * 590}
+    for n in range(dream.MAX_DIGEST_RUNS):
+        triage_run(
+            conn,
+            f"sentry:DRM-big-{n}",
+            result={**big, "a": "a" * 590, "b": "b" * 590, "c": "c" * 590},
+            stages=tuple(
+                json.dumps({"stage": f"s{k}", "note": "n" * 590}) for k in range(3)
+            ),
+            gate={"why": "w" * 590, "detail": "d" * 590},
+        )
+    now = queue.db_now(conn)
+    files = [{"filename": f"src/{'x' * 80}/{n}.py"} for n in range(15)]
+    client = FakePulls(
+        closed=[[merged(n, iso(now), title="t" * 590) for n in range(50)]],
+        files={n: files for n in range(50)},
+    )
+
+    run = run_by_subject(
+        conn, dream.enqueue(conn, repo="feliu-dev", days=7, pulls=client)
+    )
+
+    evidence = run.payload["digest"] + run.payload["merged_prs"]
+    size = sum(len(json.dumps(e).encode()) + 1 for e in evidence)
+    assert size <= dream.MAX_EVIDENCE_BYTES
+    assert run.payload["runs_omitted"] == dream.MAX_DIGEST_RUNS - len(
+        run.payload["digest"]
+    )
+    assert run.payload["runs_omitted"] > 0
+    assert run.payload["prs_omitted"] == 50 - len(run.payload["merged_prs"])
+    prompt = jobs.build_spec(run).prompt
+    assert len(prompt.encode()) < 128 * 1024, "fits one argv string"
+    assert "older merged PR(s) in the window are not shown" in prompt
 
 
 def test_a_busy_week_says_how_many_runs_it_left_out(conn):

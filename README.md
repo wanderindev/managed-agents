@@ -139,3 +139,4 @@ the full set (loop, sandbox, Sentry poll, GitHub App, notifier, PIC driver);
 | `ORCHESTRATOR_NOTIFY_TO` / `_FROM` | empty | where outcome emails go |
 | `ORCHESTRATOR_PIC_DRIVER_TOKEN` | empty | scoped token for PIC's agent-task queue |
 | `ORCHESTRATOR_DREAM_REPOS` | empty | comma list of repos the weekly dream audits; empty = every repo with orchestrator runs in the window. Each needs the App installed and a `/srv/repos` clone (runbook: "Dreaming") |
+| `ORCHESTRATOR_DREAM_MODEL` | `claude-opus-5-5` | model the dreaming job runs on; set `claude-opus-5` to roll back |
