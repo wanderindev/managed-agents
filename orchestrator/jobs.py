@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from orchestrator import config, db, log
 from orchestrator.enums import EventType
 from orchestrator.queue import Run
-from orchestrator.sandbox import JobSpec
+from orchestrator.sandbox import DEFAULT_BRANCH, JobSpec
 from orchestrator.sources import github_prs, sentry
 
 logger = logging.getLogger(__name__)
@@ -685,21 +685,35 @@ DREAM_KIND = "memory_dream"
 #: re-reads the same history and the older ones would only repeat it.
 COALESCED = ((DREAM_KIND, "repo"),)
 
+#: Opus 5.5 for the weekly audit (#60): one run per repo per week reads a whole
+#: week of evidence against the code, so it gets the strongest model. The other
+#: kinds stay on ``_TRIAGE_MODEL`` until they are moved deliberately.
+_DREAM_MODEL = "claude-opus-5-5"
+
 _DREAM_PROMPT = """\
 You are an unattended memory auditor — the "dreaming job" — for the
 repository {repo}. Nobody is watching this session and nobody will answer
 questions.
 
 The repository is cloned at /workspace, checked out on the branch `{branch}`.
-Its memory file is CLAUDE.md at the repository root: the persistent facts
-every future agent session loads before touching this codebase. Your job is
-to audit that memory against two sources of truth: the repository as it
-exists today in the working tree, and the evidence below from the last
-{days} day(s) of unattended runs.
+Its default branch is `{base}`. Its memory file is CLAUDE.md at the repository
+root: the persistent facts every future agent session loads before touching
+this codebase. Your job is to audit that memory against two sources of truth:
+the repository as it exists today in the working tree, and the evidence below
+from the last {days} day(s) — this orchestrator's unattended runs, and every
+pull request merged into the repository, whoever wrote it.
 {open_pr}
-# Evidence from recent runs
+# Evidence: unattended runs
 
 {digest}
+{runs_omitted}
+# Evidence: pull requests merged in the window
+
+Most work on this repository happens in interactive sessions that leave no
+run above; these merges are that work. Titles and changed files only — read
+the code in /workspace (`git log`, `git show`) for detail.
+
+{merged_prs}
 
 # What to look for — three classes
 
@@ -731,7 +745,7 @@ exists today in the working tree, and the evidence below from the last
 # Hard rules
 
 - Edit ONLY CLAUDE.md. Never touch code, tests, or configuration.
-- Never merge a pull request. Never push to main. Never force-push.
+- Never merge a pull request. Never push to {base}. Never force-push.
 - Stay inside /workspace and /work.
 
 {markers}# Result contract (MANDATORY)
@@ -758,7 +772,7 @@ you commented on it and changed nothing. Use it only in that case.
 """
 
 #: Spliced into the brief when a memory PR from an earlier run is still open.
-#: The whole point of #45: the branch already carries yesterday's edits, so the
+#: The whole point of #45: the branch already carries the earlier edits, so the
 #: run must add to it rather than re-derive them onto a rival branch.
 _DREAM_OPEN_PR = """
 # An earlier audit's pull request is still open
@@ -769,14 +783,14 @@ already present in the CLAUDE.md you are auditing — that is what "already
 fixed" looks like here. Do not re-apply them, and do NOT open a second pull
 request.
 
-First, bring the branch up to date with main:
+First, bring the branch up to date with {base}:
 
-    git merge --no-edit origin/main
+    git merge --no-edit origin/{base}
 
-main may have moved since this branch was cut, and merging is what stops you
+{base} may have moved since this branch was cut, and merging is what stops you
 re-reporting something a human has already fixed there. If the merge
-conflicts, resolve it by taking main's version and re-applying this branch's
-additions on top. Merge only origin/main INTO this branch, never the reverse.
+conflicts, resolve it by taking {base}'s version and re-applying this branch's
+additions on top. Merge only origin/{base} INTO this branch, never the reverse.
 
 Then audit as normal, but report only what is NEW relative to what this branch
 already carries.
@@ -786,8 +800,8 @@ already carries.
 #: already open. Both continue the "Then commit, push ..., and" sentence.
 _DREAM_PR_STEP_NEW = """\
 open a DRAFT pull
-  request against main (write the body to a file, `gh pr create --draft
-  --base main --title "..." --body-file <file>`) whose body lists each edit
+  request against {base} (write the body to a file, `gh pr create --draft
+  --base {base} --title "..." --body-file <file>`) whose body lists each edit
   and its evidence."""
 
 _DREAM_PR_STEP_OPEN = """\
@@ -815,26 +829,42 @@ def _memory_dream(run: Run) -> JobSpec:
     if not repo:
         raise RuntimeError(f"dream run {run.id} has no repo in its payload")
     # An unmerged memory PR means its branch, not a fresh one: the audit has to
-    # see yesterday's edits as already applied or it derives them again (#45).
+    # see the earlier edits as already applied or it derives them again (#45).
     open_pr = payload.get("open_pr") or {}
     branch = open_pr.get("branch") or f"agent/run-{run.id}"
     number = open_pr.get("number")
+    # Payloads enqueued before #60 carry no base and no merged PRs.
+    base = payload.get("base_branch") or DEFAULT_BRANCH
     entries = payload.get("digest") or []
     digest = "\n".join(json.dumps(e) for e in entries) or "(no recent run evidence)"
+    omitted = payload.get("runs_omitted")
+    merged = payload.get("merged_prs") or []
     prompt = _DREAM_PROMPT.format(
         repo=repo,
         branch=branch,
+        base=base,
         days=payload.get("days", 7),
         digest=digest,
+        runs_omitted=(
+            f"\n({omitted} older run(s) in the window are not shown; the newest"
+            " are above.)\n"
+            if omitted
+            else ""
+        ),
+        merged_prs=(
+            "\n".join(json.dumps(p) for p in merged) or "(no merged pull requests)"
+        ),
         open_pr=(
             _DREAM_OPEN_PR.format(
-                number=number, url=open_pr.get("url", "?"), branch=branch
+                number=number, url=open_pr.get("url", "?"), branch=branch, base=base
             )
             if open_pr
             else ""
         ),
         pr_step=(
-            _DREAM_PR_STEP_OPEN.format(number=number) if open_pr else _DREAM_PR_STEP_NEW
+            _DREAM_PR_STEP_OPEN.format(number=number)
+            if open_pr
+            else _DREAM_PR_STEP_NEW.format(base=base)
         ),
         no_edits=(
             _DREAM_NO_EDITS_OPEN.format(number=number)
@@ -847,7 +877,8 @@ def _memory_dream(run: Run) -> JobSpec:
         prompt=prompt,
         repo=repo,
         branch=branch,
-        model=_TRIAGE_MODEL,
+        base_branch=base,
+        model=_DREAM_MODEL,
         needs_github=True,
         reuse_branch=bool(open_pr),
         # No docker: the audit reads code and edits one markdown file. A
@@ -1324,7 +1355,7 @@ def followups(run: Run, result: dict | None) -> Followups:
 
     if run.kind == DREAM_KIND:
         # A run that only re-verified an open PR has nothing new to say, and
-        # parking it would re-park the same findings every night for as long as
+        # parking it would re-park the same findings every week for as long as
         # the PR sits unmerged — the noise that trains a human to ignore the
         # mailbox. The comment it left on the PR is the whole notification.
         if result.get("outcome") == "NO_CHANGE":

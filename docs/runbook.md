@@ -212,6 +212,48 @@ workspace is always deleted when the run finishes — a job's work reaches the
 world by being pushed to origin from inside the sandbox, never by surviving
 on disk.
 
+## Dreaming (#15, weekly since #60)
+
+`orchestrator.dream` is a cron one-shot, **Mondays**, with the default
+`--days 7` lookback. Per repo it enqueues one `memory_dream` run (at most one
+per repo per day, by subject) whose payload is the evidence the auditor sees:
+
+- the orchestrator's own runs on that repo in the window (newest 40; any
+  beyond that are counted as `runs_omitted`, never dropped silently), and
+- every pull request **merged** in the window, whoever wrote it — title,
+  number, author, `merged_at` and a changed-files summary, read through the
+  GitHub App. This is how interactive and epic-runner work reaches the audit.
+  A repo with merges but no runs still dreams; one with neither is skipped.
+
+Which repos: `ORCHESTRATOR_DREAM_REPOS` (comma list) when set; otherwise every
+repo with orchestrator runs in the window. `--repo NAME` overrides both.
+
+The run's base is the repo's **default branch as GitHub reports it**, recorded
+as `base_branch` in the payload: the sandbox cuts the dream branch from
+`origin/<base>` and the draft PR targets it (atelier-new-cli is on `master`).
+If the App is unusable the dream falls back to `main` and logs a warning; for a
+non-`main` repo the sandbox fetch then fails loudly rather than auditing the
+wrong history. The dream runs on Opus 5.5 (`claude-opus-5-5`); the other kinds
+stay on `claude-opus-5`. The image's pinned CLI (2.1.220) predates that id and
+does not list it, but passes `--model` through to the API, so acceptance is the
+API's call; confirm with the host smoke above using `--model claude-opus-5-5`
+inside the sandbox image before the first Monday run.
+
+### Adding a repo to the dream list
+
+1. **GitHub App** → Install App → *Only select repositories* → add the repo
+   (keep the selection explicit, never "All repositories").
+2. **Host clone**: `/srv/repos/<repo>`, owned by `wanderindev`. The name is the
+   GitHub repo name; it is the directory the job's `git clone --local` reads.
+3. **`/srv/orchestrator.env`**: append the name to `ORCHESTRATOR_DREAM_REPOS`.
+4. **Check reach**: `python -m orchestrator.github` lists what the App can see
+   and warns about anything outside feliu-dev, panama-in-context and the dream
+   list. A dream repo it cannot see means a failed clone fetch.
+5. **Dry run**: `python -m orchestrator.dream --repo <repo> --dry-run` logs the
+   run and merged-PR counts and the base branch it resolved, without
+   enqueuing. `base main` for a repo that is not on `main` means the App
+   lookup failed.
+
 ## Sentry work source
 
 ```bash

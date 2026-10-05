@@ -5,7 +5,10 @@ transcript, one dream per repo per day ever, flags are never auto-applied,
 and neither a finding nor a clean pass is ever silent.
 """
 
-from orchestrator import dream, jobs, notify
+from contextlib import nullcontext
+from datetime import timedelta
+
+from orchestrator import dream, jobs, notify, queue
 from orchestrator.enums import EventType, RunStatus
 from orchestrator.log import append, create_run
 from orchestrator.queue import get_run
@@ -130,13 +133,27 @@ BOT = "wanderindev-managed-agents[bot]"
 
 
 class FakePulls:
-    def __init__(self, pulls=()):
+    def __init__(self, pulls=(), *, closed=(), files=None, default_branch="main"):
         self._pulls = list(pulls)
+        self._closed = list(closed)  # pages of closed PRs
+        self._files = files or {}
+        self._default = default_branch
         self.asked = []
+        self.pages = []
 
     def open_pulls(self, full_repo):
         self.asked.append(full_repo)
         return self._pulls
+
+    def repository(self, full_repo):
+        return {"full_name": full_repo, "default_branch": self._default}
+
+    def closed_pulls(self, full_repo, page=1):
+        self.pages.append(page)
+        return self._closed[page - 1] if page <= len(self._closed) else []
+
+    def files(self, full_repo, number):
+        return self._files.get(number, [])
 
 
 def pull(number, *, head, author=BOT):
@@ -328,7 +345,7 @@ def test_clean_completes_quietly(conn):
 
 def test_no_change_does_not_re_park_the_same_findings(conn):
     # The run that only re-verified an open PR must not park: the same flags
-    # would otherwise be emailed every night the PR sits unmerged.
+    # would otherwise be emailed every week the PR sits unmerged.
     decision = jobs.followups(
         dream_run(conn),
         {
@@ -427,3 +444,226 @@ def test_a_parked_pr_revision_emails_too(conn):
     sent = []
     assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
     assert "change requests could not" in sent[0].body
+
+
+# --- weekly, multi-repo, merged PRs as evidence (#60) ----------------------------
+
+
+def merged(number, merged_at, *, title="a change", author="wanderindev"):
+    return {
+        "number": number,
+        "title": title,
+        "user": {"login": author},
+        "merged_at": merged_at,
+        "updated_at": merged_at,
+    }
+
+
+def iso(when):
+    return when.isoformat().replace("+00:00", "Z")
+
+
+def run_by_subject(conn, subject):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM agent_runs WHERE subject = %s", (subject,))
+        return get_run(conn, cur.fetchone()["id"])
+
+
+def test_merged_pulls_keeps_only_merges_inside_the_window(conn):
+    now = queue.db_now(conn)
+    inside = iso(now - timedelta(days=2))
+    outside = iso(now - timedelta(days=9))
+    closed_unmerged = {"number": 3, "merged_at": None, "updated_at": inside}
+    client = FakePulls(
+        closed=[
+            [merged(5, inside, title="Add X"), closed_unmerged, merged(2, outside)]
+        ],
+        files={
+            5: [
+                {"filename": "a.py", "additions": 3, "deletions": 1},
+                {"filename": "b.md", "additions": 2, "deletions": 0},
+            ]
+        },
+    )
+
+    found = dream.merged_pulls(client, repo="feliu-dev", since=now - timedelta(days=7))
+
+    assert found == [
+        {
+            "number": 5,
+            "title": "Add X",
+            "author": "wanderindev",
+            "merged_at": inside,
+            "changed": {
+                "count": 2,
+                "additions": 5,
+                "deletions": 1,
+                "files": ["a.py", "b.md"],
+            },
+        }
+    ]
+    assert client.pages == [1], "a short page is the last one"
+
+
+def test_merged_pulls_pages_until_the_window_is_passed(conn):
+    now = queue.db_now(conn)
+    recent = iso(now - timedelta(days=1))
+    old = iso(now - timedelta(days=30))
+    full_page = [merged(1000 + n, recent) for n in range(100)]
+    client = FakePulls(closed=[full_page, [merged(7, old)] * 100, [merged(8, recent)]])
+
+    found = dream.merged_pulls(client, repo="feliu-dev", since=now - timedelta(days=7))
+
+    assert client.pages == [1, 2], "page 2 reached back past the window"
+    assert len(found) == dream.MAX_MERGED_PRS
+    assert found[0]["changed"] == {
+        "count": 0,
+        "additions": 0,
+        "deletions": 0,
+        "files": [],
+    }
+
+
+def test_a_big_pr_lists_some_files_and_counts_the_rest(conn):
+    now = queue.db_now(conn)
+    files = [{"filename": f"f{n}.py"} for n in range(20)]
+    client = FakePulls(closed=[[merged(1, iso(now))]], files={1: files})
+
+    (entry,) = dream.merged_pulls(client, repo="x", since=now - timedelta(days=1))
+
+    assert entry["changed"]["count"] == 20
+    assert len(entry["changed"]["files"]) == 15
+    assert entry["changed"]["more_files"] == 5
+
+
+def test_github_failures_never_stop_the_merged_pr_digest(conn):
+    now = queue.db_now(conn)
+
+    class Flaky(FakePulls):
+        def files(self, full_repo, number):
+            raise OSError("reset")
+
+    flaky = Flaky(closed=[[merged(1, iso(now))]])
+    (entry,) = dream.merged_pulls(flaky, repo="x", since=now - timedelta(days=1))
+    assert entry["changed"] is None
+
+    class Down(FakePulls):
+        def closed_pulls(self, full_repo, page=1):
+            raise OSError("down")
+
+    assert dream.merged_pulls(Down(), repo="x", since=now) == []
+
+
+def test_the_default_branch_comes_from_github(conn):
+    client = FakePulls(default_branch="master")
+    assert dream.default_branch(client, repo="x") == "master"
+
+    class Down(FakePulls):
+        def repository(self, full_repo):
+            raise OSError("down")
+
+    assert dream.default_branch(Down(), repo="x") == "main"
+
+
+def test_a_repo_with_merges_but_no_runs_still_dreams(conn):
+    client = FakePulls(
+        closed=[[merged(12, iso(queue.db_now(conn)), title="Interactive work")]],
+        default_branch="master",
+    )
+
+    subject = dream.enqueue(conn, repo="atelier-new-cli", days=7, pulls=client)
+
+    assert subject and subject.startswith("dream:atelier-new-cli:")
+    run = run_by_subject(conn, subject)
+    assert run.payload["repo"] == "atelier-new-cli", "coalescing keys on repo (#59)"
+    assert run.payload["digest"] == []
+    assert run.payload["merged_prs"][0]["title"] == "Interactive work"
+    assert run.payload["base_branch"] == "master"
+
+
+def test_a_busy_week_says_how_many_runs_it_left_out(conn):
+    for n in range(dream.MAX_DIGEST_RUNS + 2):
+        triage_run(conn, f"sentry:DRM-busy-{n}")
+
+    run = run_by_subject(conn, dream.enqueue(conn, repo="feliu-dev", days=7))
+
+    assert len(run.payload["digest"]) == dream.MAX_DIGEST_RUNS
+    assert run.payload["runs_omitted"] == 2
+    assert "2 older run(s) in the window are not shown" in jobs.build_spec(run).prompt
+
+
+def test_without_github_the_base_is_main_and_there_are_no_merges(conn):
+    run = dream_run(conn)
+    assert run.payload["base_branch"] == "main"
+    assert run.payload["merged_prs"] == []
+    assert "runs_omitted" not in run.payload
+    spec = jobs.build_spec(run)
+    assert spec.base_branch == "main"
+    assert "(no merged pull requests)" in spec.prompt
+
+
+def test_the_dream_targets_the_repos_default_branch(conn):
+    client = FakePulls(
+        closed=[[merged(12, iso(queue.db_now(conn)), title="Rename the CLI flag")]],
+        default_branch="master",
+    )
+    subject = dream.enqueue(conn, repo="atelier-new-cli", days=7, pulls=client)
+
+    spec = jobs.build_spec(run_by_subject(conn, subject))
+
+    assert spec.base_branch == "master"
+    assert "--base master" in spec.prompt
+    assert "Never push to master" in spec.prompt
+    assert "--base main" not in spec.prompt
+    assert "Rename the CLI flag" in spec.prompt, "merged PRs are in the brief"
+
+
+def test_an_open_pr_on_a_master_repo_merges_origin_master(conn):
+    earlier = create_run(
+        conn, jobs.DREAM_KIND, "dream:atelier-new-cli:d0", {"repo": "atelier-new-cli"}
+    )
+    client = FakePulls(
+        [pull(3, head=f"agent/run-{earlier}")],
+        closed=[[merged(12, iso(queue.db_now(conn)))]],
+        default_branch="master",
+    )
+    subject = dream.enqueue(conn, repo="atelier-new-cli", days=7, pulls=client)
+
+    prompt = jobs.build_spec(run_by_subject(conn, subject)).prompt
+
+    assert "merge --no-edit origin/master" in prompt
+    assert "origin/main" not in prompt
+
+
+def test_a_pre_60_payload_still_builds(conn):
+    run_id = create_run(
+        conn,
+        jobs.DREAM_KIND,
+        "dream:feliu-dev:old",
+        {"repo": "feliu-dev", "days": 1, "digest": []},
+    )
+    spec = jobs.build_spec(get_run(conn, run_id))
+    assert spec.base_branch == "main"
+    assert "--base main" in spec.prompt
+
+
+def test_the_dream_runs_on_opus_5_5(conn):
+    assert jobs.build_spec(dream_run(conn)).model == "claude-opus-5-5"
+
+
+def test_the_dream_list_replaces_recent_repos(conn, monkeypatch, tmp_path):
+    triage_run(conn, "sentry:DRM-list", repo="feliu-dev")
+    monkeypatch.setattr(dream.config, "DREAM_REPOS", ("atelier-theme", "pic-ext"))
+    monkeypatch.setattr(dream.config, "CLAUDE_CREDENTIALS", str(tmp_path / "none"))
+    monkeypatch.setattr(dream, "connect", lambda: nullcontext(conn))
+    monkeypatch.setattr(dream, "_pulls_client", lambda: None)
+    seen = []
+    monkeypatch.setattr(dream, "enqueue", lambda conn, **kw: seen.append(kw["repo"]))
+
+    assert dream.main([]) == 0
+    assert seen == ["atelier-theme", "pic-ext"]
+
+    seen.clear()
+    monkeypatch.setattr(dream.config, "DREAM_REPOS", ())
+    assert dream.main([]) == 0
+    assert seen == ["feliu-dev"], "unset, it falls back to recent_repos"

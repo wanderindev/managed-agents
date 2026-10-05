@@ -212,7 +212,7 @@ def main() -> int:
     unexpected = set(repos) - set(config.GITHUB_EXPECTED_REPOS)
     if unexpected:
         logger.warning(
-            "\nWARNING: reachable beyond the intended two: %s", sorted(unexpected)
+            "\nWARNING: reachable beyond the intended repos: %s", sorted(unexpected)
         )
     return 0
 

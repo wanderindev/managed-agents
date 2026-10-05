@@ -26,9 +26,10 @@ lands one of three verdicts: a fix with a failing-then-passing test and a draft
 PR, `NOT_A_BUG` with evidence, or `NEEDS_HUMAN` with a brief. Every FIX is
 attacked by a fresh-context adversarial reviewer that must return STANDS before
 the PR leaves draft. The change-request loop turns human review comments on the
-orchestrator's own PRs into guarded revision runs. A nightly dreaming job
-audits each repo's memory file against digests of recent runs, accumulating its
-findings onto one open pull request until a human merges it. On Saturdays a
+orchestrator's own PRs into guarded revision runs. A weekly dreaming job
+audits each repo's memory file against the week's runs and merged pull
+requests, accumulating its findings onto one open pull request until a human
+merges it. On Saturdays a
 driver works PIC's agent-task queue through a weekly article series, with a
 rubric verifier grading output against a rubric written at planning time.
 Nothing merges without a person.
@@ -40,7 +41,7 @@ migrations/          numbered plain SQL, applied in filename order
 orchestrator/
   config.py          environment, read once
   db.py              psycopg3 connection helper
-  dream.py           nightly memory-audit ("dreaming") entry point
+  dream.py           weekly memory-audit ("dreaming") entry point
   driver.py          Saturday driver for PIC's agent-task queue
   enums.py           run statuses and event types
   github.py          GitHub App auth, per-job installation tokens
@@ -137,3 +138,4 @@ the full set (loop, sandbox, Sentry poll, GitHub App, notifier, PIC driver);
 | `ORCHESTRATOR_GITHUB_APP_ID` (+ key path, installation id) | empty | mints the per-job installation tokens |
 | `ORCHESTRATOR_NOTIFY_TO` / `_FROM` | empty | where outcome emails go |
 | `ORCHESTRATOR_PIC_DRIVER_TOKEN` | empty | scoped token for PIC's agent-task queue |
+| `ORCHESTRATOR_DREAM_REPOS` | empty | comma list of repos the weekly dream audits; empty = every repo with orchestrator runs in the window. Each needs the App installed and a `/srv/repos` clone (runbook: "Dreaming") |

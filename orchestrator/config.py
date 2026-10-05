@@ -160,11 +160,28 @@ GITHUB_APP_INSTALLATION_ID = int(
     os.environ.get("ORCHESTRATOR_GITHUB_APP_INSTALLATION_ID", "0")
 )
 
+#: Repos the dreaming job audits, comma-separated directory names under
+#: ``REPOS_ROOT`` (#60). When set it replaces "every repo with runs in the
+#: window": the interesting work on most of these happens interactively, which
+#: leaves no orchestrator runs behind. Each needs the GitHub App installed on it
+#: and a clone at /srv/repos/<name>; docs/runbook.md has the checklist.
+DREAM_REPOS = tuple(
+    name.strip()
+    for name in os.environ.get("ORCHESTRATOR_DREAM_REPOS", "").split(",")
+    if name.strip()
+)
+
 #: What the App is supposed to be able to reach. Used only to warn when setup
-#: granted more than intended; nothing enforces it here, GitHub does.
-GITHUB_EXPECTED_REPOS = (
-    "wanderindev/feliu-dev",
-    "wanderindev/panama-in-context",
+#: granted more than intended; nothing enforces it here, GitHub does. The
+#: dream list is declared intent too, so its repos are expected.
+GITHUB_EXPECTED_REPOS = tuple(
+    dict.fromkeys(
+        (
+            "wanderindev/feliu-dev",
+            "wanderindev/panama-in-context",
+            *(f"wanderindev/{name}" for name in DREAM_REPOS),
+        )
+    )
 )
 
 # --- github change-request source (#10) --------------------------------------

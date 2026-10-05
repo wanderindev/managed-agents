@@ -451,3 +451,33 @@ def test_an_unreachable_repo_loses_nothing_else(conn):
 
     assert report.enqueued == ["pr:panama-in-context#612"]
     assert report.dropped == {"repo wanderindev/feliu-dev unreachable": 1}
+
+
+def test_the_pulls_client_asks_github_for_what_the_dreamer_reads():
+    """#60's three reads: the repo (default branch), closed PRs newest-updated
+    first, and one PR's files."""
+    seen = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def opener(request, timeout=None):
+        seen.append(request.full_url)
+        return Response()
+
+    client = github_prs.PullsClient("tok", opener=opener)
+    client.repository(REPO)
+    client.closed_pulls(REPO, page=2)
+    client.files(REPO, 7)
+
+    assert seen[0] == f"https://api.github.com/repos/{REPO}"
+    assert "state=closed&sort=updated&direction=desc" in seen[1]
+    assert seen[1].endswith("&page=2")
+    assert seen[2].endswith(f"/repos/{REPO}/pulls/7/files?per_page=100")
