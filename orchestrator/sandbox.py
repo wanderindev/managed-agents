@@ -56,6 +56,10 @@ DEFAULT_BRANCH = "main"
 
 DOCKER_SOCKET = "/var/run/docker.sock"
 
+#: Where a repo workspace records its base branch, in its own git config, for
+#: the landing measures finish() takes (#67).
+BASE_CONFIG_KEY = "orchestrator.base"
+
 
 @dataclass(frozen=True, slots=True)
 class JobSpec:
@@ -232,6 +236,10 @@ class DockerRunner:
             chars = self._claude_md_chars(run)
             if chars is not None:
                 job_result["claude_md_chars"] = chars
+            # HEAD is only what the run left locally. What landed is another
+            # question (#67): a split committed but never pushed, or pushed
+            # with no PR, leaves the base branch's CLAUDE.md as it was.
+            job_result.update(self._landing(run))
 
         if exit_code == TIMEOUT_EXIT_CODE:
             stderr = (
@@ -439,6 +447,10 @@ class DockerRunner:
                 base,
                 f"origin/{base}",
             )
+            # Remembered in the clone for finish(), which measures what landed
+            # against origin/<base> (#67) and must not rebuild the spec to
+            # learn it — on a retry that reads the event log.
+            self._git("-C", str(path), "config", BASE_CONFIG_KEY, base)
         except Exception:
             # Leave nothing half-built; a retry gets a clean clone.
             shutil.rmtree(path, ignore_errors=True)
@@ -519,6 +531,55 @@ class DockerRunner:
         # Not committed (a fresh, untracked file), or output that would not
         # decode as text: the working tree is the best measure left.
         return len(path.read_text(errors="replace"))
+
+    def _landing(self, run: Run) -> dict[str, int]:
+        """Where the run's commits went, measured from the workspace's refs.
+
+        - ``claude_md_chars_base``: CLAUDE.md at ``origin/<base>``, the
+          memory every session loads until a PR carrying a fix merges.
+        - ``commits_ahead``: commits on HEAD that ``origin/<base>`` lacks.
+        - ``commits_unpushed``: commits on HEAD that no remote-tracking ref
+          has, i.e. that never reached GitHub. A successful ``git push
+          origin`` moves ``origin/<branch>``; a failed one leaves them here.
+
+        Both counts skip merge commits: a dream on an open PR's branch merges
+        ``origin/<base>`` in first, and a NO_CHANGE run then pushes nothing by
+        design — that merge carries no edit of its own. A measure that cannot
+        be taken (no repo, unknown ref, odd output) is left out.
+        """
+        workspace = self.workspace_path(run)
+        if not (workspace / ".git").exists():
+            return {}
+        base = (self._git_output(workspace, "config", BASE_CONFIG_KEY) or "").strip()
+        if not base:
+            return {}  # a scratch workspace, or one cut before #67
+        remote_base = f"origin/{base}"
+        landing: dict[str, int] = {}
+        if (workspace / "CLAUDE.md").is_file():
+            shown = self._git_output(workspace, "show", f"{remote_base}:CLAUDE.md")
+            if shown is not None:
+                landing["claude_md_chars_base"] = len(shown)
+        counts = {
+            "commits_ahead": ("--not", remote_base),
+            "commits_unpushed": ("--not", "--remotes"),
+        }
+        for key, exclude in counts.items():
+            out = self._git_output(
+                workspace, "rev-list", "--count", "--no-merges", "HEAD", *exclude
+            )
+            try:
+                landing[key] = int((out or "").strip())
+            except ValueError:
+                continue
+        return landing
+
+    def _git_output(self, workspace: Path, *args: str) -> str | None:
+        """stdout of a read-only git command in ``workspace``, or None."""
+        try:
+            result = self._run([self.git_bin, "-C", str(workspace), *args])
+        except UnicodeDecodeError:
+            return None
+        return result.stdout if result.returncode == 0 else None
 
     def _cleanup(self, run: Run, *, keep_workspace: bool) -> None:
         self._remove_paths(self.job_path(run))
