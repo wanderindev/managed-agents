@@ -362,6 +362,69 @@ def test_finish_reads_the_structured_result(roots):
     assert result.result == {"outcome": "FIX", "pr": 42}
 
 
+def _finish_with_claude_md(roots, commands, *, result='{"outcome": "CLEAN"}'):
+    repo = roots["repos_root"] / "feliu-dev"
+    repo.mkdir(parents=True, exist_ok=True)
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
+    run = make_run()
+    runner.start(run)
+    runner.workspace_path(run).mkdir(parents=True, exist_ok=True)
+    (runner.workspace_path(run) / "CLAUDE.md").write_text("é" * 50)
+    (runner.job_path(run) / RESULT_FILENAME).write_text(result)
+    return runner.finish(run, "ma-run-1-1")
+
+
+def test_finish_measures_claude_md_as_committed_at_head(roots):
+    """The dream's size guard (#61) rests on the file, not the agent's word:
+    HEAD's CLAUDE.md, in characters, overwriting whatever the agent claimed."""
+    commands = FakeCommands(
+        {
+            ("inspect",): (0, "0\n", ""),
+            ("logs",): (0, "", ""),
+            ("show", "HEAD:CLAUDE.md"): (0, "x" * 41_000, ""),
+        }
+    )
+    result = _finish_with_claude_md(
+        roots, commands, result='{"outcome": "CLEAN", "claude_md_chars": 10}'
+    )
+    assert result.result == {"outcome": "CLEAN", "claude_md_chars": 41_000}
+
+
+def test_an_uncommitted_claude_md_is_measured_from_the_tree(roots):
+    commands = FakeCommands(
+        {
+            ("inspect",): (0, "0\n", ""),
+            ("logs",): (0, "", ""),
+            ("show", "HEAD:CLAUDE.md"): (128, "", "fatal: path not in HEAD"),
+        }
+    )
+    result = _finish_with_claude_md(roots, commands)
+    assert result.result["claude_md_chars"] == 50, "characters, not bytes"
+
+
+def test_undecodable_git_output_falls_back_to_the_tree(roots):
+    commands = FakeCommands({("inspect",): (0, "0\n", ""), ("logs",): (0, "", "")})
+
+    def run_command(argv):
+        if "show" in argv:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return commands(argv)
+
+    result = _finish_with_claude_md(roots, run_command)
+    assert result.result["claude_md_chars"] == 50
+
+
+def test_no_claude_md_or_no_result_means_no_measurement(roots):
+    commands = FakeCommands({("inspect",): (0, "0\n", ""), ("logs",): (0, "", "")})
+    runner = make_runner(roots, commands)
+    run = make_run()
+    runner.start(run)
+    (runner.job_path(run) / RESULT_FILENAME).write_text('{"outcome": "FIX"}')
+
+    assert runner.finish(run, "ma-run-1-1").result == {"outcome": "FIX"}
+    assert not commands.commands("show")
+
+
 def test_finish_tolerates_an_unparseable_result_file(roots):
     commands = FakeCommands({("inspect",): (0, "0\n", ""), ("logs",): (0, "", "")})
     runner = make_runner(roots, commands)

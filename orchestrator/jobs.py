@@ -735,11 +735,23 @@ the code in /workspace (`git log`, `git show`) for detail.
   is the one operation here with no recovery path. Record each flag in the
   result with its specific evidence; a human reviews those.
 
+# Size guard (every run, even with nothing else to change)
+
+CLAUDE.md must end at or under {max_chars} characters (`wc -m CLAUDE.md`),
+counting your own edits; past that Claude Code warns it is too large. Over it:
+move subsystem detail verbatim into `docs/claude/<topic>.md` (create or
+extend), leaving in CLAUDE.md a stub — a `### <Topic> → docs/claude/<topic>.md`
+heading, "read it before changing this area", and the few traps most often
+hit — plus one line indexing `docs/claude/`. Cross-cutting rules (shipping,
+hard rules, conventions for every area) stay in CLAUDE.md. A move is a SAFE
+EDIT, not a deletion: nothing may be lost. Record each as class "SIZE".
+
 {no_edits}
 
 # Hard rules
 
-- Edit ONLY CLAUDE.md. Never touch code, tests, or configuration.
+- Edit ONLY CLAUDE.md, plus `docs/claude/*.md` for the size guard alone.
+  Never touch code, tests, or configuration.
 - Never merge a pull request. Never push to {base}. Never force-push.
 - Stay inside /workspace and /work.
 
@@ -750,7 +762,7 @@ Write /work/result.json before you finish:
 {{
   "outcome": "CLEAN" | "FINDINGS" | "NO_CHANGE",
   "applied": [
-    {{"class": "STALE" | "MISSING", "claim": "the memory line touched",
+    {{"class": "STALE" | "MISSING" | "SIZE", "claim": "the memory line touched",
       "edit": "what changed", "evidence": "why this is correct"}}
   ],
   "flagged": [
@@ -761,7 +773,7 @@ Write /work/result.json before you finish:
   "summary": "one paragraph: the state of this repository's memory"
 }}
 
-CLEAN means both lists are empty and nothing needed changing.
+CLEAN means both lists are empty and nothing needed changing, size included.
 NO_CHANGE means an open pull request already carries everything you found:
 you commented on it and changed nothing. Use it only in that case.
 """
@@ -874,6 +886,7 @@ def _memory_dream(run: Run) -> JobSpec:
             else _DREAM_NO_EDITS_NEW
         ),
         markers=_STAGE_MARKERS.format(branch=branch),
+        max_chars=config.DREAM_CLAUDE_MD_MAX_CHARS,
     )
     return JobSpec(
         prompt=prompt,
@@ -1260,6 +1273,24 @@ def _resumed(run: Run, spec: JobSpec) -> JobSpec:
     )
 
 
+def _claude_md_oversize(result: dict) -> str | None:
+    """Why a dream's CLAUDE.md is still too large, or None when it is not.
+
+    ``claude_md_chars`` is written by the runner after the run, never by the
+    dreamer (``DockerRunner.finish`` overwrites it). Absent means the repo has
+    no CLAUDE.md, or the run predates #61: nothing to guard.
+    """
+    chars = result.get("claude_md_chars")
+    limit = config.DREAM_CLAUDE_MD_MAX_CHARS
+    if not isinstance(chars, int) or chars <= limit:
+        return None
+    # Short: the notifier uses ``why`` as the email subject.
+    return (
+        f"CLAUDE.md still {chars:,} chars, over the {limit:,} limit"
+        " — split it into docs/claude/"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NewRun:
     kind: str
@@ -1360,25 +1391,38 @@ def followups(run: Run, result: dict | None) -> Followups:
         )
 
     if run.kind == DREAM_KIND:
+        # The size guard (#61) is checked in code, not taken on the dreamer's
+        # word: the runner measured CLAUDE.md at the workspace's HEAD after the
+        # run. Still over the limit parks whatever the outcome — CLEAN and
+        # NO_CHANGE included — because a memory file Claude Code warns about
+        # is a problem nobody fixed, and completing quietly would hide it.
+        oversize = _claude_md_oversize(result)
         # A run that only re-verified an open PR has nothing new to say, and
         # parking it would re-park the same findings every week for as long as
         # the PR sits unmerged — the noise that trains a human to ignore the
         # mailbox. The comment it left on the PR is the whole notification.
-        if result.get("outcome") == "NO_CHANGE":
+        if result.get("outcome") == "NO_CHANGE" and not oversize:
             return Followups()
         # Anything worth a human's eyes — a PR of safe edits, or flags that
         # must never be auto-applied — parks the run; #9 emails the report.
         # CLEAN completes quietly and the notifier says so once.
-        if result.get("flagged") or result.get("pr_url"):
-            return Followups(
-                human_gate={
-                    "why": "memory audit found issues to review",
-                    "outcome": result.get("outcome"),
-                    "reason": result.get("summary") or "",
-                    "pr_url": result.get("pr_url"),
-                    "flagged": result.get("flagged") or [],
-                }
-            )
+        if result.get("flagged") or result.get("pr_url") or oversize:
+            whys = [oversize] if oversize else []
+            if result.get("outcome") != "NO_CHANGE" and (
+                result.get("flagged") or result.get("pr_url")
+            ):
+                whys.append("memory audit found issues to review")
+            gate = {
+                "why": "; ".join(whys),
+                "outcome": result.get("outcome"),
+                "reason": result.get("summary") or "",
+                "pr_url": result.get("pr_url"),
+                "flagged": result.get("flagged") or [],
+            }
+            if oversize:
+                gate["claude_md_chars"] = result["claude_md_chars"]
+                gate["claude_md_max_chars"] = config.DREAM_CLAUDE_MD_MAX_CHARS
+            return Followups(human_gate=gate)
         return Followups()
 
     if run.kind == RESEARCH_WRITE_KIND:

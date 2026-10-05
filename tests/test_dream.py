@@ -359,6 +359,100 @@ def test_no_change_does_not_re_park_the_same_findings(conn):
     assert decision.enqueue == () and decision.human_gate is None
 
 
+# --- the CLAUDE.md size guard (#61) ----------------------------------------------
+
+
+def test_the_prompt_carries_the_size_guard(conn, monkeypatch):
+    monkeypatch.setattr(jobs.config, "DREAM_CLAUDE_MD_MAX_CHARS", 12345)
+    prompt = jobs.build_spec(dream_run(conn)).prompt
+    assert "at or under 12345 characters" in prompt
+    assert "even with nothing else to change" in prompt
+    assert "docs/claude/<topic>.md" in prompt
+    assert "plus `docs/claude/*.md` for the size guard alone" in prompt
+    assert '"SIZE"' in prompt
+
+
+def test_the_size_limit_defaults_to_claude_codes_warning_floor():
+    assert jobs.config.DREAM_CLAUDE_MD_MAX_CHARS == 40_000
+
+
+def test_an_oversized_claude_md_parks_even_a_clean_run(conn, monkeypatch):
+    monkeypatch.setattr(jobs.config, "DREAM_CLAUDE_MD_MAX_CHARS", 40_000)
+    decision = jobs.followups(
+        dream_run(conn),
+        {"outcome": "CLEAN", "applied": [], "flagged": [], "claude_md_chars": 52_000},
+    )
+    gate = decision.human_gate
+    assert gate is not None
+    assert gate["why"].startswith("CLAUDE.md still 52,000 chars, over the 40,000")
+    assert "issues to review" not in gate["why"]
+    assert gate["claude_md_chars"] == 52_000
+    assert gate["claude_md_max_chars"] == 40_000
+
+
+def test_an_oversized_claude_md_parks_even_a_no_change_run(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "NO_CHANGE",
+            "pr_url": "https://github.com/x/pull/167",
+            "claude_md_chars": 40_001,
+        },
+    )
+    assert decision.human_gate is not None
+    assert "issues to review" not in decision.human_gate["why"]
+
+
+def test_findings_and_an_oversized_file_say_both(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "FINDINGS",
+            "pr_url": "https://github.com/x/pull/9",
+            "claude_md_chars": 90_000,
+        },
+    )
+    why = decision.human_gate["why"]
+    assert "CLAUDE.md still 90,000 chars" in why
+    assert "memory audit found issues to review" in why
+
+
+def test_a_claude_md_at_the_limit_is_not_flagged(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {"outcome": "CLEAN", "applied": [], "flagged": [], "claude_md_chars": 40_000},
+    )
+    assert decision.human_gate is None
+
+
+def test_a_dream_that_split_claude_md_parks_without_the_size_flag(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "FINDINGS",
+            "pr_url": "https://github.com/x/pull/9",
+            "applied": [{"class": "SIZE", "claim": "Blog section", "edit": "moved"}],
+            "claude_md_chars": 31_000,
+        },
+    )
+    gate = decision.human_gate
+    assert gate["why"] == "memory audit found issues to review"
+    assert "claude_md_chars" not in gate
+
+
+def test_an_oversized_dream_emails_the_size(conn):
+    run = dream_run(conn)
+    notify.pass_once(conn, lambda e: None, to="j@x", cap=10)  # flush the fixture run
+    _finish_dream(
+        conn,
+        run,
+        {"outcome": "CLEAN", "applied": [], "flagged": [], "claude_md_chars": 52_000},
+    )
+    sent = []
+    assert notify.pass_once(conn, sent.append, to="j@x", cap=10) == 1
+    assert "CLAUDE.md still 52,000 chars" in sent[0].subject
+
+
 # --- the emails -----------------------------------------------------------------
 
 
