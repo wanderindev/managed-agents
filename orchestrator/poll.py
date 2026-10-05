@@ -10,10 +10,12 @@ the dedup and the unique index both hold.
 """
 
 import argparse
+import functools
 import logging
 import sys
+from collections.abc import Callable
 
-from orchestrator import auth, config, github
+from orchestrator import auth, config, dream, github
 from orchestrator.db import connect
 from orchestrator.sources import github_prs, sentry
 
@@ -52,30 +54,57 @@ def main(argv: list[str] | None = None) -> int:
             # Not a failure: the timer has nothing to alert on, and the loop's
             # own email already says what the human has to do.
             return 0
+        pulls = _pulls_client()
         report = sentry.poll(
             conn,
             client,
             filters=filters,
             dry_run=args.dry_run,
             stats_period=config.SENTRY_STATS_PERIOD,
+            base_branch=_base_branch_resolver(pulls),
         )
-        _poll_prs(conn, dry_run=args.dry_run)
+        _poll_prs(conn, pulls, dry_run=args.dry_run)
     # Exit code carries nothing about how many were enqueued: a poll that finds
     # nothing is a completely normal outcome and must not look like a failure to
     # whatever timer runs this.
     return 0 if report is not None else 1
 
 
-def _poll_prs(conn, *, dry_run: bool) -> None:
-    """The change-request source (#10). Optional: without the App configured
-    there are no orchestrator PRs to poll, so skipping is correct, not a
-    degradation — but it is said out loud, never silently."""
+def _pulls_client() -> github_prs.PullsClient | None:
+    """The GitHub App's read client, or None when the App is not usable.
+
+    Optional: without the App there are no orchestrator PRs to poll and no
+    repo metadata to read, so skipping is correct, not a degradation — but it
+    is said out loud, never silently."""
     try:
         token = github.from_config().installation_token()
     except github.GitHubAppError as exc:
-        logger.warning("skipping the PR poll (GitHub App not usable: %s)", exc)
+        logger.warning(
+            "GitHub App not usable (%s): skipping the PR poll, and assuming"
+            " every Sentry fix targets main",
+            exc,
+        )
+        return None
+    return github_prs.PullsClient(token)
+
+
+def _base_branch_resolver(
+    pulls: github_prs.PullsClient | None,
+) -> Callable[[str], str] | None:
+    """Each repo's default branch as GitHub reports it, read once per poll.
+
+    The base a triage fix targets (#68): atelier-new-cli is on ``master``.
+    """
+    if pulls is None:
+        return None
+    return functools.cache(lambda repo: dream.default_branch(pulls, repo=repo))
+
+
+def _poll_prs(conn, pulls: github_prs.PullsClient | None, *, dry_run: bool) -> None:
+    """The change-request source (#10)."""
+    if pulls is None:
         return
-    github_prs.poll(conn, github_prs.PullsClient(token), dry_run=dry_run)
+    github_prs.poll(conn, pulls, dry_run=dry_run)
 
 
 if __name__ == "__main__":

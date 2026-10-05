@@ -43,6 +43,7 @@ import psycopg
 from orchestrator import config, queue
 from orchestrator.log import create_run
 from orchestrator.queue import Run, get_run
+from orchestrator.sandbox import DEFAULT_BRANCH
 from orchestrator.sources.sentry import RUN_KIND as TRIAGE_KIND
 from orchestrator.sources.sentry import PollReport
 
@@ -371,6 +372,9 @@ def poll(
                 },
                 "repo": repo,
                 "branch": head_ref,
+                # The PR's own base, not an assumed `main` (#68): the sandbox
+                # fetches it and the chained review diffs against it.
+                "base_branch": (pull.get("base") or {}).get("ref") or DEFAULT_BRANCH,
                 "pr_url": pull.get("html_url") or "",
                 "number": number,
                 "change_requests": [r.as_payload() for r in fresh],

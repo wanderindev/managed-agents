@@ -1,13 +1,15 @@
 """The Sentry work source. Issue #6.
 
-Polls the two projects' Sentry for unresolved issues and enqueues a
+Polls the mapped projects' Sentry for unresolved issues and enqueues a
 ``sentry_triage`` run for each one worth an agent's attention.
 
 The filters here are not guesses. They were written against the 25 unresolved
 issues actually sitting in ``javier-feliu`` on 2026-07-25, and every pattern
 below corresponds to something real in that list. Start narrow and widen once the
 loop has a track record: a filter that is too tight wastes an issue, one that is
-too loose wastes tokens and buries the signal.
+too loose wastes tokens and buries the signal. The atelier entries (#68) were
+written the same way, against the 42 unresolved ``atelier-theme`` issues on
+2026-10-05 (``atelier-loyalty-app`` had none).
 
 Read-only against Sentry. Resolving an issue is a downstream effect of merging a
 PR, never something this does.
@@ -19,6 +21,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -26,6 +29,7 @@ import psycopg
 
 from orchestrator import queue
 from orchestrator.log import create_run
+from orchestrator.sandbox import DEFAULT_BRANCH
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +37,21 @@ RUN_KIND = "sentry_triage"
 
 #: Sentry project -> the repo a fix would land in.
 #:
-#: `atelier-loyalty-app` and `pic-cert-watcher` are deliberately absent. They are
-#: real projects in the same org but they are not repos this orchestrator has, so
-#: an agent could only ever report back that it cannot help.
+#: The project name is not always the repo name: `atelier-theme` is the live
+#: storefront theme's project, and that theme's code lives in atelier-new-cli
+#: (the `atelier-theme` *repo* is its unreleased replacement). Adding a project
+#: takes more than a line here; docs/runbook.md has the checklist.
+#:
+#: `pic-cert-watcher` is deliberately absent: it is a real project in the same
+#: org, but not a repo this orchestrator has, so an agent could only ever report
+#: back that it cannot help.
 PROJECT_REPOS = {
     "trd-python": "feliu-dev",
     "trd-javascript-react": "feliu-dev",
     "pic-python-fastapi": "panama-in-context",
     "pic-javascript-react": "panama-in-context",
+    "atelier-loyalty-app": "atelier-loyalty-app",
+    "atelier-theme": "atelier-new-cli",
 }
 
 #: (pattern, why) matched case-insensitively against title and culprit.
@@ -80,12 +91,74 @@ IGNORE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     ),
     (
         re.compile(
-            r"TypeError: Load failed|NetworkError when attempting to fetch",
+            r"TypeError: Load failed|NetworkError: Load failed"
+            r"|NetworkError when attempting to fetch",
             re.IGNORECASE,
         ),
         "browser-side network failure, usually a visitor losing connectivity",
     ),
+    (
+        re.compile(r"Importing a module script failed", re.IGNORECASE),
+        "Safari's wording for a module that failed to load: stale chunk or network",
+    ),
+    # Storefront third parties (#68). Each names the third party's own code in
+    # the title or culprit, so none of these can hide a frame of ours.
+    (
+        re.compile(r"pushdaddy", re.IGNORECASE),
+        "PushDaddy chat app script on the Shopify files CDN, not our code",
+    ),
+    (
+        re.compile(r"recaptcha/releases/", re.IGNORECASE),
+        "Google reCAPTCHA's own bundle throwing, not our code",
+    ),
+    (
+        re.compile(r"shopifysvc\.com|/web-pixels/", re.IGNORECASE),
+        "Shopify's own telemetry and web-pixel sandbox, not our code",
+    ),
+    (
+        re.compile(r"Object Not Found Matching Id:\d+, MethodName:", re.IGNORECASE),
+        "link-scanner bot (Outlook SafeLinks) driving the page, not a visitor",
+    ),
+    (
+        re.compile(r"/editor_asset/", re.IGNORECASE),
+        "Shopify theme editor preview inside the admin, not the storefront",
+    ),
 )
+
+#: Patterns that hold for one project only, matched like IGNORE_PATTERNS. Noise
+#: in a jQuery storefront can be a real bug in a React app, so a judgement about
+#: one project must not filter every project.
+PROJECT_IGNORE_PATTERNS: dict[str, tuple[tuple[re.Pattern, str], ...]] = {
+    # Mirrors atelier-new-cli's snippets/sentry.liquid `ignoreErrors`, added
+    # there on 2026-09-20 after this same backlog was triaged by hand. The
+    # browser SDK drops these now, but the issues raised before that stay
+    # unresolved and would otherwise each cost a run.
+    "atelier-theme": (
+        (
+            re.compile(
+                r"\$ is not a function|\$ is not defined|jQuery is not defined",
+                re.IGNORECASE,
+            ),
+            "jQuery missing or clobbered by an app embed; the theme ignores it",
+        ),
+        (
+            re.compile(r"Theme failed to boot \(jQuery/theme missing", re.IGNORECASE),
+            "superseded boot check that fired on a failed jQuery load",
+        ),
+        (
+            re.compile(r"Maximum call stack size exceeded", re.IGNORECASE),
+            "recursion from a clobbered jQuery; the theme ignores it",
+        ),
+        (
+            re.compile(r"\[object XMLHttpRequest\]", re.IGNORECASE),
+            "a script rejecting with a raw XHR; the theme ignores it",
+        ),
+        (
+            re.compile(r"require is not defined", re.IGNORECASE),
+            "an app script expecting CommonJS; the theme ignores it",
+        ),
+    ),
+}
 
 #: Titles Sentry emits when it could not group the error into anything.
 UNUSABLE_TITLES = frozenset({"", "<unknown>", "unknown"})
@@ -128,6 +201,9 @@ class Filters:
     #: fix has been deployed and had a chance to stop the errors.
     cooldown_days: int = 7
     ignore_patterns: tuple[tuple[re.Pattern, str], ...] = IGNORE_PATTERNS
+    project_ignore_patterns: dict[str, tuple[tuple[re.Pattern, str], ...]] = field(
+        default_factory=lambda: dict(PROJECT_IGNORE_PATTERNS)
+    )
 
 
 @dataclass
@@ -246,7 +322,8 @@ def classify(issue: SentryIssue, filters: Filters) -> str | None:
         # conclude the same thing. Matters much more at min_events=1.
         return "no title or culprit; nothing for an agent to start from"
     haystack = f"{issue.title}\n{issue.culprit}"
-    for pattern, reason in filters.ignore_patterns:
+    scoped = filters.project_ignore_patterns.get(issue.project, ())
+    for pattern, reason in (*filters.ignore_patterns, *scoped):
         if pattern.search(haystack):
             return reason
     return None
@@ -260,6 +337,7 @@ def poll(
     filters: Filters | None = None,
     dry_run: bool = False,
     stats_period: str = "14d",
+    base_branch: Callable[[str], str] | None = None,
 ) -> PollReport:
     """Fetch, filter, and enqueue. Returns what happened.
 
@@ -270,8 +348,14 @@ def poll(
     ``dry_run`` does everything except enqueue. That is how the filters get tuned:
     the drop tally tells you what a change would have kept or thrown away, without
     committing an agent to any of it.
+
+    ``base_branch`` maps a repo to the branch its fix PR targets. It is resolved
+    here, at enqueue time as the dream does, and carried in the payload,
+    because not every repo is on ``main`` (atelier-new-cli is on ``master``).
+    Without one, every repo is assumed to be on ``main``.
     """
     filters = filters or Filters()
+    resolve_base = base_branch or (lambda _repo: DEFAULT_BRANCH)
     projects = projects if projects is not None else list(PROJECT_REPOS)
     report = PollReport(window=stats_period)
     cooldown = timedelta(days=filters.cooldown_days)
@@ -318,7 +402,12 @@ def poll(
 
             if not dry_run:
                 with conn.transaction():
-                    create_run(conn, RUN_KIND, issue.subject, _payload(issue))
+                    create_run(
+                        conn,
+                        RUN_KIND,
+                        issue.subject,
+                        _payload(issue, resolve_base(PROJECT_REPOS[issue.project])),
+                    )
             report.enqueued.append(issue.subject)
             logger.info(
                 "%s %s (%s events)",
@@ -331,7 +420,7 @@ def poll(
     return report
 
 
-def _payload(issue: SentryIssue) -> dict:
+def _payload(issue: SentryIssue, base_branch: str = DEFAULT_BRANCH) -> dict:
     """Everything #7 needs to start without a second call to Sentry."""
     return {
         "issue_id": issue.id,
@@ -340,6 +429,7 @@ def _payload(issue: SentryIssue) -> dict:
         "culprit": issue.culprit,
         "project": issue.project,
         "repo": PROJECT_REPOS[issue.project],
+        "base_branch": base_branch,
         "events": issue.count,
         "users": issue.user_count,
         "first_seen": issue.first_seen,

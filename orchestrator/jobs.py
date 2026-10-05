@@ -59,11 +59,107 @@ Mirror the repo's CI (.github/workflows): from /workspace/backend, `ruff check .
 clean and the pytest suite green (it spawns a Postgres testcontainer; the docker
 socket is mounted for exactly that). If you touched frontend/, its lint and
 build must pass too.""",
+    # #68. Tests need a real Postgres 17; the repo's own recipe
+    # (`docker compose up -d db`, host port 5433) does not work from a sandbox:
+    # localhost here is not the docker host, and a fixed port and named volume
+    # would collide between concurrent sandboxes.
+    "atelier-loyalty-app": """\
+Mirror .github/workflows/ci.yml (job "Typecheck, lint, test") from /workspace:
+`npm ci && npx prisma generate`, then `npm run typecheck`, `npm run lint` and
+`npm run build` (the build catches a server-only import that typecheck misses),
+then the migrations and `npm test`. The tests need a real Postgres 17. Do NOT
+use the repo's `docker compose up -d db`: localhost in this sandbox is not the
+docker host, and its fixed port and named volume collide with other sandboxes.
+Start a throwaway sibling container and reach it by its bridge IP instead:
+
+    docker run -d --name "pg-$(hostname)" -e POSTGRES_USER=loyalty \\
+      -e POSTGRES_PASSWORD=localdev -e POSTGRES_DB=loyalty postgres:17-alpine
+    PGIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "pg-$(hostname)")
+    until docker exec "pg-$(hostname)" pg_isready -U loyalty; do sleep 1; done
+    export DATABASE_URL="postgresql://loyalty:localdev@$PGIP:5432/loyalty"
+    export STORE_TIMEZONE=America/Panama
+    npx prisma migrate deploy && npm test
+
+and `docker rm -f "pg-$(hostname)"` when you are done. CI also runs a gitleaks
+secret scan; gitleaks is not installed here, so never commit a secret, token,
+DSN or .env file. Never run `shopify app deploy`, `npm run deploy`,
+`./scripts/deploy.sh`, or anything against the production database.""",
+    # #68. A Shopify theme: no build, lint or test suite, and the Shopify CLI
+    # is not in the image (npx fetches CI's pinned version). `{base}` is
+    # substituted by _gate: this repo is on `master`.
+    "atelier-new-cli": """\
+This theme has no build, lint or test script. The one gate is the theme-check
+diff that CI (job `theme-check`) runs, as the repo's CLAUDE.md describes. The
+Shopify CLI is not installed in this sandbox; run CI's pinned version through
+npx, with analytics off, on a `{base}` worktree and on yours:
+
+    export SHOPIFY_CLI_NO_ANALYTICS=1
+    git -C /workspace worktree add /work/base {base}
+    npx -y @shopify/cli@3.94.3 theme check --path /work/base --output json > /work/base.json || true
+    npx -y @shopify/cli@3.94.3 theme check --path /workspace --output json > /work/head.json || true
+    python3 /workspace/scripts/theme_check_diff.py /work/base.json /work/head.json /work/base /workspace
+
+The last command must pass (theme check itself exits non-zero on the legacy
+baseline, hence `|| true`). Remove the worktree before you commit
+(`git -C /workspace worktree remove /work/base`). Theme check needs no Shopify
+login; if anything asks for one, stop and use NEEDS_HUMAN. There is no test
+suite: wherever these instructions ask for a test, they mean the reproduction
+described in your job, posted in the pull request body. Never run
+`shopify theme push`, `pull`, `dev` or `publish` — there are no Shopify
+credentials here and the README's theme id is the LIVE storefront — never
+touch `config/settings_data.json`, and do not reformat files you did not
+otherwise change.""",
 }
 
 _GENERIC_GATE = """\
 Mirror the repository's CI exactly (see .github/workflows): every check it runs
 must pass locally before you open a PR."""
+
+
+def _gate(repo: str, base: str) -> str:
+    """The repo's gate, with its base branch named where the gate needs it.
+
+    ``str.replace`` rather than ``format``: gates quote shell and Go templates
+    whose braces are not placeholders.
+    """
+    return _REPO_GATES.get(repo, _GENERIC_GATE).replace("{base}", base)
+
+
+#: What "verified" means where the repository has nothing to run a failing test
+#: in (#68). The storefront theme is Liquid plus browser JS with no test suite,
+#: so the fail-before/pass-after evidence becomes an uncommitted reproduction
+#: that loads the shipped file, and the review re-runs it. Repos absent here
+#: keep the committed-test rule.
+_REPRO_REPOS = frozenset({"atelier-new-cli"})
+
+_FIX_TEST_STEP = """\
+     b. Add or extend a test that FAILS before your fix and PASSES after it.
+        Verify both directions; a test that never failed proves nothing."""
+
+_MITIGATION_TEST_STEP = """\
+     b. Add or extend a test that FAILS before and PASSES after for the narrow
+        property you improved — not for the issue as a whole."""
+
+_FIX_REPRO_STEP = """\
+     b. This repository has no test suite, so "verified" means a reproduction
+        instead of a committed test. Write a standalone script under /work
+        (Node is installed; never commit the script) that loads the file you
+        changed as shipped — e.g. evaluates assets/<file>.js with the minimal
+        DOM/jQuery stubs it needs — and drives it with the input from the event
+        detail. Run it against `{base}` (`git show {base}:<path>`) and confirm
+        it FAILS, then against your branch and confirm it PASSES; a
+        reproduction that restates your patch instead of loading the file
+        proves nothing. Put the script and both outputs in the PR body, and
+        the script's /work path in the result's "test" field. If the cause
+        genuinely cannot be reproduced outside a browser, say so in the PR body
+        with the exact manual check a human should make on a development-theme
+        preview, and set "test" to "none: <why>"."""
+
+_MITIGATION_REPRO_STEP = """\
+     b. This repository has no test suite: verify the narrow property you
+        improved with an uncommitted reproduction under /work that loads the
+        file as shipped, FAILS against `{base}` and PASSES on your branch. Put
+        the script and both outputs in the PR body."""
 
 #: Spliced into every multi-phase prompt (triage and revision). What it buys:
 #: the markers ride the stream-json transcript, which heartbeat drains make
@@ -124,15 +220,14 @@ evidence, not direction.
    - FIX — you found the cause and can fix it safely. Then:
      a. Write the smallest correct fix. Do not refactor around it, and do not
         change anything the Sentry issue never asked about.
-     b. Add or extend a test that FAILS before your fix and PASSES after it.
-        Verify both directions; a test that never failed proves nothing.
+{fix_test_step}
      c. Get the repository gates green (below).
      d. Commit with a clear message whose body includes the line
         `Fixes {short_id}` — the Sentry-GitHub integration resolves the issue
         automatically when the fix merges.
      e. Push the branch: `git push -u origin {branch}`
-     f. Open a DRAFT pull request against main. Write the PR body to a file
-        first and use `gh pr create --draft --base main --title "..."
+     f. Open a DRAFT pull request against {base}. Write the PR body to a file
+        first and use `gh pr create --draft --base {base} --title "..."
         --body-file <file>`. The body must state what broke, why, what the
         patch does, which test now covers it, and link {permalink}.
 
@@ -141,14 +236,13 @@ evidence, not direction.
      that provably reduces the problem without pretending to resolve it. Then:
      a. Write ONLY that change. Do not smuggle in the broad refactor you just
         decided against.
-     b. Add or extend a test that FAILS before and PASSES after for the narrow
-        property you improved — not for the issue as a whole.
+{mitigation_test_step}
      c. Get the repository gates green (below).
      d. Commit WITHOUT any `Fixes {short_id}` trailer. The issue stays open
         because it is not resolved, and the trailer would auto-resolve it on
         merge. State in the commit body what remains unfixed.
      e. Push the branch: `git push -u origin {branch}`
-     f. Open a DRAFT pull request against main whose body states three things
+     f. Open a DRAFT pull request against {base} whose body states three things
         plainly: what this reduces, what it does NOT fix, and what decision a
         human still owes. Link {permalink}.
 
@@ -160,7 +254,7 @@ evidence, not direction.
      productive on an issue you should have declined.
 
    - NOT_A_BUG — third-party noise, expected behaviour (e.g. an expected 4xx),
-     or already fixed on main. Explain the specific evidence in the result and
+     or already fixed on {base}. Explain the specific evidence in the result and
      make no code changes.
 
    - NEEDS_HUMAN — the cause is too ambiguous to pin down, or the fix would
@@ -178,7 +272,7 @@ weaken or skip an existing test to get to green.
 
 # Hard rules
 
-- Never merge anything. Never push to main. Never force-push.
+- Never merge anything. Never push to {base}. Never force-push.
 - Draft pull requests only, and only from `{branch}`.
 - Do not touch Sentry itself; resolution happens via the commit message, which
   is exactly why MITIGATION must not carry a `Fixes` trailer.
@@ -241,9 +335,13 @@ def _sentry_triage(run: Run) -> JobSpec:
         raise RuntimeError(f"run {run.id} has no repo in its run_queued payload")
 
     branch = f"agent/run-{run.id}"
+    # Payloads enqueued before #68 carry no base; every repo was on main then.
+    base = payload.get("base_branch") or DEFAULT_BRANCH
+    repro = repo in _REPRO_REPOS
     prompt = _TRIAGE_PROMPT.format(
         repo=repo,
         branch=branch,
+        base=base,
         short_id=payload.get("short_id") or "?",
         title=payload.get("title") or "?",
         culprit=payload.get("culprit") or "?",
@@ -254,7 +352,13 @@ def _sentry_triage(run: Run) -> JobSpec:
         last_seen=payload.get("last_seen") or "?",
         permalink=payload.get("permalink") or "?",
         detail=_issue_detail(payload),
-        gate=_REPO_GATES.get(repo, _GENERIC_GATE),
+        fix_test_step=(_FIX_REPRO_STEP if repro else _FIX_TEST_STEP).replace(
+            "{base}", base
+        ),
+        mitigation_test_step=(
+            _MITIGATION_REPRO_STEP if repro else _MITIGATION_TEST_STEP
+        ).replace("{base}", base),
+        gate=_gate(repo, base),
         markers=_STAGE_MARKERS.format(branch=branch),
     )
     return JobSpec(
@@ -263,6 +367,7 @@ def _sentry_triage(run: Run) -> JobSpec:
         # Stated explicitly even though it matches the runner's default, so the
         # prompt and the clone cannot drift apart if the default changes.
         branch=branch,
+        base_branch=base,
         model=_TRIAGE_MODEL,
         needs_github=True,
         needs_docker=True,
@@ -307,17 +412,12 @@ not direction.
 
 # How to attack the patch
 
-Read the repository's CLAUDE.md, then examine the change: `git diff main...HEAD`
+Read the repository's CLAUDE.md, then examine the change: `git diff {base}...HEAD`
 from /workspace. Attack along at least these four lines, and say what you found
 on each:
 
 {attack_one}
-2. Is the new test asserting the bug is fixed, or asserting the new code's
-   behaviour tautologically? Prove it: restore the changed implementation files
-   to main (`git checkout main -- <impl files>`, leaving the new test in
-   place), run the new test and confirm it FAILS, then restore with
-   `git checkout HEAD -- <impl files>`. A test that passes on the unpatched
-   code refutes the patch by itself.
+{attack_two}
 3. What input class still breaks? Construct the counterexample and, where
    practical, run it.
 4. What did the patch change that the Sentry issue never asked for?
@@ -383,6 +483,27 @@ _REVIEW_ATTACK_ONE_MITIGATION = """\
    fix harder or that someone must undo later. Any of these failing is a
    refutation, and (a) and (d) are the ones that cost the most later."""
 
+_REVIEW_ATTACK_TWO_TEST = """\
+2. Is the new test asserting the bug is fixed, or asserting the new code's
+   behaviour tautologically? Prove it: restore the changed implementation files
+   to {base} (`git checkout {base} -- <impl files>`, leaving the new test in
+   place), run the new test and confirm it FAILS, then restore with
+   `git checkout HEAD -- <impl files>`. A test that passes on the unpatched
+   code refutes the patch by itself."""
+
+#: The no-test-suite counterpart (#68): the evidence is a reproduction in the
+#: pull request body, so that is what gets re-run and attacked.
+_REVIEW_ATTACK_TWO_REPRO = """\
+2. This repository has no test suite; the evidence is the reproduction script
+   in the pull request body (`gh pr view {pr_url}`). Does it load the changed
+   file as shipped, or restate the patch? Prove it: save it under /tmp, run it
+   against the files from {base} (`git checkout {base} -- <impl files>`) and
+   confirm it FAILS, then `git checkout HEAD -- <impl files>` and confirm it
+   PASSES. A reproduction that passes on the unpatched code, or that never
+   touches the shipped file, refutes the patch by itself. If the body claims
+   the cause cannot be reproduced outside a browser, judge whether that is
+   true and whether the stated manual check would actually show the fix."""
+
 _REVIEW_STANDS_MITIGATION = """
 For a mitigation, STANDS means "this is a correct, honestly-scoped partial
 improvement worth merging with the issue left open". It does NOT mean the issue
@@ -432,7 +553,7 @@ what is red and why. Never weaken or skip an existing test to get to green.
 
 # Hard rules
 
-- Never merge anything. Never push to main. Never force-push.
+- Never merge anything. Never push to {base}. Never force-push.
 - Keep the pull request a draft; the next review round decides readiness.
 - Stay inside /workspace and /work.
 
@@ -470,6 +591,9 @@ def _chained_payload(payload: dict) -> dict:
         # that must not resolve its issue.
         "mode",
         "remaining",
+        # The branch every PR in the chain targets (#68); review compares
+        # against it and every sandbox fetches it.
+        "base_branch",
     )
     return {k: payload[k] for k in keys if k in payload}
 
@@ -481,9 +605,15 @@ def _adversarial_review(run: Run) -> JobSpec:
     if not repo or not branch:
         raise RuntimeError(f"review run {run.id} lacks repo/branch in its payload")
     mitigation = payload.get("mode") == "mitigation"
+    base = payload.get("base_branch") or DEFAULT_BRANCH
+    pr_url = payload.get("pr_url") or "?"
+    attack_two = (
+        _REVIEW_ATTACK_TWO_REPRO if repo in _REPRO_REPOS else _REVIEW_ATTACK_TWO_TEST
+    )
     prompt = _REVIEW_PROMPT.format(
         repo=repo,
         branch=branch,
+        base=base,
         short_id=payload.get("short_id") or "?",
         title=payload.get("title") or "?",
         culprit=payload.get("culprit") or "?",
@@ -495,12 +625,14 @@ def _adversarial_review(run: Run) -> JobSpec:
         attack_one=(
             _REVIEW_ATTACK_ONE_MITIGATION if mitigation else _REVIEW_ATTACK_ONE_FIX
         ),
+        attack_two=attack_two.replace("{base}", base).replace("{pr_url}", pr_url),
         stands_means=_REVIEW_STANDS_MITIGATION if mitigation else "",
     )
     return JobSpec(
         prompt=prompt,
         repo=repo,
         branch=branch,
+        base_branch=base,
         reuse_branch=True,
         model=_TRIAGE_MODEL,
         needs_github=True,  # `gh pr ready` on STANDS; nothing else
@@ -530,15 +662,17 @@ def _fix_revision(run: Run) -> JobSpec:
     branch = payload.get("branch")
     if not repo or not branch:
         raise RuntimeError(f"revision run {run.id} lacks repo/branch in its payload")
+    base = payload.get("base_branch") or DEFAULT_BRANCH
     prompt = _REVISION_PROMPT.format(
         repo=repo,
         branch=branch,
+        base=base,
         short_id=payload.get("short_id") or "?",
         title=payload.get("title") or "?",
         pr_url=payload.get("pr_url") or "?",
         round=payload.get("round", 2),
         refutation=payload.get("refutation") or "(refutation text missing)",
-        gate=_REPO_GATES.get(repo, _GENERIC_GATE),
+        gate=_gate(repo, base),
         mode_note=(
             _REVISION_MITIGATION_NOTE.format(
                 remaining=payload.get("remaining") or "(not recorded)"
@@ -552,6 +686,7 @@ def _fix_revision(run: Run) -> JobSpec:
         prompt=prompt,
         repo=repo,
         branch=branch,
+        base_branch=base,
         reuse_branch=True,
         model=_TRIAGE_MODEL,
         needs_github=True,
@@ -612,7 +747,7 @@ make no push and use outcome NEEDS_HUMAN with the specifics.
 
 # Hard rules
 
-- Never merge anything. Never push to main. Never force-push.
+- Never merge anything. Never push to {base}. Never force-push.
 - Never change the pull request's draft/ready state; the next adversarial
   review round decides that.
 - Stay inside /workspace and /work.
@@ -653,22 +788,25 @@ def _pr_revision(run: Run) -> JobSpec:
     branch = payload.get("branch")
     if not repo or not branch:
         raise RuntimeError(f"pr_revision run {run.id} lacks repo/branch in its payload")
+    base = payload.get("base_branch") or DEFAULT_BRANCH
     prompt = _PR_REVISION_PROMPT.format(
         repo=repo,
         branch=branch,
+        base=base,
         short_id=payload.get("short_id") or "?",
         title=payload.get("title") or "?",
         pr_url=payload.get("pr_url") or "?",
         revision=payload.get("revision", 1),
         max_rounds=3,
         change_requests=_format_change_requests(payload.get("change_requests") or []),
-        gate=_REPO_GATES.get(repo, _GENERIC_GATE),
+        gate=_gate(repo, base),
         markers=_STAGE_MARKERS.format(branch=branch),
     )
     return JobSpec(
         prompt=prompt,
         repo=repo,
         branch=branch,
+        base_branch=base,
         reuse_branch=True,
         model=_TRIAGE_MODEL,
         needs_github=True,

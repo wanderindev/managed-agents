@@ -328,14 +328,56 @@ The org is `javier-feliu` and it lives in the **US region**, so the base URL is
 
 ### Which projects, and which are deliberately excluded
 
-| Sentry project | Repo |
-|---|---|
-| `trd-python`, `trd-javascript-react` | `feliu-dev` |
-| `pic-python-fastapi`, `pic-javascript-react` | `panama-in-context` |
+The map is `PROJECT_REPOS` in `orchestrator/sources/sentry.py`.
 
-`atelier-loyalty-app` and `pic-cert-watcher` are real projects in the same org
-and are deliberately absent: there is no clone of either here, so an agent could
-only ever report that it cannot help.
+| Sentry project | Repo | Base | Verified by |
+|---|---|---|---|
+| `trd-python`, `trd-javascript-react` | `feliu-dev` | `main` | pytest + coverage floor |
+| `pic-python-fastapi`, `pic-javascript-react` | `panama-in-context` | `main` | pytest, frontend lint/build |
+| `atelier-loyalty-app` | `atelier-loyalty-app` | `main` | typecheck, lint, build, vitest on a throwaway Postgres 17 |
+| `atelier-theme` | **`atelier-new-cli`** | `master` | theme-check diff + an uncommitted reproduction (no test suite) |
+
+The `atelier-theme` *project* is the live storefront theme, whose code is in
+`atelier-new-cli`; the `atelier-theme` *repo* is its unreleased replacement and
+gets no Sentry runs. `pic-cert-watcher` is deliberately absent: there is no
+clone of it here, so an agent could only ever report that it cannot help.
+
+**The base branch is resolved, not assumed** (#68). The poll asks GitHub for
+each repo's default branch (once per poll, through the App) and stores it as
+`base_branch` in the triage payload; the sandbox cuts and fetches from it, the
+prompts name it (`--base`, `git diff <base>...HEAD`) and it rides the whole
+chain. A change-request revision takes the PR's own base. Without a usable App
+the poll logs that it is assuming `main`, which for `atelier-new-cli` makes the
+sandbox fetch fail loudly rather than fix against the wrong history.
+
+**What "verified" means per repo** lives in `_REPO_GATES` in
+`orchestrator/jobs.py`, quoted into every triage, revision and change-request
+prompt. A repo without one gets "mirror its CI". A repo in `_REPRO_REPOS` has no
+test suite: the fail-before/pass-after evidence is an uncommitted reproduction
+script in the PR body that loads the shipped file, and the adversarial review
+re-runs it instead of a test. The sandbox has Node 22, Python 3, git, gh and the
+docker CLI; anything else a gate needs is fetched at run time (the theme runs
+CI's pinned `@shopify/cli@3.94.3` through `npx`) and must need no login.
+
+### Adding a project
+
+1. **Repo reach**: GitHub App installed on the repo and a clone at
+   `/srv/repos/<repo>` (steps 1–2 of *Adding a repo to the dream list*).
+2. **Map it**: add `"<sentry-project>": "<repo>"` to `PROJECT_REPOS`, and
+   `wanderindev/<repo>` to `GITHUB_EXPECTED_REPOS` in `config.py` (a test fails
+   until both agree; the change-request poll walks that list).
+3. **Gate**: add the repo to `_REPO_GATES`, quoting its CI exactly and saying
+   how its tests reach any service they need from inside a sandbox (`localhost`
+   there is not the docker host). No test suite: add it to `_REPRO_REPOS`.
+4. **The repo's CLAUDE.md** must say how to run its checks and that PRs go
+   through `gh pr create`; the agent reads it first.
+5. **Noise**: list the project's unresolved issues and add an
+   `IGNORE_PATTERNS` entry (or a `PROJECT_IGNORE_PATTERNS` one, when the
+   judgement only holds for that project) for each real noise issue, with a
+   test that quotes it. Then `python -m orchestrator.poll --dry-run` and read
+   the drop tally: the cooldown means a bad first poll costs a week.
+6. Copy the code to `/srv/orchestrator` and restart the loop; the next hourly
+   poll picks the project up.
 
 ### Tuning the filters
 
@@ -353,6 +395,14 @@ missing-column error that had happened exactly once. Raise it with
 At a floor of 1 the ungroupable-issue filter starts earning its keep: an issue
 with no usable title *and* no culprit gives an agent nothing to start from, so
 it is dropped rather than turned into a run that can only conclude the same.
+
+The storefront theme throws a different class of noise from the React apps:
+in-app browsers, third-party app scripts (PushDaddy, reCAPTCHA, Shopify's own
+web pixels and telemetry) and an app embed that clobbers jQuery. On 2026-10-05
+the filters dropped 39 of its 42 unresolved issues and kept the three in the
+theme's own code. The jQuery-shaped judgements are scoped to `atelier-theme` in
+`PROJECT_IGNORE_PATTERNS` and mirror the `ignoreErrors` list the theme added to
+`snippets/sentry.liquid` on 2026-09-20; when that list changes, change these.
 
 ### Closing the loop back to Sentry
 

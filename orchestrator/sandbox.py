@@ -47,11 +47,10 @@ PROMPT_FILENAME = "prompt.txt"
 TIMEOUT_EXIT_CODE = 124
 
 #: The base a job's clone is cut from unless its spec says otherwise.
-#: feliu-dev and panama-in-context use `main`, and the triage/review/revision
-#: prompts bake it in (`git diff main...HEAD`, `--base main`). The dreaming job
-#: covers repos that do not (atelier-new-cli is on `master`), so it resolves the
-#: repo's real default branch at enqueue time and passes it as
-#: ``JobSpec.base_branch`` (#60).
+#: Not every repo is on `main` (atelier-new-cli is on `master`), so the jobs
+#: that open PRs resolve the repo's real default branch at enqueue time and
+#: pass it as ``JobSpec.base_branch``: the dream since #60, the Sentry chain
+#: since #68. This is the fallback for payloads that predate that.
 DEFAULT_BRANCH = "main"
 
 DOCKER_SOCKET = "/var/run/docker.sock"

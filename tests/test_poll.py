@@ -17,7 +17,9 @@ def test_it_polls_and_exits_zero_when_nothing_is_found(monkeypatch, migrated_dsn
     monkeypatch.setattr(poll_module.config, "DATABASE_URL", migrated_dsn)
     seen = {}
 
-    def fake_poll(conn, client, *, filters=None, dry_run=False, stats_period="14d"):
+    def fake_poll(
+        conn, client, *, filters=None, dry_run=False, stats_period="14d", **kw
+    ):
         seen["client"] = client
         seen["filters"] = filters
         return poll_module.sentry.PollReport()
@@ -33,7 +35,9 @@ def test_dry_run_is_passed_through(monkeypatch, migrated_dsn):
     monkeypatch.setattr(poll_module.config, "DATABASE_URL", migrated_dsn)
     seen = {}
 
-    def fake_poll(conn, client, *, filters=None, dry_run=False, stats_period="14d"):
+    def fake_poll(
+        conn, client, *, filters=None, dry_run=False, stats_period="14d", **kw
+    ):
         seen["dry_run"] = dry_run
         return poll_module.sentry.PollReport()
 
