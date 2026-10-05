@@ -238,10 +238,13 @@ def _headline(
         return "finished without a structured result"
     if cand.kind == DRIVE_KIND:
         # An incomplete drive parks AWAITING_HUMAN and is handled above; a
-        # COMPLETE Saturday still gets its one line, same silence rule.
+        # COMPLETE drive still gets its one line, same silence rule. So does
+        # one that found PIC at capacity: a normal end, not an error (#62).
         if outcome == "COMPLETE":
-            return "weekly drive: COMPLETE"
-        return "weekly drive finished without a structured result"
+            return "daily drive: COMPLETE"
+        if outcome == "AT_CAPACITY":
+            return "daily drive: at capacity, nothing due and no new series"
+        return "daily drive finished without a structured result"
     return None  # a DONE review chained a revision; that run will email
 
 
@@ -322,6 +325,8 @@ def _body(
             )
         ]
         return "\n".join(lines)
+    if cand.kind == DRIVE_KIND:
+        return _drive_body(cand, result, gate)
     pr_url = gate.get("pr_url") or result.get("pr_url") or payload.get("pr_url")
     lines = [
         f"Repository:  {payload.get('repo', '?')}",
@@ -360,10 +365,59 @@ def _body(
                 f"    evidence: {item.get('evidence', '?')}",
             ]
         lines += [""]
-    if gate.get("parked_tasks"):
+    if result.get("test"):
+        lines += [f"Covered by: {result['test']}", ""]
+    lines += [
+        (
+            f"(run {cand.run_id}, kind {cand.kind}, status {cand.status}."
+            " Full history: agent_events in the orchestrator database.)"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _drive_body(cand: _Candidate, result: dict, gate: dict) -> str:
+    """A drive session: every goal it touched, what waits on the operator
+    (grouped by kind), and what is parked. The gate carries the lists when the
+    run parked; a DONE run has them on its result."""
+    lines = [f"PIC:  {cand.payload.get('base_url', '?')}", ""]
+    if result.get("summary"):
+        lines += ["What happened:", result["summary"], ""]
+    if gate.get("why"):
+        lines += [f"Parked because: {gate['why']}", ""]
+    if result.get("goals"):
+        lines += ["Goals touched this session:"]
+        for goal in result["goals"]:
+            lines += [
+                (
+                    f"- {goal.get('goal_key')}: {goal.get('tasks', 0)} task(s),"
+                    f" {goal.get('waiting', 0)} waiting,"
+                    f" {goal.get('parked', 0)} parked,"
+                    f" {goal.get('unfinished', 0)} not yet runnable"
+                )
+            ]
+        lines += [""]
+    waiting = gate.get("waiting_tasks") or result.get("waiting") or []
+    if waiting:
+        # Work only the operator can do on the laptop; each daily drive
+        # re-checks and moves on by itself once it is done.
+        lines += ["Waiting on you (the next daily drive re-checks on its own):"]
+        for label, items in driver.group_waiting(waiting).items():
+            lines += [f"  {label}:"]
+            for item in items:
+                lines += [
+                    (
+                        f"  - task {item.get('task_id')}  {item.get('kind', '?')} on"
+                        f" {item.get('subject', '?')} ({item.get('goal_key', '?')}):"
+                        f" {item.get('waiting_for') or '(no detail)'}"
+                    )
+                ]
+        lines += [""]
+    parked = gate.get("parked_tasks") or result.get("parked") or []
+    if parked:
         # The drive's stuck steps; the admin queue page is the fixing tool.
         lines += ["Parked tasks (retry or skip them from the admin queue page):"]
-        for item in gate["parked_tasks"]:
+        for item in parked:
             lines += [
                 (
                     f"- task {item.get('task_id')}  {item.get('kind', '?')} on"
@@ -372,8 +426,6 @@ def _body(
                 )
             ]
         lines += [""]
-    if result.get("test"):
-        lines += [f"Covered by: {result['test']}", ""]
     lines += [
         (
             f"(run {cand.run_id}, kind {cand.kind}, status {cand.status}."

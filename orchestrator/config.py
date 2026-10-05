@@ -221,7 +221,7 @@ GITHUB_HUMAN_LOGINS = tuple(
 #: Revision runs one poll may enqueue. A review spree must not spawn a fleet.
 GITHUB_PR_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_GITHUB_PR_MAX_PER_POLL", "3"))
 
-# --- weekly-series driver (#13) ------------------------------------------------
+# --- series driver (#13) -------------------------------------------------------
 
 #: Scheme + host of the PIC deployment. CallSpec paths are absolute
 #: (/api/v1/...), so this is the only URL piece the driver supplies.
@@ -232,6 +232,13 @@ PIC_API_BASE = os.environ.get(
 #: The long-lived service token PIC's agent-tasks router accepts (its #418).
 #: Empty disables the driver entirely.
 PIC_DRIVER_TOKEN = os.environ.get("ORCHESTRATOR_PIC_DRIVER_TOKEN", "")
+
+#: PIC's series cadence, mirrored for ``--dry-run`` only (#62): ``daily``
+#: keys goals ``daily_series:YYYY-MM-DD``, ``weekly`` keys them
+#: ``weekly_series:YYYY-Www``. PIC's ``WEEKLY_PLAN_DAILY_CADENCE`` is the
+#: source of truth (on in production since 2026-09-03); a real drive never
+#: needs this, because every claim and plan-week answer carries its goal key.
+DRIVER_CADENCE = os.environ.get("ORCHESTRATOR_DRIVER_CADENCE", "daily")
 
 #: Ceiling on tasks one drive session will execute. A week's graph is a few
 #: dozen rows; a session that hits this cap is looping, not working.
