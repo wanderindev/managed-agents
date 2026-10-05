@@ -10,7 +10,7 @@ FROM node:22-bookworm-slim
 # silently installed the last compatible release, stranding the host on an old
 # CLI that could not reach current models. Bumping this is a one-line, reviewed
 # change rather than a surprise on the next rebuild.
-ARG CLAUDE_CODE_VERSION=2.1.220
+ARG CLAUDE_CODE_VERSION=2.1.289
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8
