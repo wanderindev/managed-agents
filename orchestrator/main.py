@@ -55,7 +55,10 @@ def main() -> int:
 
     runner = DockerRunner(jobs.build_spec, github_token=_github_token())
     orchestrator = Orchestrator(
-        runner, followups=jobs.followups, notify=notify.pass_once
+        runner,
+        followups=jobs.followups,
+        notify=notify.pass_once,
+        coalesce=jobs.COALESCED,
     )
     logger.info(
         "orchestrator %s starting: image=%s max_concurrent=%s tick=%ss",

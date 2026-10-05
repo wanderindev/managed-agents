@@ -6,7 +6,10 @@ at AWAITING_HUMAN, a NOT_A_BUG or NEEDS_HUMAN verdict, or a crash — produces
 exactly one email, and every run the notifier deliberately does not email gets
 an ``email_sent`` event saying why, so the log never has an unexamined run.
 
-At most one email per run. Past the daily cap the remainder go into a single
+At most one email per run, with one exception: while dispatch is paused on a
+dead Claude login, a reminder with the queued-run count goes out once a day
+(#59), because the fix is a human at a terminal and one email is easy to miss.
+Past the daily cap the remainder go into a single
 digest instead of being suppressed. Emails link; they never dump — no stack
 traces, no transcripts, no secrets.
 
@@ -24,11 +27,12 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Any
 
 import psycopg
 
-from orchestrator import config, driver, log
+from orchestrator import auth, config, driver, log, queue
 from orchestrator.db import connect
 from orchestrator.driver import RUN_KIND as DRIVE_KIND
 from orchestrator.enums import EventType
@@ -130,6 +134,11 @@ def _candidates(conn: psycopg.Connection) -> list[_Candidate]:
         ]
 
 
+def _queued_for(conn: psycopg.Connection, failed: dict) -> dict[str, int] | None:
+    """The queued counts an auth-failure email reports; None for any other."""
+    return queue.queued_by_kind(conn) if failed.get("reason") == "auth" else None
+
+
 def _sent_today(conn: psycopg.Connection) -> int:
     """Individual emails sent today. Digests and suppressions do not count:
     the digest is the overflow mechanism and must not consume the cap."""
@@ -137,7 +146,8 @@ def _sent_today(conn: psycopg.Connection) -> int:
         cur.execute(
             "SELECT count(*) AS n FROM agent_events"
             " WHERE type = %s AND created_at >= date_trunc('day', now())"
-            "   AND NOT (payload ? 'digest') AND NOT (payload ? 'suppressed')",
+            "   AND NOT (payload ? 'digest') AND NOT (payload ? 'suppressed')"
+            "   AND NOT (payload ? 'auth_reminder')",
             (EventType.EMAIL_SENT.value,),
         )
         return cur.fetchone()["n"]
@@ -235,8 +245,35 @@ def _headline(
     return None  # a DONE review chained a revision; that run will email
 
 
+def _queued_lines(queued: dict[str, int]) -> str:
+    total = sum(queued.values())
+    lines = [f"{total} run(s) are queued and waiting:"]
+    lines += [f"  {kind}: {n}" for kind, n in queued.items()]
+    return "\n".join(lines)
+
+
+#: What to do about a paused login. Shared by the first email and the daily
+#: reminder, so the two can never give different instructions.
+_AUTH_FIX = (
+    "The poll and the dream schedule do not enqueue while paused, and queued"
+    " dreams for one repo coalesce to the newest. Anything else queued"
+    " dispatches all at once after the re-login, so look first and cancel what"
+    " is stale (dry-run, then for real):\n"
+    "  python -m orchestrator.queue cancel --older-than 1d --dry-run\n"
+    "  python -m orchestrator.queue cancel --older-than 1d\n\n"
+    "Fix (interactive, cannot be automated):\n"
+    "  ssh -t wanderindev@<agents droplet> claude auth login\n\n"
+    "Dispatch resumes on the next tick after the credential file is"
+    " rewritten; no restart needed."
+)
+
+
 def _body(
-    cand: _Candidate, result: dict, gate: dict, failed: dict | None = None
+    cand: _Candidate,
+    result: dict,
+    gate: dict,
+    failed: dict | None = None,
+    queued: dict[str, int] | None = None,
 ) -> str:
     payload = cand.payload
     failed = failed or {}
@@ -245,13 +282,11 @@ def _body(
             "The sandbox could not authenticate: the host's Claude OAuth session"
             " expired and could not be refreshed. This is a host condition, not a"
             " problem with this run.\n\n"
-            "The orchestrator has PAUSED dispatch. Every queued run (and every one"
-            " the schedules enqueue meanwhile) waits; nothing else will be burned"
-            " and this is the only email about it.\n\n"
-            "Fix (interactive, cannot be automated):\n"
-            "  ssh -t wanderindev@<agents droplet> claude auth login\n\n"
-            "Dispatch resumes on the next tick after the credential file is"
-            " rewritten; no restart needed.\n\n"
+            "The orchestrator has PAUSED dispatch. Every queued run waits; nothing"
+            " else will be burned. A reminder follows once a day while it stays"
+            " paused.\n\n"
+            f"{_queued_lines(queued or {})}\n\n"
+            f"{_AUTH_FIX}\n\n"
             f"(run {cand.run_id}, kind {cand.kind}, subject {cand.subject}.)"
         )
     if failed.get("reason") in (driver.REASON_NO_RESEARCH, driver.REASON_PROTOCOL):
@@ -362,6 +397,86 @@ def _digest_body(remaining: list[tuple[_Candidate, str]]) -> str:
     return "\n".join(lines)
 
 
+# --- the paused-login reminder ----------------------------------------------
+
+
+def _auth_reminder(
+    conn: psycopg.Connection, credentials: Path
+) -> tuple[Email, int] | None:
+    """Today's "login still expired" email (recipient unset) and the run it
+    is recorded on, or None when none is due.
+
+    Due while dispatch is paused (the loop's own condition, ``auth.paused``)
+    and the newest auth-failed run has had its first email but nothing today.
+    Stateless like the rest: the ``email_sent`` events are the memory. The
+    first-email guard keeps the reminder from stealing that run's one outcome
+    email, which ``_candidates`` would otherwise skip forever.
+    """
+    if auth.paused(conn, credentials) is None:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT f.run_id, f.created_at,"
+            " EXISTS (SELECT 1 FROM agent_events e"
+            "          WHERE e.run_id = f.run_id AND e.type = %s) AS emailed,"
+            " EXISTS (SELECT 1 FROM agent_events e"
+            "          WHERE e.run_id = f.run_id AND e.type = %s"
+            "            AND e.created_at >= date_trunc('day', now())) AS today"
+            " FROM agent_events f"
+            " WHERE f.type = %s AND f.payload->>'reason' = 'auth'"
+            " ORDER BY f.id DESC LIMIT 1",
+            (
+                EventType.EMAIL_SENT.value,
+                EventType.EMAIL_SENT.value,
+                EventType.RUN_FAILED.value,
+            ),
+        )
+        row = cur.fetchone()
+    if row is None or not row["emailed"] or row["today"]:
+        return None
+    queued = queue.queued_by_kind(conn)
+    since = row["created_at"].strftime("%Y-%m-%d %H:%M %Z").strip()
+    email = Email(
+        to="",
+        subject=(
+            "[managed-agents] Claude login STILL EXPIRED on the agents droplet"
+            f" — dispatch paused since {since[:10]}, {sum(queued.values())} queued"
+        ),
+        body=(
+            f"Dispatch has been paused since {since} (run {row['run_id']} failed"
+            " to authenticate) and the credential file has not changed since.\n\n"
+            f"{_queued_lines(queued)}\n\n"
+            f"{_AUTH_FIX}\n\n"
+            "This reminder repeats once a day while dispatch stays paused."
+        ),
+    )
+    return email, row["run_id"]
+
+
+def _remind_paused_login(
+    conn: psycopg.Connection, transport: Transport, to: str, credentials: Path
+) -> int:
+    due = _auth_reminder(conn, credentials)
+    if due is None:
+        return 0
+    draft, run_id = due
+    email = Email(to=to, subject=draft.subject, body=draft.body)
+    try:
+        transport(email)
+    except Exception:
+        logger.exception("could not send the paused-login reminder; will retry")
+        return 0
+    with conn.transaction():
+        log.append(
+            conn,
+            run_id,
+            EventType.EMAIL_SENT,
+            {"to": to, "subject": email.subject, "auth_reminder": True},
+        )
+    logger.info("emailed the paused-login reminder: %s", email.subject)
+    return 1
+
+
 # --- the pass ----------------------------------------------------------------
 
 
@@ -371,10 +486,12 @@ def pass_once(
     *,
     to: str | None = None,
     cap: int | None = None,
+    credentials: str | Path | None = None,
 ) -> int:
-    """Examine every unexamined finished run; email or record why not.
+    """Examine every unexamined finished run; email or record why not. Then,
+    while dispatch is paused on a dead login, send the daily reminder.
 
-    Returns the number of emails sent (digest included). A transport failure
+    Returns the number of emails sent (digest and reminder included). A transport failure
     aborts the pass with nothing marked, so the next tick retries — the
     at-least-once direction, chosen because a duplicate email is annoying and
     a silently lost one violates the whole point of #9.
@@ -387,7 +504,15 @@ def pass_once(
             logger.warning("ORCHESTRATOR_NOTIFY_TO is not set; outcome emails are off")
             _warned_disabled = True
         return 0
+    sent = _examine(conn, transport, to, cap)
+    # After the candidates, so the day an auth failure lands, its own email
+    # goes first and counts as that day's.
+    return sent + _remind_paused_login(
+        conn, transport, to, Path(credentials or config.CLAUDE_CREDENTIALS)
+    )
 
+
+def _examine(conn: psycopg.Connection, transport: Transport, to: str, cap: int) -> int:
     candidates = _candidates(conn)
     if not candidates:
         return 0
@@ -422,7 +547,7 @@ def pass_once(
                 f"[managed-agents] {cand.payload.get('repo', '?')}"
                 f" {cand.payload.get('short_id', cand.subject)}: {headline}"
             ),
-            body=_body(cand, result, gate, failed),
+            body=_body(cand, result, gate, failed, _queued_for(conn, failed)),
         )
         try:
             transport(email)
@@ -490,8 +615,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"run {cand.run_id}  {cand.subject}: {marker}")
                 if headline:
                     print("---")
-                    print(_body(cand, result, gate, failed))
+                    print(_body(cand, result, gate, failed, _queued_for(conn, failed)))
                     print("===")
+            due = _auth_reminder(conn, Path(config.CLAUDE_CREDENTIALS))
+            if due is not None:
+                print(f"paused-login reminder: {due[0].subject}")
+                print("---")
+                print(due[0].body)
+                print("===")
             return 0
         sent = pass_once(conn)
         print(f"sent {sent} email(s)")

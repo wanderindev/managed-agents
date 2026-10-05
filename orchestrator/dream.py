@@ -33,7 +33,7 @@ from typing import Any
 
 import psycopg
 
-from orchestrator import config, github, jobs, queue
+from orchestrator import auth, config, github, jobs, queue
 from orchestrator.db import connect
 from orchestrator.enums import EventType
 from orchestrator.log import create_run, load_events
@@ -256,8 +256,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s %(message)s"
     )
-    pulls = _pulls_client()
     with connect() as conn:
+        if auth.skip_enqueue(conn, "memory dreams"):
+            return 0
+        pulls = _pulls_client()
         repos = [args.repo] if args.repo else recent_repos(conn, args.days)
         if not repos:
             logger.info("no repos with run activity in the last %s day(s)", args.days)

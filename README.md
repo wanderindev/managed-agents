@@ -51,7 +51,7 @@ orchestrator/
   migrate.py         migration runner
   notify.py          outcome email; every silence explains itself
   poll.py            work-source poll: Sentry issues, PR change requests
-  queue.py           queue reads and the lease write
+  queue.py           queue reads, the lease write, `cancel` CLI, coalescing
   research_gate.py   research-gate experiment: write, rubric-verify, revise
   runner.py          Runner protocol, the seam to container mechanics
   sandbox.py         the Docker runner
@@ -109,6 +109,16 @@ files applied and a retry resumes.
 `agent_events` refuses `UPDATE`, `DELETE` and `TRUNCATE` via a trigger. That is
 intentional and enforced in the database rather than in the grants, because
 migrations connect as the owner and grants would not bind them.
+
+So queued work is never cleared by hand either. The supported way writes proper
+events (`run_abandoned` marked `cancelled`) and only touches QUEUED runs:
+
+```bash
+python -m orchestrator.queue cancel --kind memory_dream --older-than 1d --dry-run
+python -m orchestrator.queue cancel --kind memory_dream --older-than 1d
+```
+
+`docs/runbook.md` ("When the login dies anyway") covers when to use it.
 
 ## Configuration
 

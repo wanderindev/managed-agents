@@ -82,12 +82,20 @@ class TickResult:
     heartbeated: list[int] = field(default_factory=list)
     abandoned: list[int] = field(default_factory=list)
     finished: list[int] = field(default_factory=list)
+    #: Queued runs coalescing cancelled as superseded (#59).
+    cancelled: list[int] = field(default_factory=list)
     #: Set when dispatch refused to lease because the Claude login is dead.
     paused: str | None = None
 
     @property
     def idle(self) -> bool:
-        return not (self.leased or self.heartbeated or self.abandoned or self.finished)
+        return not (
+            self.leased
+            or self.heartbeated
+            or self.abandoned
+            or self.finished
+            or self.cancelled
+        )
 
 
 class Orchestrator:
@@ -106,6 +114,7 @@ class Orchestrator:
         followups: Callable[[Run, dict[str, Any] | None], Any] | None = None,
         notify: Callable[[psycopg.Connection], int] | None = None,
         credentials: str | Path | None = None,
+        coalesce: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self.runner = runner
         #: The Claude credential the sandbox mounts. Only fingerprinted here,
@@ -145,6 +154,11 @@ class Orchestrator:
         #: outcome emails go out promptly. Guarded like followups: a mail
         #: outage must never cost a tick.
         self.notify = notify
+        #: ``(kind, payload key)`` pairs whose queued runs collapse to the
+        #: newest per key before anything is leased (jobs.COALESCED in
+        #: production). Done even while paused, so a backlog shrinks as it
+        #: builds rather than all at once on resume.
+        self.coalesce = coalesce
 
     # --- one tick ------------------------------------------------------------
 
@@ -508,6 +522,8 @@ class Orchestrator:
     # --- dispatch ------------------------------------------------------------
 
     def _dispatch(self, conn: psycopg.Connection, result: TickResult) -> None:
+        for kind, key in self.coalesce:
+            result.cancelled.extend(queue.coalesce(conn, kind, key))
         result.paused = self._auth_pause(conn)
         if result.paused is not None:
             return
@@ -534,8 +550,8 @@ class Orchestrator:
         rewrites the file, the fingerprint moves, and the queue drains on the
         next tick with nothing to reset. Logged once per pause, not per tick.
         """
-        stamped = log.latest_auth_failure(conn)
-        if stamped is None or stamped != auth.fingerprint(self.credentials):
+        stamped = auth.paused(conn, self.credentials)
+        if stamped is None:
             if self._paused_for is not None:
                 logger.info("Claude credential changed; resuming dispatch")
                 self._paused_for = None
@@ -619,9 +635,10 @@ class Orchestrator:
         if result.idle:
             return
         logger.info(
-            "tick: leased=%s heartbeated=%s finished=%s abandoned=%s",
+            "tick: leased=%s heartbeated=%s finished=%s abandoned=%s cancelled=%s",
             result.leased,
             result.heartbeated,
             result.finished,
             result.abandoned,
+            result.cancelled,
         )

@@ -109,6 +109,36 @@ ssh -t wanderindev@159.223.174.185 claude auth login
 That rewrites the file; the next tick sees the new fingerprint and drains the
 queue. No restart, nothing to reset in the database.
 
+While paused (#59, after the 2026-09-24 expiry sat unnoticed for 11 days):
+
+- **The schedules stand down.** `orchestrator.poll` and `orchestrator.dream`
+  check the same condition (`auth.paused`) and exit 0 without enqueuing,
+  logging `not enqueuing …: dispatch is paused` with the queued count. Sentry
+  issues and PR reviews are still there for the first poll after the re-login.
+- **Queued dreams coalesce.** Every tick, even while paused, the loop keeps
+  only the newest QUEUED `memory_dream` per repo and cancels the rest with
+  `reason: superseded by newer queued run N`.
+- **The email repeats daily**, with the queued count per kind, until the
+  credential changes (`auth_reminder` on the `email_sent` event; it does not
+  count against `NOTIFY_DAILY_CAP`).
+
+The queue is drained **all at once** on the tick after the re-login, so clear
+what is stale *before* logging in. Look, then cancel:
+
+```bash
+ssh wanderindev@159.223.174.185
+cd /srv/orchestrator && set -a && . /srv/orchestrator.env && set +a
+.venv/bin/python -m orchestrator.queue cancel --older-than 1d --dry-run
+.venv/bin/python -m orchestrator.queue cancel --older-than 1d --reason "stale after login expiry"
+```
+
+Filters combine (all must match) and at least one is required: `--kind KIND`,
+`--older-than AGE` (`30m`, `12h`, `1d`, `2w`, measured from `created_at`), and
+`--run ID` (repeatable). Only QUEUED runs are touched — a leased or running run
+is never cancelled. A cancel is proper events, not an edit: `run_abandoned`
+with `requeued: false, cancelled: true, reason`, then an `email_sent` marker so
+no "ABANDONED" email follows. Never hand-write rows to do this.
+
 ### `bypassPermissions`, and what the Docker socket costs
 
 The entrypoint defaults to `--permission-mode bypassPermissions`. That is right
