@@ -175,6 +175,17 @@ DREAM_REPOS = tuple(
 #: CLI or the API refuses it, falling back is an env edit and a loop restart.
 DREAM_MODEL = os.environ.get("ORCHESTRATOR_DREAM_MODEL", "claude-opus-5-5")
 
+#: Largest CLAUDE.md, in characters, a dream may leave behind (#61). 40,000 is
+#: the floor of Claude Code's own "Large CLAUDE.md will impact performance"
+#: warning: the CLI (2.1.289 bundle, `y5e`) warns when one memory file's length
+#: exceeds max(40000, context window x 0.05 x chars-per-token), so 40,000 is
+#: where it warns on a 200K-context model and the one number that never warns.
+#: Over it, the dreamer moves subsystem detail into docs/claude/<topic>.md, and
+#: a dream that still leaves it over is parked for a human.
+DREAM_CLAUDE_MD_MAX_CHARS = int(
+    os.environ.get("ORCHESTRATOR_DREAM_CLAUDE_MD_MAX_CHARS", "40000")
+)
+
 #: What the App is supposed to be able to reach. Used only to warn when setup
 #: granted more than intended; nothing enforces it here, GitHub does. The
 #: dream list is declared intent too, so its repos are expected.

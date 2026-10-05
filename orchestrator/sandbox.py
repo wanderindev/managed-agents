@@ -225,6 +225,13 @@ class DockerRunner:
         exit_code = self._parse_exit_code(state.stdout)
         events, stderr = self._collect_logs(handle)
         job_result = self._read_result(run)
+        if job_result is not None:
+            # Measured here, before the workspace goes, so the dream's size
+            # guard (#61) rests on the file and not on the agent's say-so.
+            # Overwrites anything the agent wrote under the same key.
+            chars = self._claude_md_chars(run)
+            if chars is not None:
+                job_result["claude_md_chars"] = chars
 
         if exit_code == TIMEOUT_EXIT_CODE:
             stderr = (
@@ -488,6 +495,30 @@ class DockerRunner:
             logger.warning("run %s wrote an unparseable %s", run.id, RESULT_FILENAME)
             return None
         return parsed if isinstance(parsed, dict) else None
+
+    def _claude_md_chars(self, run: Run) -> int | None:
+        """Length of the workspace's CLAUDE.md as committed at HEAD, or None.
+
+        HEAD rather than the working tree: what was committed (and pushed) is
+        what the next session loads, and an edit left uncommitted fixes
+        nothing. Characters, like Claude Code's own warning. A repo without a
+        CLAUDE.md — or a scratch workspace — has nothing to measure.
+        """
+        workspace = self.workspace_path(run)
+        path = workspace / "CLAUDE.md"
+        if not path.is_file():
+            return None
+        try:
+            shown = self._run(
+                [self.git_bin, "-C", str(workspace), "show", "HEAD:CLAUDE.md"]
+            )
+        except UnicodeDecodeError:
+            shown = None
+        if shown is not None and shown.returncode == 0:
+            return len(shown.stdout)
+        # Not committed (a fresh, untracked file), or output that would not
+        # decode as text: the working tree is the best measure left.
+        return len(path.read_text(errors="replace"))
 
     def _cleanup(self, run: Run, *, keep_workspace: bool) -> None:
         self._remove_paths(self.job_path(run))

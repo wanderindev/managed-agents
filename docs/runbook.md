@@ -242,6 +242,26 @@ and Linux refuses a single argument over 128 KiB ("Argument list too long", on
 every retry). Do not raise `MAX_EVIDENCE_BYTES` without changing how the
 entrypoint hands over the prompt.
 
+**CLAUDE.md size guard (#61).** Every dream keeps CLAUDE.md at or under
+`ORCHESTRATOR_DREAM_CLAUDE_MD_MAX_CHARS` (default 40,000 characters), even
+when it has nothing else to change: over it, the dreamer moves subsystem detail
+verbatim into `docs/claude/<topic>.md` and leaves a stub (heading, "read it
+first", the main traps) — the panama-in-context pattern — keeping
+cross-cutting rules in CLAUDE.md. Those files are the only thing besides
+CLAUDE.md a dream may edit. The check is also code: after the run the runner
+measures CLAUDE.md as committed at the workspace's HEAD and records it as
+`claude_md_chars` in the result; still over the limit parks the run
+AWAITING_HUMAN (email subject "CLAUDE.md still N chars, over the limit"),
+whatever the outcome, CLEAN and NO_CHANGE included.
+
+Where 40,000 comes from: Claude Code's own "Large CLAUDE.md will impact
+performance (N chars > LIMIT)" warning. In the CLI bundle (2.1.289) the
+per-file limit is `max(40000, context window x 0.05 x chars-per-token)`
+(3 or 4 chars per token by model), so 40,000 is where it warns on a
+200K-context model; a 1M-context session tolerates more. The CLI counts
+JavaScript string length, Python counts code points: identical unless the
+file holds characters outside the Basic Multilingual Plane (emoji).
+
 The dream runs on Opus 5.5 (`claude-opus-5-5`, `ORCHESTRATOR_DREAM_MODEL`); the
 other kinds stay on `claude-opus-5`. The image's pinned CLI (2.1.220) predates
 that id and does not list it, but passes `--model` through to the API. The
