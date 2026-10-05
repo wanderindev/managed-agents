@@ -263,10 +263,13 @@ JavaScript string length, Python counts code points: identical unless the
 file holds characters outside the Basic Multilingual Plane (emoji).
 
 The dream runs on Opus 5.5 (`claude-opus-5-5`, `ORCHESTRATOR_DREAM_MODEL`); the
-other kinds stay on `claude-opus-5`. The image's pinned CLI (2.1.220) predates
-that id and does not list it, but passes `--model` through to the API. The
-host's own `claude` is a different (newer) CLI, so test the **image** before
-the first Monday run, with the same credential mount the runner uses:
+other kinds stay on `claude-opus-5`. The API refuses that id from an older CLI
+— on 2.1.220 the run ends at once with `API Error: 400 Claude Code 2.1.220
+does not support this model; version 2.1.280 or newer is required` — so the
+image pins 2.1.289 (#69). The host's own `claude` is installed separately and
+can lag the image (it was still 2.1.220 when the image was bumped), so test
+the **image** after every rebuild and before the first Monday run, with the
+same credential mount the runner uses:
 
 ```bash
 ssh wanderindev@159.223.174.185
@@ -279,8 +282,10 @@ docker run --rm --init \
 
 The stream's `system` init line should name `claude-opus-5-5` and the result
 should be `SMOKE OK`. If the model is refused, set
-`ORCHESTRATOR_DREAM_MODEL=claude-opus-5` and restart the loop, or bump
-`CLAUDE_CODE_VERSION` and rebuild the image.
+`ORCHESTRATOR_DREAM_MODEL=claude-opus-5` and restart the loop (the loop reads
+config once at startup, so an env edit alone changes nothing), or bump
+`CLAUDE_CODE_VERSION` and rebuild the image. Once the image passes again,
+remove that override and restart the loop to go back to Opus 5.5.
 
 ### Adding a repo to the dream list
 
