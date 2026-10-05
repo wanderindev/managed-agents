@@ -242,6 +242,26 @@ def test_local_main_is_forced_to_origins_main(roots):
     assert "main" in branch and "origin/main" in branch
 
 
+def test_a_non_main_base_branch_is_fetched_cut_from_and_tracked(roots):
+    """atelier-new-cli is on `master` (#60): the dream's spec carries the base,
+    and nothing may assume `main` exists on that remote."""
+    (roots["repos_root"] / "atelier-new-cli").mkdir(parents=True)
+    commands = FakeCommands()
+    spec = JobSpec(
+        prompt="p", repo="atelier-new-cli", branch="agent/x", base_branch="master"
+    )
+
+    make_runner(roots, commands, spec=spec).start(make_run())
+
+    fetch = commands.commands("fetch")[0]
+    assert "+refs/heads/master:refs/remotes/origin/master" in fetch
+    assert not any("refs/heads/main" in part for part in fetch)
+    checkout = commands.commands("checkout", "-B")[0]
+    assert checkout[-1] == "origin/master"
+    branch = commands.commands("branch", "-f")[0]
+    assert branch[-2:] == ["master", "origin/master"]
+
+
 def test_start_fails_clearly_when_the_clone_is_missing(roots):
     runner = make_runner(
         roots, FakeCommands(), spec=JobSpec(prompt="p", repo="not-cloned")

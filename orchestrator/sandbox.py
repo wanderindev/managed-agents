@@ -46,8 +46,12 @@ PROMPT_FILENAME = "prompt.txt"
 #: looks like an arbitrary failure.
 TIMEOUT_EXIT_CODE = 124
 
-#: Both repos use `main`, and the prompts bake it in (`git diff main...HEAD`,
-#: `--base main`), so the runner may too.
+#: The base a job's clone is cut from unless its spec says otherwise.
+#: feliu-dev and panama-in-context use `main`, and the triage/review/revision
+#: prompts bake it in (`git diff main...HEAD`, `--base main`). The dreaming job
+#: covers repos that do not (atelier-new-cli is on `master`), so it resolves the
+#: repo's real default branch at enqueue time and passes it as
+#: ``JobSpec.base_branch`` (#60).
 DEFAULT_BRANCH = "main"
 
 DOCKER_SOCKET = "/var/run/docker.sock"
@@ -83,6 +87,9 @@ class JobSpec:
     #: (fixers push from /workspace), so reuse fetches the branch from origin
     #: and checks it out as-is — never ``-B``, which would reset it.
     reuse_branch: bool = False
+    #: The repo's default branch: what a fresh branch is cut from and what the
+    #: local ``<base>`` ref is forced to. Only the dreaming job sets it (#60).
+    base_branch: str = DEFAULT_BRANCH
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess]
@@ -374,7 +381,8 @@ class DockerRunner:
         # the parent's .git on the host, a path never mounted into the sandbox,
         # which left git dead in /workspace and every fixer improvising private
         # in-sandbox clones. --local hardlinks the objects, so this stays cheap.
-        default = f"+refs/heads/{DEFAULT_BRANCH}:refs/remotes/origin/{DEFAULT_BRANCH}"
+        base = spec.base_branch or DEFAULT_BRANCH
+        default = f"+refs/heads/{base}:refs/remotes/origin/{base}"
         try:
             self._git("clone", "--local", str(repo), str(path))
             # Pushes and fetches go straight to GitHub. The URL carries no
@@ -401,7 +409,7 @@ class DockerRunner:
                 )
                 self._git("-C", str(path), "checkout", "-b", branch, f"origin/{branch}")
             else:
-                # Cut the fresh branch from origin's main, not the parent's
+                # Cut the fresh branch from origin's base, not the parent's
                 # HEAD: the parent clone is a static template that only goes
                 # staler (#30), and a PR based on stale main reviews badly.
                 self._git("-C", str(path), "fetch", fetch_url, default, scrub=token)
@@ -411,17 +419,18 @@ class DockerRunner:
                     "checkout",
                     "-B",
                     branch,
-                    f"origin/{DEFAULT_BRANCH}",
+                    f"origin/{base}",
                 )
             # The prompts compare against local main (`git diff main...HEAD`,
-            # `git checkout main -- <files>`), so it has to match origin's.
+            # `git checkout main -- <files>`), so it has to match origin's;
+            # likewise the local ref of a non-main base branch (#60).
             self._git(
                 "-C",
                 str(path),
                 "branch",
                 "-f",
-                DEFAULT_BRANCH,
-                f"origin/{DEFAULT_BRANCH}",
+                base,
+                f"origin/{base}",
             )
         except Exception:
             # Leave nothing half-built; a retry gets a clean clone.

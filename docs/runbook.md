@@ -212,6 +212,71 @@ workspace is always deleted when the run finishes — a job's work reaches the
 world by being pushed to origin from inside the sandbox, never by surviving
 on disk.
 
+## Dreaming (#15, weekly since #60)
+
+`orchestrator.dream` is a cron one-shot, **Mondays**, with the default
+`--days 7` lookback. Per repo it enqueues one `memory_dream` run (at most one
+per repo per day, by subject) whose payload is the evidence the auditor sees:
+
+- the orchestrator's own runs on that repo in the window (newest 40; any
+  beyond that are counted as `runs_omitted`, never dropped silently), and
+- every pull request **merged** in the window, whoever wrote it — title,
+  number, author, `merged_at` and a changed-files summary, read through the
+  GitHub App. This is how interactive and epic-runner work reaches the audit.
+  A repo with merges but no runs still dreams; one with neither is skipped.
+
+Which repos: `ORCHESTRATOR_DREAM_REPOS` (comma list) when set; otherwise every
+repo with orchestrator runs in the window. `--repo NAME` overrides both.
+
+The run's base is the repo's **default branch as GitHub reports it**, recorded
+as `base_branch` in the payload: the sandbox cuts the dream branch from
+`origin/<base>` and the draft PR targets it (atelier-new-cli is on `master`).
+If the App is unusable the dream falls back to `main` and logs a warning; for a
+non-`main` repo the sandbox fetch then fails loudly rather than auditing the
+wrong history.
+
+The brief's evidence (runs + merged PRs) is bounded to 64 KB, oldest entries
+trimmed first and counted as `runs_omitted` / `prs_omitted`. The bound is the
+argv limit: the entrypoint passes the whole prompt as one `claude -p` argument,
+and Linux refuses a single argument over 128 KiB ("Argument list too long", on
+every retry). Do not raise `MAX_EVIDENCE_BYTES` without changing how the
+entrypoint hands over the prompt.
+
+The dream runs on Opus 5.5 (`claude-opus-5-5`, `ORCHESTRATOR_DREAM_MODEL`); the
+other kinds stay on `claude-opus-5`. The image's pinned CLI (2.1.220) predates
+that id and does not list it, but passes `--model` through to the API. The
+host's own `claude` is a different (newer) CLI, so test the **image** before
+the first Monday run, with the same credential mount the runner uses:
+
+```bash
+ssh wanderindev@159.223.174.185
+docker run --rm --init \
+    --volume /home/wanderindev/.claude/.credentials.json:/home/agent/.claude/.credentials.json \
+    --env AGENT_MODEL=claude-opus-5-5 \
+    --env AGENT_PROMPT='Reply with exactly: SMOKE OK' \
+    managed-agents/sandbox:latest
+```
+
+The stream's `system` init line should name `claude-opus-5-5` and the result
+should be `SMOKE OK`. If the model is refused, set
+`ORCHESTRATOR_DREAM_MODEL=claude-opus-5` and restart the loop, or bump
+`CLAUDE_CODE_VERSION` and rebuild the image.
+
+### Adding a repo to the dream list
+
+1. **GitHub App** → Install App → *Only select repositories* → add the repo
+   (keep the selection explicit, never "All repositories").
+2. **Host clone**: `/srv/repos/<repo>`, owned by `wanderindev`. The name is the
+   GitHub repo name; it is the directory the job's `git clone --local` reads.
+3. **`/srv/orchestrator.env`**: append the name to `ORCHESTRATOR_DREAM_REPOS`.
+4. **Check reach**: `python -m orchestrator.github` lists what the App can see
+   and warns about anything outside feliu-dev, panama-in-context and the dream
+   list. A dream repo it cannot see means a failed clone fetch.
+5. **Dry run**: `python -m orchestrator.dream --repo <repo> --dry-run` logs the
+   run and merged-PR counts and the base branch it resolved, without
+   enqueuing. `base main` for a repo that is not on `main` means the App
+   lookup failed.
+
 ## Sentry work source
 
 ```bash

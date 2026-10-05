@@ -349,5 +349,5 @@ def test_the_cli_warns_when_the_app_can_reach_more_than_intended(
     with caplog.at_level("INFO", logger="orchestrator.github"):
         github.main()
 
-    assert "beyond the intended two" in caplog.text
+    assert "beyond the intended repos" in caplog.text
     assert "pic-extension" in caplog.text

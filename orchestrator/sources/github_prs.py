@@ -135,6 +135,22 @@ class PullsClient:
     def commits(self, full_repo: str, number: int) -> list[dict]:
         return self._get(f"/repos/{full_repo}/pulls/{number}/commits?per_page=100")
 
+    # --- for the dreaming job (#60) --------------------------------------------
+
+    def repository(self, full_repo: str) -> dict:
+        """The repo itself; the dreamer reads its ``default_branch``."""
+        return self._get(f"/repos/{full_repo}")
+
+    def closed_pulls(self, full_repo: str, page: int = 1) -> list[dict]:
+        """Closed PRs, most recently updated first, one page of 100."""
+        return self._get(
+            f"/repos/{full_repo}/pulls?state=closed&sort=updated&direction=desc"
+            f"&per_page=100&page={page}"
+        )
+
+    def files(self, full_repo: str, number: int) -> list[dict]:
+        return self._get(f"/repos/{full_repo}/pulls/{number}/files?per_page=100")
+
 
 def _subject(repo: str, number: int) -> str:
     """Stable per pull request; what the dedup and the round bound key on."""
