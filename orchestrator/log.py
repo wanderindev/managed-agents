@@ -46,18 +46,30 @@ def truncate_payload(
 
     The replacement keeps the fields you actually navigate by (``type``, ``name``)
     plus a preview, so a truncated event is still identifiable rather than a hole.
+    It also keeps the accounting fields (#50): an assistant message's ``usage``
+    and ``model``, and a result event's ``usage`` and ``total_cost_usd``. The
+    largest turns are the ones a fold over the log can least afford to lose.
     """
     limit = config.MAX_PAYLOAD_BYTES if max_bytes is None else max_bytes
     encoded = json.dumps(payload, default=str)
     if len(encoded) <= limit:
         return payload
-    return {
+    replacement: dict[str, Any] = {
         "_truncated": True,
         "_original_bytes": len(encoded),
         "type": payload.get("type"),
         "name": payload.get("name"),
         "preview": encoded[: max(limit // 4, 0)],
     }
+    for key in ("usage", "total_cost_usd"):
+        if key in payload:
+            replacement[key] = payload[key]
+    message = payload.get("message")
+    if isinstance(message, dict):
+        kept = {k: message[k] for k in ("model", "usage") if k in message}
+        if kept:
+            replacement["message"] = kept
+    return replacement
 
 
 def apply_event(
