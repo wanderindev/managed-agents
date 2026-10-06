@@ -313,3 +313,26 @@ def test_a_truncated_reply_stays_bounded_and_untorn():
     assert stored["result"].startswith("line ")
     assert stored["result"].endswith("line 19999\n")
     assert len(json.dumps(stored)) < 4000
+
+
+def test_many_text_blocks_share_one_tail_budget():
+    """One budget per message, so a message of many text blocks cannot grow
+    the stub past the limit."""
+    from orchestrator.log import truncate_payload
+
+    blocks = [{"type": "text", "text": f"block {i}\n" + "y" * 5000} for i in range(10)]
+    payload = {"type": "assistant", "message": {"content": blocks}}
+
+    stored = truncate_payload(payload, max_bytes=16384)
+
+    assert len(json.dumps(stored)) < 16384
+    assert stored["message"]["content"][-1]["text"].endswith("y")
+
+
+def test_a_tail_cut_on_a_line_start_keeps_that_line():
+    from orchestrator.log import _tail
+
+    assert _tail("a\nMARK\nb", 6) == "MARK\nb"
+    assert _tail("abc\ndef", 5) == "def"
+    assert _tail("abcdef", 3) == "def"
+    assert _tail("abcd", 0) == ""

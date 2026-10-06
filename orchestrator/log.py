@@ -76,13 +76,7 @@ def truncate_payload(
     message = payload.get("message")
     if isinstance(message, dict):
         kept = {k: message[k] for k in ("model", "usage") if k in message}
-        texts = [
-            {"type": "text", "text": _tail(block["text"], tail)}
-            for block in message.get("content") or []
-            if isinstance(block, dict)
-            and block.get("type") == "text"
-            and isinstance(block.get("text"), str)
-        ]
+        texts = _text_tails(message.get("content") or [], tail)
         if texts:
             kept["content"] = texts
         if kept:
@@ -90,11 +84,39 @@ def truncate_payload(
     return replacement
 
 
+def _text_tails(content: list[Any], budget: int) -> list[dict[str, str]]:
+    """The text blocks' tails, sharing one budget spent from the last block back.
+
+    One budget for the message, not one per block, so a message of many text
+    blocks still yields a bounded stub.
+    """
+    texts = [
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+    kept: list[dict[str, str]] = []
+    for text in reversed(texts):
+        if budget <= 0:
+            break
+        piece = _tail(text, budget)
+        budget -= len(piece)
+        if piece:
+            kept.insert(0, {"type": "text", "text": piece})
+    return kept
+
+
 def _tail(text: str, size: int) -> str:
     """The last ``size`` characters, cut at a line start so no line is torn."""
     if len(text) <= size:
         return text
-    cut = text[-size:] if size else ""
+    if size <= 0:
+        return ""
+    if text[-size - 1] == "\n":
+        return text[-size:]
+    cut = text[-size:]
     newline = cut.find("\n")
     return cut[newline + 1 :] if newline >= 0 else cut
 
