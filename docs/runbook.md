@@ -168,6 +168,29 @@ set -a; . /srv/orchestrator.env; set +a
 is also safe: the loop is built to be resumed, and the first tick of the next
 process reconciles whatever it inherits.
 
+### Cron
+
+```
+*/5 * * * * /home/wanderindev/bin/orch-loop-keepalive.sh
+5 * * * *   /home/wanderindev/bin/orch-run.sh orchestrator.poll
+15 4 * * 1  /home/wanderindev/bin/orch-run.sh orchestrator.dream
+```
+
+`orch-loop-keepalive.sh` (versioned in `scripts/`, installed by copying it to
+`~/bin/`) starts the loop when none is running, logging to
+`~/logs/orchestrator-main.log` and `~/logs/keepalive.log`. To restart the loop
+onto new code, `kill` it and wait for the next 5-minute mark. `orch-run.sh`
+(host only) runs a one-shot module with the env loaded, logging to
+`~/logs/<module>.log`.
+
+Keepalive decides "running" by matching the loop **process**: argv[0] a
+python binary, relative or absolute, then `-m orchestrator.main`. It used to
+match any command line containing `orchestrator.main`, so an ssh/bash wait
+loop that named the module kept the real loop down for 20 minutes (#72).
+When you wait for a restart, don't put `orchestrator.main` in a remote
+`bash -c` command. The current script ignores such commands, but an older
+copy still on the host would not.
+
 Enqueue an end-to-end check:
 
 ```python
@@ -249,10 +272,25 @@ verbatim into `docs/claude/<topic>.md` and leaves a stub (heading, "read it
 first", the main traps) — the panama-in-context pattern — keeping
 cross-cutting rules in CLAUDE.md. Those files are the only thing besides
 CLAUDE.md a dream may edit. The check is also code: after the run the runner
-measures CLAUDE.md as committed at the workspace's HEAD and records it as
-`claude_md_chars` in the result; still over the limit parks the run
-AWAITING_HUMAN (email subject "CLAUDE.md still N chars, over the limit"),
+measures CLAUDE.md as committed at the workspace's HEAD (`claude_md_chars`)
+and at `origin/<base>` (`claude_md_chars_base`), and counts the run's
+non-merge commits ahead of `origin/<base>` (`commits_ahead`) and on no
+remote-tracking ref (`commits_unpushed`), all written into the result (the base
+is recorded in the clone's git config as `orchestrator.base`). What counts is
+what landed: HEAD's size when a PR carries the commits (`pr_url`, or the open
+memory PR the run reused), the base's otherwise. Still over the limit parks the
+run AWAITING_HUMAN (email subject "CLAUDE.md still N chars, over the limit"),
 whatever the outcome, CLEAN and NO_CHANGE included.
+
+**Commits that went nowhere (#67).** A split committed at HEAD but whose push
+or `gh pr create` failed used to pass the guard and complete as CLEAN, leaving
+the base over the limit and nobody told. Now any unpushed commit, or commits
+ahead of the base with no PR to carry them, park the run whatever the outcome
+("N dream commit(s) never reached GitHub" / "... pushed but no pull request
+carries them"). Merge commits are not counted: an open-PR dream merges
+`origin/<base>` in first, and a NO_CHANGE run then pushes nothing by design.
+The unpushed count trusts `origin/<branch>`, which only a `git push origin`
+moves — a push to a bare URL would look unpushed and park (safe side).
 
 Where 40,000 comes from: Claude Code's own "Large CLAUDE.md will impact
 performance (N chars > LIMIT)" warning. In the CLI bundle (2.1.289) the
