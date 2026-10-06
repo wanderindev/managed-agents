@@ -229,6 +229,45 @@ def test_an_enormous_event_is_truncated_but_stays_identifiable(conn):
     assert stored["preview"]
 
 
+def test_a_truncated_assistant_turn_keeps_its_usage_and_model():
+    """#50: accounting is a fold over the log, so dropping usage would silently
+    undercount exactly the largest turns."""
+    from orchestrator.log import truncate_payload
+
+    usage = {"input_tokens": 12, "output_tokens": 3400, "cache_read_tokens": 90}
+    payload = {
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-5-5",
+            "usage": usage,
+            "content": "x" * 200_000,
+        },
+    }
+
+    stored = truncate_payload(payload)
+
+    assert stored["_truncated"] is True
+    assert stored["message"] == {"model": "claude-opus-5-5", "usage": usage}
+
+
+def test_a_truncated_result_event_keeps_its_totals():
+    from orchestrator.log import truncate_payload
+
+    payload = {
+        "type": "result",
+        "result": "x" * 200_000,
+        "usage": {"output_tokens": 9000},
+        "total_cost_usd": 4.2,
+    }
+
+    stored = truncate_payload(payload)
+
+    assert stored["_truncated"] is True
+    assert stored["usage"] == {"output_tokens": 9000}
+    assert stored["total_cost_usd"] == 4.2
+    assert "message" not in stored
+
+
 def test_a_normal_event_is_stored_verbatim(conn):
     from orchestrator.log import truncate_payload
 
