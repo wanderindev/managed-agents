@@ -5,6 +5,8 @@ successfully would have been abandoned and retried. "Not running any more" cover
 three different situations and only one of them deserves a retry.
 """
 
+import json
+
 import pytest
 
 from orchestrator.enums import EventType, Outcome, RunStatus
@@ -294,3 +296,20 @@ def test_the_smoke_job_asks_for_a_structured_result(conn):
     spec = jobs.build_spec(run)
     assert "result.json" in spec.prompt
     assert spec.repo == ""
+
+
+def test_a_truncated_reply_stays_bounded_and_untorn():
+    """The kept tail starts on a line boundary and keeps the stub well under
+    the limit, so a long reply cannot make truncation pointless."""
+    from orchestrator.log import truncate_payload
+
+    payload = {
+        "type": "result",
+        "result": "".join(f"line {i}\n" for i in range(20_000)),
+    }
+
+    stored = truncate_payload(payload, max_bytes=4000)
+
+    assert stored["result"].startswith("line ")
+    assert stored["result"].endswith("line 19999\n")
+    assert len(json.dumps(stored)) < 4000
