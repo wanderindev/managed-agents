@@ -453,6 +453,137 @@ def test_an_oversized_dream_emails_the_size(conn):
     assert "CLAUDE.md still 52,000 chars" in sent[0].subject
 
 
+# --- commits that never landed (#67) --------------------------------------------
+
+
+def test_a_split_whose_push_failed_parks_on_the_base_size(conn):
+    """HEAD has the split, the base does not: CLEAN with nothing to show for it
+    is exactly the run that used to complete quietly."""
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "CLEAN",
+            "applied": [],
+            "flagged": [],
+            "claude_md_chars": 31_000,
+            "claude_md_chars_base": 52_000,
+            "commits_ahead": 1,
+            "commits_unpushed": 1,
+        },
+    )
+    gate = decision.human_gate
+    assert gate is not None
+    assert "1 dream commit(s) never reached GitHub" in gate["why"]
+    assert "CLAUDE.md still 52,000 chars" in gate["why"]
+    assert gate["claude_md_chars"] == 52_000
+    assert gate["commits_unpushed"] == 1
+
+
+def test_a_split_pushed_without_a_pr_parks_on_the_base_size(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "FINDINGS",
+            "applied": [{"class": "SIZE", "claim": "Blog", "edit": "moved"}],
+            "flagged": [],
+            "claude_md_chars": 31_000,
+            "claude_md_chars_base": 52_000,
+            "commits_ahead": 2,
+            "commits_unpushed": 0,
+        },
+    )
+    gate = decision.human_gate
+    assert gate is not None
+    assert "2 dream commit(s) pushed but no pull request carries them" in gate["why"]
+    assert "CLAUDE.md still 52,000 chars" in gate["why"]
+    assert gate["commits_ahead"] == 2
+
+
+def test_unlanded_commits_park_even_under_the_limit(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "CLEAN",
+            "claude_md_chars": 9_000,
+            "claude_md_chars_base": 9_000,
+            "commits_ahead": 1,
+            "commits_unpushed": 1,
+        },
+    )
+    gate = decision.human_gate
+    assert gate["why"] == "1 dream commit(s) never reached GitHub"
+    assert "claude_md_chars" not in gate
+
+
+def test_a_pr_carrying_the_split_is_measured_at_head(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "FINDINGS",
+            "pr_url": "https://github.com/x/pull/9",
+            "claude_md_chars": 31_000,
+            "claude_md_chars_base": 52_000,
+            "commits_ahead": 1,
+            "commits_unpushed": 0,
+        },
+    )
+    assert decision.human_gate["why"] == "memory audit found issues to review"
+
+
+def test_clean_with_no_commits_still_completes_quietly(conn):
+    decision = jobs.followups(
+        dream_run(conn),
+        {
+            "outcome": "CLEAN",
+            "applied": [],
+            "flagged": [],
+            "claude_md_chars": 30_000,
+            "claude_md_chars_base": 30_000,
+            "commits_ahead": 0,
+            "commits_unpushed": 0,
+        },
+    )
+    assert decision.human_gate is None and decision.enqueue == ()
+
+
+def test_no_change_on_an_open_pr_stays_quiet(conn):
+    """The open PR's branch is ahead of the base, and the run's merge of
+    origin/<base> is never pushed (NO_CHANGE pushes nothing); the runner skips
+    merge commits, and the open PR carries the rest."""
+    earlier = dreamed(conn)
+    run = dream_run(conn, open_pr=pull(167, head=f"agent/run-{earlier}"))
+    decision = jobs.followups(
+        run,
+        {
+            "outcome": "NO_CHANGE",
+            "flagged": [{"class": "DELETION", "claim": "/search row"}],
+            "claude_md_chars": 31_000,
+            "claude_md_chars_base": 52_000,
+            "commits_ahead": 3,
+            "commits_unpushed": 0,
+        },
+    )
+    assert decision.human_gate is None and decision.enqueue == ()
+
+
+def test_new_commits_on_an_open_pr_that_never_pushed_park(conn):
+    earlier = dreamed(conn)
+    run = dream_run(conn, open_pr=pull(167, head=f"agent/run-{earlier}"))
+    decision = jobs.followups(
+        run,
+        {
+            "outcome": "FINDINGS",
+            "claude_md_chars": 31_000,
+            "claude_md_chars_base": 52_000,
+            "commits_ahead": 4,
+            "commits_unpushed": 1,
+        },
+    )
+    why = decision.human_gate["why"]
+    assert "1 dream commit(s) never reached GitHub" in why
+    assert "CLAUDE.md still 52,000 chars" in why
+
+
 # --- the emails -----------------------------------------------------------------
 
 
