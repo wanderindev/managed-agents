@@ -188,12 +188,16 @@ DREAM_CLAUDE_MD_MAX_CHARS = int(
 
 #: What the App is supposed to be able to reach. Used only to warn when setup
 #: granted more than intended; nothing enforces it here, GitHub does. The
-#: dream list is declared intent too, so its repos are expected.
+#: dream list is declared intent too, so its repos are expected. The change-
+#: request poll (#10) walks this list, so every repo Sentry triage can open a PR
+#: in (sources/sentry.PROJECT_REPOS; a test keeps the two in step) is here.
 GITHUB_EXPECTED_REPOS = tuple(
     dict.fromkeys(
         (
             "wanderindev/feliu-dev",
             "wanderindev/panama-in-context",
+            "wanderindev/atelier-loyalty-app",
+            "wanderindev/atelier-new-cli",
             *(f"wanderindev/{name}" for name in DREAM_REPOS),
         )
     )

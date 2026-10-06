@@ -21,7 +21,8 @@ work source  ->  agent_runs (queue)  ->  sandbox container  ->  artifact  ->  ad
 ```
 
 Three workloads run through the loop today. Sentry triage polls unresolved
-issues on `feliu-dev` and `panama-in-context`, investigates in a sandbox, and
+issues on `feliu-dev`, `panama-in-context`, `atelier-loyalty-app` and the
+storefront theme (`atelier-new-cli`), investigates in a sandbox, and
 lands one of three verdicts: a fix with a failing-then-passing test and a draft
 PR, `NOT_A_BUG` with evidence, or `NEEDS_HUMAN` with a brief. Every FIX is
 attacked by a fresh-context adversarial reviewer that must return STANDS before
