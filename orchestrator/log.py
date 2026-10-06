@@ -49,27 +49,76 @@ def truncate_payload(
     It also keeps the accounting fields (#50): an assistant message's ``usage``
     and ``model``, and a result event's ``usage`` and ``total_cost_usd``. The
     largest turns are the ones a fold over the log can least afford to lose.
+
+    And it keeps the tail of the agent's own words (#77): a result event's
+    ``result`` and an assistant message's text blocks, in the same shape, so
+    ``jobs.stage_markers`` still finds a ``STAGE_COMPLETED`` line that closes a
+    long reply. Tool calls and thinking are what blow the limit in practice,
+    and they are still dropped.
     """
     limit = config.MAX_PAYLOAD_BYTES if max_bytes is None else max_bytes
     encoded = json.dumps(payload, default=str)
     if len(encoded) <= limit:
         return payload
+    tail = max(limit // 4, 0)
     replacement: dict[str, Any] = {
         "_truncated": True,
         "_original_bytes": len(encoded),
         "type": payload.get("type"),
         "name": payload.get("name"),
-        "preview": encoded[: max(limit // 4, 0)],
+        "preview": encoded[:tail],
     }
     for key in ("usage", "total_cost_usd"):
         if key in payload:
             replacement[key] = payload[key]
+    if isinstance(payload.get("result"), str):
+        replacement["result"] = _tail(payload["result"], tail)
     message = payload.get("message")
     if isinstance(message, dict):
         kept = {k: message[k] for k in ("model", "usage") if k in message}
+        texts = _text_tails(message.get("content") or [], tail)
+        if texts:
+            kept["content"] = texts
         if kept:
             replacement["message"] = kept
     return replacement
+
+
+def _text_tails(content: list[Any], budget: int) -> list[dict[str, str]]:
+    """The text blocks' tails, sharing one budget spent from the last block back.
+
+    One budget for the message, not one per block, so a message of many text
+    blocks still yields a bounded stub.
+    """
+    texts = [
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+    kept: list[dict[str, str]] = []
+    for text in reversed(texts):
+        if budget <= 0:
+            break
+        piece = _tail(text, budget)
+        budget -= len(piece)
+        if piece:
+            kept.insert(0, {"type": "text", "text": piece})
+    return kept
+
+
+def _tail(text: str, size: int) -> str:
+    """The last ``size`` characters, cut at a line start so no line is torn."""
+    if len(text) <= size:
+        return text
+    if size <= 0:
+        return ""
+    if text[-size - 1] == "\n":
+        return text[-size:]
+    cut = text[-size:]
+    newline = cut.find("\n")
+    return cut[newline + 1 :] if newline >= 0 else cut
 
 
 def apply_event(

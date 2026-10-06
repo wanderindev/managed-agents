@@ -96,6 +96,47 @@ def test_an_unmarked_transcript_yields_nothing():
     assert jobs.stage_markers([assistant("just prose"), {"type": "system"}]) == []
 
 
+def test_a_marker_closing_a_truncated_reply_survives_the_log():
+    """#77: the log truncates oversized events before they are stored, and a
+    long final summary is exactly where an agent prints its last marker."""
+    from orchestrator.log import truncate_payload
+
+    marker = 'STAGE_COMPLETED {"stage": "pr_opened", "pr_url": "https://x.invalid/1"}'
+    prose = "a line of summary\n" * 12_000
+    stored = [
+        truncate_payload(assistant(prose + marker)),
+        truncate_payload({"type": "result", "result": prose + marker}),
+    ]
+
+    assert all(s["_truncated"] for s in stored)
+    for event in stored:
+        assert [s["stage"] for s in jobs.stage_markers([event])] == ["pr_opened"]
+
+
+def test_a_truncated_tool_call_keeps_no_text():
+    """The common case in production: a huge Write input. Nothing of it is the
+    agent's own words, so nothing of it may yield a marker."""
+    from orchestrator.log import truncate_payload
+
+    payload = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "Write",
+                    "input": {"content": 'STAGE_COMPLETED {"stage": "x"}\n' * 9000},
+                }
+            ]
+        },
+    }
+
+    stored = truncate_payload(payload)
+
+    assert "message" not in stored
+    assert jobs.stage_markers([stored]) == []
+
+
 # --- the prompts instruct the markers -----------------------------------------
 
 
