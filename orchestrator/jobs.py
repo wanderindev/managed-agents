@@ -1273,14 +1273,44 @@ def _resumed(run: Run, spec: JobSpec) -> JobSpec:
     )
 
 
-def _claude_md_oversize(result: dict) -> str | None:
+def _dream_unlanded(run: Run, result: dict) -> str | None:
+    """Why a dream's commits reached no pull request, or None when they did.
+
+    The counts are written by the runner after the run (``DockerRunner
+    finish``), never by the dreamer. Commits that never left the workspace
+    went nowhere; commits ahead of the base with neither a ``pr_url`` nor an
+    open PR to carry them are a push or ``gh pr create`` that failed (#67).
+    Absent counts (a run before #67) mean nothing to judge.
+    """
+    unpushed = result.get("commits_unpushed")
+    if isinstance(unpushed, int) and unpushed > 0:
+        return f"{unpushed} dream commit(s) never reached GitHub"
+    ahead = result.get("commits_ahead")
+    carried = result.get("pr_url") or (run.payload or {}).get("open_pr")
+    if isinstance(ahead, int) and ahead > 0 and not carried:
+        return f"{ahead} dream commit(s) pushed but no pull request carries them"
+    return None
+
+
+def _claude_md_landed_chars(result: dict, *, carried: bool) -> int | None:
+    """CLAUDE.md's size where it counts: on the PR when one carries the run's
+    commits, otherwise on the base branch — HEAD alone can hold a split that
+    never reached the remote (#67). Falls back to HEAD when the base was not
+    measured (a run before #67, or no CLAUDE.md on the base)."""
+    head = result.get("claude_md_chars")
+    base = result.get("claude_md_chars_base")
+    if carried or not isinstance(base, int):
+        return head if isinstance(head, int) else None
+    return base
+
+
+def _claude_md_oversize(chars: int | None) -> str | None:
     """Why a dream's CLAUDE.md is still too large, or None when it is not.
 
-    ``claude_md_chars`` is written by the runner after the run, never by the
-    dreamer (``DockerRunner.finish`` overwrites it). Absent means the repo has
-    no CLAUDE.md, or the run predates #61: nothing to guard.
+    The sizes are written by the runner after the run, never by the dreamer
+    (``DockerRunner.finish`` overwrites them). Absent means the repo has no
+    CLAUDE.md, or the run predates #61: nothing to guard.
     """
-    chars = result.get("claude_md_chars")
     limit = config.DREAM_CLAUDE_MD_MAX_CHARS
     if not isinstance(chars, int) or chars <= limit:
         return None
@@ -1391,23 +1421,30 @@ def followups(run: Run, result: dict | None) -> Followups:
         )
 
     if run.kind == DREAM_KIND:
+        # Commits that reached no PR are a failure whatever the outcome says
+        # (#67): a push or `gh pr create` broke, and the edits went nowhere.
+        unlanded = _dream_unlanded(run, result)
+        carried = not unlanded and bool(result.get("pr_url") or payload.get("open_pr"))
         # The size guard (#61) is checked in code, not taken on the dreamer's
-        # word: the runner measured CLAUDE.md at the workspace's HEAD after the
-        # run. Still over the limit parks whatever the outcome — CLEAN and
-        # NO_CHANGE included — because a memory file Claude Code warns about
-        # is a problem nobody fixed, and completing quietly would hide it.
-        oversize = _claude_md_oversize(result)
+        # word: the runner measured CLAUDE.md after the run, at HEAD and at
+        # origin/<base>, and what counts is what landed — HEAD when a PR
+        # carries it, the base otherwise. Still over the limit parks whatever
+        # the outcome — CLEAN and NO_CHANGE included — because a memory file
+        # Claude Code warns about is a problem nobody fixed, and completing
+        # quietly would hide it.
+        chars = _claude_md_landed_chars(result, carried=carried)
+        oversize = _claude_md_oversize(chars)
         # A run that only re-verified an open PR has nothing new to say, and
         # parking it would re-park the same findings every week for as long as
         # the PR sits unmerged — the noise that trains a human to ignore the
         # mailbox. The comment it left on the PR is the whole notification.
-        if result.get("outcome") == "NO_CHANGE" and not oversize:
+        if result.get("outcome") == "NO_CHANGE" and not oversize and not unlanded:
             return Followups()
         # Anything worth a human's eyes — a PR of safe edits, or flags that
         # must never be auto-applied — parks the run; #9 emails the report.
         # CLEAN completes quietly and the notifier says so once.
-        if result.get("flagged") or result.get("pr_url") or oversize:
-            whys = [oversize] if oversize else []
+        if result.get("flagged") or result.get("pr_url") or oversize or unlanded:
+            whys = [w for w in (unlanded, oversize) if w]
             if result.get("outcome") != "NO_CHANGE" and (
                 result.get("flagged") or result.get("pr_url")
             ):
@@ -1419,8 +1456,12 @@ def followups(run: Run, result: dict | None) -> Followups:
                 "pr_url": result.get("pr_url"),
                 "flagged": result.get("flagged") or [],
             }
+            if unlanded:
+                for key in ("commits_ahead", "commits_unpushed"):
+                    if key in result:
+                        gate[key] = result[key]
             if oversize:
-                gate["claude_md_chars"] = result["claude_md_chars"]
+                gate["claude_md_chars"] = chars
                 gate["claude_md_max_chars"] = config.DREAM_CLAUDE_MD_MAX_CHARS
             return Followups(human_gate=gate)
         return Followups()

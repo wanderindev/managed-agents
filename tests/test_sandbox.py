@@ -10,7 +10,13 @@ import pytest
 
 from orchestrator.enums import Outcome, RunStatus
 from orchestrator.queue import Run
-from orchestrator.sandbox import PROMPT_FILENAME, RESULT_FILENAME, DockerRunner, JobSpec
+from orchestrator.sandbox import (
+    BASE_CONFIG_KEY,
+    PROMPT_FILENAME,
+    RESULT_FILENAME,
+    DockerRunner,
+    JobSpec,
+)
 from tests.fakes import FakeCommands
 
 
@@ -423,6 +429,181 @@ def test_no_claude_md_or_no_result_means_no_measurement(roots):
 
     assert runner.finish(run, "ma-run-1-1").result == {"outcome": "FIX"}
     assert not commands.commands("show")
+
+
+# --- where the commits landed (#67) -------------------------------------------
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@x",
+            "-c",
+            "init.defaultBranch=main",
+            *args,
+        ],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _commit(cwd, text, message):
+    (cwd / "CLAUDE.md").write_text(text)
+    _git(cwd, "commit", "-qam", message)
+
+
+@pytest.fixture()
+def dream_workspace(roots, tmp_path):
+    """A real clone of a bare 'GitHub', cut the way _make_workspace cuts it:
+    origin/main measured, the run's branch checked out from it."""
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "-q", "--bare", str(remote))
+    seed = tmp_path / "seed"
+    _git(tmp_path, "init", "-q", str(seed))
+    (seed / "CLAUDE.md").write_text("x" * 52)
+    _git(seed, "add", "CLAUDE.md")
+    _git(seed, "commit", "-qm", "seed")
+    _git(seed, "push", "-q", str(remote), "HEAD:refs/heads/main")
+
+    from orchestrator.sandbox import _run_command
+
+    runner = DockerRunner(
+        lambda run: JobSpec(prompt="p", repo="feliu-dev", base_branch="main"),
+        run_command=_run_command,
+        **roots,
+    )
+    run = make_run()
+    workspace = runner.workspace_path(run)
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    _git(tmp_path, "clone", "-q", str(remote), str(workspace))
+    _git(workspace, "checkout", "-q", "-b", "agent/run-1", "origin/main")
+    _git(workspace, "config", BASE_CONFIG_KEY, "main")
+    return runner, run, workspace
+
+
+def test_a_commit_that_never_pushed_is_counted(dream_workspace):
+    runner, run, workspace = dream_workspace
+    _commit(workspace, "x" * 31, "split")
+
+    assert runner._landing(run) == {
+        "claude_md_chars_base": 52,
+        "commits_ahead": 1,
+        "commits_unpushed": 1,
+    }
+
+
+def test_a_pushed_commit_is_not_unpushed(dream_workspace):
+    runner, run, workspace = dream_workspace
+    _commit(workspace, "x" * 31, "split")
+    _git(workspace, "push", "-q", "-u", "origin", "agent/run-1")
+
+    landing = runner._landing(run)
+    assert landing["commits_ahead"] == 1
+    assert landing["commits_unpushed"] == 0
+
+
+def test_an_unpushed_merge_of_the_base_is_not_a_dream_commit(dream_workspace):
+    """An open PR's NO_CHANGE run merges origin/<base> in and pushes nothing."""
+    runner, run, workspace = dream_workspace
+    _commit(workspace, "x" * 31, "split")
+    _git(workspace, "push", "-q", "-u", "origin", "agent/run-1")
+    _git(workspace, "checkout", "-q", "main")
+    (workspace / "other.txt").write_text("moved on")
+    _git(workspace, "add", "other.txt")
+    _git(workspace, "commit", "-qm", "base moves")
+    _git(workspace, "push", "-q", "origin", "main")
+    _git(workspace, "checkout", "-q", "agent/run-1")
+    _git(workspace, "merge", "-q", "--no-edit", "origin/main")
+
+    landing = runner._landing(run)
+    assert landing["commits_unpushed"] == 0
+    assert landing["commits_ahead"] == 1
+
+
+def test_the_workspace_records_its_base_for_finish(roots):
+    repo = roots["repos_root"] / "atelier-new-cli"
+    repo.mkdir(parents=True)
+    commands = FakeCommands()
+    spec = JobSpec(prompt="p", repo="atelier-new-cli", base_branch="master")
+    make_runner(roots, commands, spec=spec).start(make_run())
+    assert commands.commands("config", BASE_CONFIG_KEY, "master")
+
+
+def test_landing_skips_what_it_cannot_measure(roots):
+    commands = FakeCommands(
+        {
+            ("config", BASE_CONFIG_KEY): (0, "main\n", ""),
+            ("show",): (128, "", "fatal: invalid object name"),
+            ("rev-list",): (0, "not a number", ""),
+        }
+    )
+    runner = make_runner(roots, commands)
+    run = make_run()
+    assert runner._landing(run) == {}, "no workspace, no git"
+
+    (runner.workspace_path(run) / ".git").mkdir(parents=True)
+    (runner.workspace_path(run) / "CLAUDE.md").write_text("x")
+    assert runner._landing(run) == {}
+    assert commands.commands("show", "origin/main:CLAUDE.md")
+
+
+def test_landing_needs_a_recorded_base(roots):
+    """A workspace cut before #67 has no base on record: nothing to measure."""
+    commands = FakeCommands({("config", BASE_CONFIG_KEY): (1, "", "")})
+    runner = make_runner(roots, commands)
+    run = make_run()
+    (runner.workspace_path(run) / ".git").mkdir(parents=True)
+    assert runner._landing(run) == {}
+    assert not commands.commands("rev-list")
+
+
+def test_undecodable_landing_output_is_skipped(roots):
+    def run_command(argv):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    runner = DockerRunner(
+        lambda run: JobSpec(prompt="p"), run_command=run_command, **roots
+    )
+    run = make_run()
+    (runner.workspace_path(run) / ".git").mkdir(parents=True)
+    assert runner._landing(run) == {}
+
+
+def test_finish_records_where_the_commits_landed(roots):
+    commands = FakeCommands(
+        {
+            ("inspect",): (0, "0\n", ""),
+            ("logs",): (0, "", ""),
+            ("show", "HEAD:CLAUDE.md"): (0, "x" * 31, ""),
+            ("show", "origin/main:CLAUDE.md"): (0, "x" * 52, ""),
+            ("rev-list", "origin/main"): (0, "2\n", ""),
+            ("rev-list", "--remotes"): (0, "1\n", ""),
+            ("config", BASE_CONFIG_KEY): (0, "main\n", ""),
+        }
+    )
+    repo = roots["repos_root"] / "feliu-dev"
+    repo.mkdir(parents=True)
+    runner = make_runner(roots, commands, spec=JobSpec(prompt="p", repo="feliu-dev"))
+    run = make_run()
+    runner.start(run)
+    (runner.workspace_path(run) / ".git").mkdir(parents=True)
+    (runner.workspace_path(run) / "CLAUDE.md").write_text("x" * 31)
+    (runner.job_path(run) / RESULT_FILENAME).write_text(
+        '{"outcome": "CLEAN", "commits_unpushed": 0}'
+    )
+
+    assert runner.finish(run, "ma-run-1-1").result == {
+        "outcome": "CLEAN",
+        "claude_md_chars": 31,
+        "claude_md_chars_base": 52,
+        "commits_ahead": 2,
+        "commits_unpushed": 1,
+    }
 
 
 def test_finish_tolerates_an_unparseable_result_file(roots):
