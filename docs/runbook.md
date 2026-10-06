@@ -168,6 +168,29 @@ set -a; . /srv/orchestrator.env; set +a
 is also safe: the loop is built to be resumed, and the first tick of the next
 process reconciles whatever it inherits.
 
+### Cron
+
+```
+*/5 * * * * /home/wanderindev/bin/orch-loop-keepalive.sh
+5 * * * *   /home/wanderindev/bin/orch-run.sh orchestrator.poll
+15 4 * * 1  /home/wanderindev/bin/orch-run.sh orchestrator.dream
+```
+
+`orch-loop-keepalive.sh` (versioned in `scripts/`, installed by copying it to
+`~/bin/`) starts the loop when none is running, logging to
+`~/logs/orchestrator-main.log` and `~/logs/keepalive.log`. To restart the loop
+onto new code, `kill` it and wait for the next 5-minute mark. `orch-run.sh`
+(host only) runs a one-shot module with the env loaded, logging to
+`~/logs/<module>.log`.
+
+Keepalive decides "running" by matching the loop **process**: argv[0] a
+python binary, relative or absolute, then `-m orchestrator.main`. It used to
+match any command line containing `orchestrator.main`, so an ssh/bash wait
+loop that named the module kept the real loop down for 20 minutes (#72).
+When you wait for a restart, don't put `orchestrator.main` in a remote
+`bash -c` command. The current script ignores such commands, but an older
+copy still on the host would not.
+
 Enqueue an end-to-end check:
 
 ```python
