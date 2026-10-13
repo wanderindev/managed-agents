@@ -1,0 +1,339 @@
+"""Configuration, read from the environment.
+
+No settings framework. There are four values.
+"""
+
+import os
+
+#: DSN for the log database. Its own database on the managed Postgres instance,
+#: never inside feliudev or PIC's database.
+DATABASE_URL = os.environ.get(
+    "ORCHESTRATOR_DATABASE_URL",
+    "postgresql://orchestrator:localdev@localhost:5433/orchestrator",
+)
+
+#: The managed instance is 2GB / 50 connections, and feliu + PIC pools were
+#: already trimmed to 2/3 to fit. Stay small so this does not eat the headroom.
+DB_POOL_MAX = int(os.environ.get("ORCHESTRATOR_DB_POOL_MAX", "2"))
+
+#: How many runs may be in flight. Deliberately 1 to start: the point is the
+#: loop, not throughput.
+MAX_CONCURRENT_RUNS = int(os.environ.get("ORCHESTRATOR_MAX_CONCURRENT_RUNS", "1"))
+
+#: Identifies this orchestrator process in ``agent_runs.worker_id``, so a
+#: reconcile pass can tell its own abandoned leases from someone else's.
+WORKER_ID = os.environ.get("ORCHESTRATOR_WORKER_ID", "orchestrator-1")
+
+#: Seconds a lease is valid for. The heartbeat extends it every tick while the
+#: sandbox is alive, so this only has to outlast one tick plus slack. Its real
+#: job is bounding how long a run stays stuck after the *orchestrator* dies,
+#: because then nobody is heartbeating and nothing can ask the container.
+LEASE_SECONDS = int(os.environ.get("ORCHESTRATOR_LEASE_SECONDS", "300"))
+
+#: How long between ticks.
+TICK_SECONDS = int(os.environ.get("ORCHESTRATOR_TICK_SECONDS", "15"))
+
+#: How many times a run may be leased before it is given up on. A run that dies
+#: three times is an infrastructure problem, and retrying it a fourth time just
+#: burns tokens on the same failure.
+MAX_ATTEMPTS = int(os.environ.get("ORCHESTRATOR_MAX_ATTEMPTS", "3"))
+
+#: Base delay before a requeued run may be claimed again, doubling per attempt.
+#: Without it, three 15-second ticks exhaust every attempt in ~45 seconds, which
+#: turns transient problems (a daemon mid-restart, a Postgres failover) into
+#: permanent give-ups. See ``loop.backoff_delay``.
+BACKOFF_BASE_SECONDS = int(os.environ.get("ORCHESTRATOR_BACKOFF_BASE_SECONDS", "60"))
+
+#: Ceiling on the computed backoff. A known-better wait (a rate limit's reset
+#: time) is passed explicitly and is not subject to this.
+BACKOFF_CEILING_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_BACKOFF_CEILING_SECONDS", "3600")
+)
+
+# --- sandbox -----------------------------------------------------------------
+
+SANDBOX_IMAGE = os.environ.get(
+    "ORCHESTRATOR_SANDBOX_IMAGE", "managed-agents/sandbox:latest"
+)
+
+#: Host clones live here; each job gets a standalone local clone off one of
+#: them (`git clone --local`, so the objects are hardlinked and cheap). Not a
+#: worktree: a worktree's .git links into the parent's .git on the *host*, a
+#: path never mounted into the sandbox, which left git dead in /workspace (#33).
+REPOS_ROOT = os.environ.get("ORCHESTRATOR_REPOS_ROOT", "/srv/repos")
+#: Named for the worktree era (#33 replaced worktrees with clones); the env var
+#: and the /srv/worktrees directory keep their names so nothing redeploys.
+WORKTREES_ROOT = os.environ.get("ORCHESTRATOR_WORKTREES_ROOT", "/srv/worktrees")
+
+#: Where each job clone's `origin` points, so commits push straight to GitHub
+#: rather than at the parent clone on the host.
+GITHUB_REMOTE_BASE = os.environ.get(
+    "ORCHESTRATOR_GITHUB_REMOTE_BASE", "https://github.com/wanderindev"
+)
+
+#: Per-job scratch, mounted at /work. The prompt goes here rather than into the
+#: repo, so a job cannot accidentally commit its own instructions.
+JOBS_ROOT = os.environ.get("ORCHESTRATOR_JOBS_ROOT", "/srv/jobs")
+
+CLAUDE_CREDENTIALS = os.environ.get(
+    "ORCHESTRATOR_CLAUDE_CREDENTIALS", "/home/wanderindev/.claude/.credentials.json"
+)
+
+#: Wall clock, enforced inside the container. Never an event count: a healthy
+#: long research run emits few events, and a stuck one can emit thousands.
+SANDBOX_TIMEOUT_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_SANDBOX_TIMEOUT_SECONDS", "1800")
+)
+
+SANDBOX_MEMORY = os.environ.get("ORCHESTRATOR_SANDBOX_MEMORY", "3g")
+SANDBOX_MEMORY_SWAP = os.environ.get("ORCHESTRATOR_SANDBOX_MEMORY_SWAP", "4g")
+
+#: Hands the job the host's Docker daemon so it can run testcontainers suites.
+#: Off by default: with it on the container stops being a security boundary.
+SANDBOX_WITH_DOCKER = os.environ.get("ORCHESTRATOR_SANDBOX_WITH_DOCKER", "0") == "1"
+
+#: Ceiling on one event's payload. One runaway tool result must not be able to
+#: bloat the log, and nothing downstream reads a 2MB payload usefully anyway.
+MAX_PAYLOAD_BYTES = int(os.environ.get("ORCHESTRATOR_MAX_PAYLOAD_BYTES", "16384"))
+
+# --- sentry work source (#6) -------------------------------------------------
+
+#: A Sentry auth token with event:read and org:read. Created by hand in the
+#: Sentry UI; there is no API for minting one.
+SENTRY_TOKEN = os.environ.get("ORCHESTRATOR_SENTRY_TOKEN", "")
+SENTRY_ORG = os.environ.get("ORCHESTRATOR_SENTRY_ORG", "javier-feliu")
+
+#: Region URL, not sentry.io. The org lives in the US region and the API rejects
+#: a request sent to the wrong one.
+SENTRY_BASE_URL = os.environ.get("ORCHESTRATOR_SENTRY_BASE_URL", "https://us.sentry.io")
+
+#: 1, not 2: these are low-traffic personal sites where a single occurrence
+#: is already signal. See Filters.min_events.
+SENTRY_MIN_EVENTS = int(os.environ.get("ORCHESTRATOR_SENTRY_MIN_EVENTS", "1"))
+SENTRY_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_SENTRY_MAX_PER_POLL", "5"))
+SENTRY_COOLDOWN_DAYS = int(os.environ.get("ORCHESTRATOR_SENTRY_COOLDOWN_DAYS", "7"))
+
+#: Lookback for the issue query. An issue whose last event is older than this is
+#: invisible to the poll, however real it is, so this is a scope decision rather
+#: than a tuning knob.
+SENTRY_STATS_PERIOD = os.environ.get("ORCHESTRATOR_SENTRY_STATS_PERIOD", "14d")
+
+# --- outcome email (#9) ------------------------------------------------------
+
+#: Where outcome emails go. Empty disables the notifier entirely (with one
+#: warning), which is the right dev default: a test loop must not email anyone.
+NOTIFY_TO = os.environ.get("ORCHESTRATOR_NOTIFY_TO", "")
+
+#: The From address. Must be a sender the SMTP relay accepts for its domain.
+NOTIFY_FROM = os.environ.get("ORCHESTRATOR_NOTIFY_FROM", "")
+
+#: Same transport PIC's email_sender.py uses: Google Workspace SMTP relay,
+#: STARTTLS, no auth — the relay trusts allowlisted droplet IPs. Reused per #9
+#: rather than adding a provider; the agents droplet's IP must be in the
+#: Workspace admin allowlist or the relay refuses.
+NOTIFY_SMTP_HOST = os.environ.get(
+    "ORCHESTRATOR_NOTIFY_SMTP_HOST", "smtp-relay.gmail.com"
+)
+NOTIFY_SMTP_PORT = int(os.environ.get("ORCHESTRATOR_NOTIFY_SMTP_PORT", "587"))
+NOTIFY_SMTP_TIMEOUT = int(os.environ.get("ORCHESTRATOR_NOTIFY_SMTP_TIMEOUT", "10"))
+
+#: Individual emails per day before the notifier switches to a single digest.
+#: Digest, not firehose — and the digest means the cap never suppresses
+#: silently.
+NOTIFY_DAILY_CAP = int(os.environ.get("ORCHESTRATOR_NOTIFY_DAILY_CAP", "10"))
+
+# --- github app (#11) --------------------------------------------------------
+
+#: Numeric App ID from the App's settings page.
+GITHUB_APP_ID = os.environ.get("ORCHESTRATOR_GITHUB_APP_ID", "")
+
+#: PEM private key, on disk rather than in the environment: it is multi-line, and
+#: a file can be chmod 600 while an env var is visible to anything that can read
+#: /proc for the process.
+GITHUB_APP_PRIVATE_KEY_PATH = os.environ.get(
+    "ORCHESTRATOR_GITHUB_APP_PRIVATE_KEY_PATH", "/srv/secrets/github-app.pem"
+)
+
+#: Which installation to mint tokens for. Discover it with
+#: `python -m orchestrator.github`.
+GITHUB_APP_INSTALLATION_ID = int(
+    os.environ.get("ORCHESTRATOR_GITHUB_APP_INSTALLATION_ID", "0")
+)
+
+#: Repos the dreaming job audits, comma-separated directory names under
+#: ``REPOS_ROOT`` (#60). When set it replaces "every repo with runs in the
+#: window": the interesting work on most of these happens interactively, which
+#: leaves no orchestrator runs behind. Each needs the GitHub App installed on it
+#: and a clone at /srv/repos/<name>; docs/runbook.md has the checklist.
+DREAM_REPOS = tuple(
+    name.strip()
+    for name in os.environ.get("ORCHESTRATOR_DREAM_REPOS", "").split(",")
+    if name.strip()
+)
+
+#: Model the dreaming job runs on (#60). An env key so that, if the sandbox
+#: CLI or the API refuses it, falling back is an env edit and a loop restart.
+DREAM_MODEL = os.environ.get("ORCHESTRATOR_DREAM_MODEL", "claude-opus-5-5")
+
+#: Largest CLAUDE.md, in characters, a dream may leave behind (#61). 40,000 is
+#: the floor of Claude Code's own "Large CLAUDE.md will impact performance"
+#: warning: the CLI (2.1.289 bundle, `y5e`) warns when one memory file's length
+#: exceeds max(40000, context window x 0.05 x chars-per-token), so 40,000 is
+#: where it warns on a 200K-context model and the one number that never warns.
+#: Over it, the dreamer moves subsystem detail into docs/claude/<topic>.md, and
+#: a dream that still leaves it over is parked for a human.
+DREAM_CLAUDE_MD_MAX_CHARS = int(
+    os.environ.get("ORCHESTRATOR_DREAM_CLAUDE_MD_MAX_CHARS", "40000")
+)
+
+#: What the App is supposed to be able to reach. Used only to warn when setup
+#: granted more than intended; nothing enforces it here, GitHub does. The
+#: dream list is declared intent too, so its repos are expected. The change-
+#: request poll (#10) walks this list, so every repo Sentry triage can open a PR
+#: in (sources/sentry.PROJECT_REPOS; a test keeps the two in step) is here.
+GITHUB_EXPECTED_REPOS = tuple(
+    dict.fromkeys(
+        (
+            "wanderindev/feliu-dev",
+            "wanderindev/panama-in-context",
+            "wanderindev/atelier-loyalty-app",
+            "wanderindev/atelier-new-cli",
+            *(f"wanderindev/{name}" for name in DREAM_REPOS),
+        )
+    )
+)
+
+# --- github change-request source (#10) --------------------------------------
+
+#: The login GitHub shows for PRs the App opens. How #10 tells this
+#: orchestrator's pull requests apart from a human's.
+GITHUB_BOT_LOGIN = os.environ.get(
+    "ORCHESTRATOR_GITHUB_BOT_LOGIN", "wanderindev-managed-agents[bot]"
+)
+
+#: Humans whose commits on an agent branch mean "hands off". Checked against
+#: commit author/committer logins, because the *positive* identity of sandbox
+#: commits is unreliable (PR #431's commit resolves to login `claude`).
+GITHUB_HUMAN_LOGINS = tuple(
+    login.strip()
+    for login in os.environ.get(
+        "ORCHESTRATOR_GITHUB_HUMAN_LOGINS", "wanderindev"
+    ).split(",")
+    if login.strip()
+)
+
+#: Revision runs one poll may enqueue. A review spree must not spawn a fleet.
+GITHUB_PR_MAX_PER_POLL = int(os.environ.get("ORCHESTRATOR_GITHUB_PR_MAX_PER_POLL", "3"))
+
+# --- series driver (#13) -------------------------------------------------------
+
+#: Scheme + host of the PIC deployment. CallSpec paths are absolute
+#: (/api/v1/...), so this is the only URL piece the driver supplies.
+PIC_API_BASE = os.environ.get(
+    "ORCHESTRATOR_PIC_API_BASE", "https://panamaincontext.com"
+)
+
+#: The long-lived service token PIC's agent-tasks router accepts (its #418).
+#: Empty disables the driver entirely.
+PIC_DRIVER_TOKEN = os.environ.get("ORCHESTRATOR_PIC_DRIVER_TOKEN", "")
+
+# --- PIC MCP (#80) -------------------------------------------------------------
+
+#: PIC's MCP endpoint (its #638). Lives on the api host, not the site host.
+PIC_MCP_URL = os.environ.get(
+    "ORCHESTRATOR_PIC_MCP_URL", "https://api.panamaincontext.com/mcp"
+)
+
+#: A read-scope PIC MCP token (``orchestrator-sandbox-read``). Handed to
+#: sandboxes working on panama-in-context as an env var only, and redacted
+#: from agent_events and emails (orchestrator/redact.py). Empty disables it:
+#: PIC jobs then run with no MCP config at all, exactly as before #80.
+PIC_MCP_READ_TOKEN = os.environ.get("ORCHESTRATOR_PIC_MCP_READ_TOKEN", "")
+
+#: A ``read,pipeline`` PIC MCP token (``orchestrator-supervisor-pipeline-2``,
+#: #84). Held by the orchestrator process only and never handed to a sandbox:
+#: the host calls ``retry_agent_task`` with it after a diagnosis recommends a
+#: retry (orchestrator/auto_retry.py). Redacted from agent_events and emails
+#: like the read token.
+PIC_MCP_PIPELINE_TOKEN = os.environ.get("ORCHESTRATOR_PIC_MCP_PIPELINE_TOKEN", "")
+
+#: HTTP timeout for one host-side MCP request (orchestrator/mcp_client.py).
+PIC_MCP_TIMEOUT_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_PIC_MCP_TIMEOUT_SECONDS", "30")
+)
+
+#: PIC's series cadence, mirrored for ``--dry-run`` only (#62): ``daily``
+#: keys goals ``daily_series:YYYY-MM-DD``, ``weekly`` keys them
+#: ``weekly_series:YYYY-Www``. PIC's ``WEEKLY_PLAN_DAILY_CADENCE`` is the
+#: source of truth (on in production since 2026-09-03); a real drive never
+#: needs this, because every claim and plan-week answer carries its goal key.
+DRIVER_CADENCE = os.environ.get("ORCHESTRATOR_DRIVER_CADENCE", "daily")
+
+#: Ceiling on tasks one drive session will execute. A week's graph is a few
+#: dozen rows; a session that hits this cap is looping, not working.
+DRIVER_MAX_TASKS = int(os.environ.get("ORCHESTRATOR_DRIVER_MAX_TASKS", "60"))
+
+#: Session failure budget. The issue's rule is "anything that fails twice
+#: becomes an email, not a retry loop"; PIC's own attempts ceiling parks
+#: individual tasks, and this bounds the session as a whole.
+DRIVER_MAX_FAILURES = int(os.environ.get("ORCHESTRATOR_DRIVER_MAX_FAILURES", "5"))
+
+#: Background-job polling cadence and patience (the 202-returning fact-check
+#: kinds). The timeout mirrors the sandbox wall clock: generous, but an ending.
+DRIVER_JOB_POLL_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_DRIVER_JOB_POLL_SECONDS", "15")
+)
+DRIVER_JOB_TIMEOUT_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_DRIVER_JOB_TIMEOUT_SECONDS", "1800")
+)
+
+#: HTTP read timeout for one task call. Some task endpoints run an LLM
+#: synchronously (generate-outlines took >60s on 2026-09-01 and the old 60s
+#: timeout killed the whole drive session); queue plumbing (claim, report,
+#: job polls) keeps the default 60s.
+DRIVER_CALL_TIMEOUT_SECONDS = int(
+    os.environ.get("ORCHESTRATOR_DRIVER_CALL_TIMEOUT_SECONDS", "600")
+)
+
+# --- pipeline supervisor (#81) ---------------------------------------------------
+
+#: Days a PIC goal may sit unchanged in the log (the driver's per-goal counts
+#: as of its latest session) before the supervisor diagnoses it as stalled.
+SUPERVISOR_STALL_DAYS = int(os.environ.get("ORCHESTRATOR_SUPERVISOR_STALL_DAYS", "3"))
+
+#: How far back the stall scan looks: a goal whose last change is older than
+#: this is history, not an incident.
+SUPERVISOR_LOOKBACK_DAYS = int(
+    os.environ.get("ORCHESTRATOR_SUPERVISOR_LOOKBACK_DAYS", "30")
+)
+
+#: How recent a drive session must be for its parked (FAILED) rows to trigger
+#: a diagnosis. Older ones are the stall scan's.
+SUPERVISOR_RECENT_HOURS = int(
+    os.environ.get("ORCHESTRATOR_SUPERVISOR_RECENT_HOURS", "48")
+)
+
+#: Most diagnoses one scan enqueues, oldest incident first.
+SUPERVISOR_MAX_PER_SCAN = int(
+    os.environ.get("ORCHESTRATOR_SUPERVISOR_MAX_PER_SCAN", "3")
+)
+
+#: The supervisor session's turn cap (claude --max-turns).
+SUPERVISOR_MAX_TURNS = int(os.environ.get("ORCHESTRATOR_SUPERVISOR_MAX_TURNS", "15"))
+
+#: Model the supervisor runs on.
+SUPERVISOR_MODEL = os.environ.get("ORCHESTRATOR_SUPERVISOR_MODEL", "claude-opus-5-5")
+
+#: The kill switch for auto-retry (#84). Off unless set to 1/true/yes/on, and
+#: inert without ``PIC_MCP_PIPELINE_TOKEN``: diagnoses then stay read-only,
+#: exactly as in phase 1. Turning it off needs an env edit and a loop restart,
+#: no deploy.
+SUPERVISOR_AUTO_RETRY = os.environ.get(
+    "ORCHESTRATOR_SUPERVISOR_AUTO_RETRY", ""
+).strip().lower() in ("1", "true", "yes", "on")
+
+#: Most ``retry_agent_task`` calls one diagnosis may make. The per-task limit
+#: (one per task per rolling 24 hours) is separate and always applies.
+SUPERVISOR_MAX_RETRIES_PER_RUN = int(
+    os.environ.get("ORCHESTRATOR_SUPERVISOR_MAX_RETRIES_PER_RUN", "3")
+)

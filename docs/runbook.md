@@ -1,0 +1,726 @@
+# Runbook
+
+How the orchestrator host and its log database were built, and the traps that
+cost time the first time. Issue #2.
+
+## Host
+
+| | |
+|---|---|
+| Droplet | `agents`, id 587510123 |
+| Address | 159.223.174.185, private 10.136.109.229 |
+| Size | `s-2vcpu-4gb`, 80GB, $24/mo |
+| Region / VPC | nyc1, `default-nyc1` |
+| Operator user | `wanderindev` (in the `docker` group) |
+
+4GB rather than 2GB because a sandbox holds Claude Code, a Postgres
+testcontainer, and a full test suite at the same time. 2GB OOMs on the first
+real run and costs more in debugging than the $12 saves.
+
+**Not** the prod `pic` droplet (474003017). That host's frontend container is the
+single nginx entry point for every site, with SSL at `/opt/letsencrypt`. Keep
+this cluster entirely separate.
+
+```bash
+scp scripts/provision-droplet.sh root@159.223.174.185:/root/
+ssh root@159.223.174.185 'bash /root/provision-droplet.sh'
+```
+
+Then, once, by hand:
+
+```bash
+ssh wanderindev@159.223.174.185
+claude          # interactive OAuth, cannot be automated
+```
+
+### Traps
+
+- **A fresh droplet holds the dpkg lock.** cloud-init is still running apt for
+  the first minute or two, so the very first provisioning run dies on "could not
+  get lock". The script now waits it out.
+- **Claude Code requires Node >= 22.** On Node 20, `npm install -g` does not
+  fail. It prints an `EBADENGINE` warning and installs the last 20-compatible
+  release instead, which strands the host on an old CLI that cannot reach
+  current models. This cost a version-mismatch investigation. Do not silence
+  npm's output here.
+
+### Verifying the host
+
+```bash
+ssh wanderindev@159.223.174.185
+cd /tmp && claude -p "Reply with exactly: SMOKE OK" \
+    --model claude-opus-5 --output-format stream-json --verbose
+```
+
+Confirmed on 2026-07-25 with Claude Code 2.1.220 and Node 22.23.1. Two things
+worth reading in that output:
+
+- `"apiKeySource":"none"` — the run is on the Max subscription, not an API key.
+  That is the premise the whole project's affordability rests on.
+- A `rate_limit_event` line reports a `five_hour` window. The sandbox runner
+  (#5) has to log these; hitting the limit mid-run is a real failure mode for an
+  unattended orchestrator, not a theoretical one.
+
+## Sandbox image
+
+One disposable container per run. Built from `docker/sandbox/`.
+
+```bash
+cd /srv/managed-agents
+docker build -t managed-agents/sandbox:latest docker/sandbox
+scripts/run-sandbox.sh /srv/worktrees/<job> "<prompt>"
+```
+
+Contains Node 22, a pinned Claude Code, git, `gh`, Python, and the Docker
+**client**. Nothing job-specific is baked in: the workspace clone, the
+credential and any secrets arrive at run time.
+
+`/srv/managed-agents` on the droplet is a plain copy of `docker/`, `docs/` and
+`scripts/`, not a git clone. A change to `docker/sandbox/` reaches runs only
+once it is copied there and the image is rebuilt with the command above; a run
+already started keeps the old image.
+
+### The credential is mounted read-write, deliberately
+
+Claude Code refreshes its OAuth token. A read-only mount works right up until the
+access token expires, and then every unattended run fails at once. So
+`~/.claude/.credentials.json` (471 bytes) is bind-mounted read-write.
+
+Only that one file. The host's `~/.claude.json` is 38KB of machine id, feature
+caches and every project the CLI has ever opened, and none of that belongs in a
+sandbox. The entrypoint writes a minimal replacement containing just
+`hasCompletedOnboarding`, without which `claude -p` refuses to run.
+
+This is the one long-lived secret a sandbox has to hold, and there is no way
+around it because running the CLI is the entire point. #11 gets GitHub down to
+1-hour scoped tokens; this credential cannot be reduced the same way, which is
+worth stating plainly rather than pretending the container solves it.
+
+### When the login dies anyway
+
+The refresh can fail for good (it did on 2026-08-22: the CLI rewrote the file
+with `expiresAt: 0`, and every sandbox afterwards died in a second with
+`authentication_failed`). The loop recognises that transcript
+(`orchestrator/auth.py`): the `run_failed` event is stamped `reason: auth` plus
+a fingerprint (mtime + size, never content) of the credential file, the email
+for that run says **"Claude login EXPIRED"** in the subject, and dispatch
+**pauses** while the file on disk still matches the fingerprint — queued runs
+wait instead of each burning a daily failure. Fix, by hand:
+
+```bash
+ssh -t wanderindev@159.223.174.185 claude auth login
+```
+
+That rewrites the file; the next tick sees the new fingerprint and drains the
+queue. No restart, nothing to reset in the database.
+
+While paused (#59, after the 2026-09-24 expiry sat unnoticed for 11 days):
+
+- **The schedules stand down.** `orchestrator.poll` and `orchestrator.dream`
+  check the same condition (`auth.paused`) and exit 0 without enqueuing,
+  logging `not enqueuing …: dispatch is paused` with the queued count. Sentry
+  issues and PR reviews are still there for the first poll after the re-login.
+- **Queued dreams coalesce.** Every tick, even while paused, the loop keeps
+  only the newest QUEUED `memory_dream` per repo and cancels the rest with
+  `reason: superseded by newer queued run N`.
+- **The email repeats daily**, with the queued count per kind, until the
+  credential changes (`auth_reminder` on the `email_sent` event; it does not
+  count against `NOTIFY_DAILY_CAP`).
+
+The queue is drained **all at once** on the tick after the re-login, so clear
+what is stale *before* logging in. Look, then cancel:
+
+```bash
+ssh wanderindev@159.223.174.185
+cd /srv/orchestrator && set -a && . /srv/orchestrator.env && set +a
+.venv/bin/python -m orchestrator.queue cancel --older-than 1d --dry-run
+.venv/bin/python -m orchestrator.queue cancel --older-than 1d --reason "stale after login expiry"
+```
+
+Filters combine (all must match) and at least one is required: `--kind KIND`,
+`--older-than AGE` (`30m`, `12h`, `1d`, `2w`, measured from `created_at`), and
+`--run ID` (repeatable). Only QUEUED runs are touched — a leased or running run
+is never cancelled. A cancel is proper events, not an edit: `run_abandoned`
+with `requeued: false, cancelled: true, reason`, then an `email_sent` marker so
+no "ABANDONED" email follows. Never hand-write rows to do this.
+
+### `bypassPermissions`, and what the Docker socket costs
+
+The entrypoint defaults to `--permission-mode bypassPermissions`. That is right
+*here* and nowhere else: the container is disposable, holds one job's clone, and
+an interactive approval prompt in an unattended job just deadlocks.
+
+The honest caveat: `AGENT_WITH_DOCKER=1` mounts the host's Docker socket, which
+a job needs to run feliu-dev's testcontainers suite or PIC's compose commands.
+That hands the job control of the host Docker daemon, so with it enabled the
+container is an *isolation* boundary, not a *security* boundary. Acceptable
+under this project's stated trust model (our repos, our Claude Code, per #1),
+but it means "sandbox" is a slight overclaim and the flag should stay opt-in.
+
+Runtime limits are set in `scripts/run-sandbox.sh`: 3g memory, 4g with swap,
+512 pids, `--init` so the CLI's child processes get reaped.
+
+## Running the orchestrator
+
+```bash
+ssh wanderindev@159.223.174.185
+cd /srv/orchestrator
+set -a; . /srv/orchestrator.env; set +a
+.venv/bin/python -m orchestrator.main
+```
+
+`SIGTERM` and `SIGINT` ask it to stop after the current tick. Killing it outright
+is also safe: the loop is built to be resumed, and the first tick of the next
+process reconciles whatever it inherits.
+
+### Cron
+
+```
+*/5 * * * * /home/wanderindev/bin/orch-loop-keepalive.sh
+5 * * * *   /home/wanderindev/bin/orch-run.sh orchestrator.poll
+15 4 * * 1  /home/wanderindev/bin/orch-run.sh orchestrator.dream
+35 * * * *  /home/wanderindev/bin/orch-run.sh orchestrator.supervisor
+```
+
+`orchestrator.supervisor` (#81) runs hourly; see "Pipeline supervisor".
+
+`orch-loop-keepalive.sh` (versioned in `scripts/`, installed by copying it to
+`~/bin/`) starts the loop when none is running, logging to
+`~/logs/orchestrator-main.log` and `~/logs/keepalive.log`. To restart the loop
+onto new code, stop it, wait for it to exit, then run the keepalive script
+(the one-liner is in CLAUDE.md, "Deploy / verify"); otherwise the next
+5-minute mark starts it. `orch-run.sh`
+(host only) runs a one-shot module with the env loaded, logging to
+`~/logs/<module>.log`.
+
+Keepalive decides "running" by matching the loop **process**: argv[0] a
+python binary, relative or absolute, then `-m orchestrator.main`. It used to
+match any command line containing `orchestrator.main`, so an ssh/bash wait
+loop that named the module kept the real loop down for 20 minutes (#72).
+When you wait for a restart, don't put `orchestrator.main` in a remote
+`bash -c` command. The current script ignores such commands, but an older
+copy still on the host would not.
+
+Enqueue an end-to-end check:
+
+```python
+from orchestrator.db import connect
+from orchestrator.log import create_run
+
+with connect() as conn:
+    create_run(conn, "smoke", "smoke:1")
+    conn.commit()
+```
+
+A finished run's `agent_events` are meant to be enough on their own:
+
+```sql
+SELECT seq, type, left(payload::text, 90) FROM agent_events WHERE run_id = 2 ORDER BY seq;
+```
+
+```
+ 1 | run_queued      | {"why": "issue #5 end to end"}
+ 2 | run_leased      | {"attempt": 1, "worker_id": "agents-1"}
+ 3 | sandbox_started | {"container": "ma-run-2-1"}
+ 4 | claude_event    | {"cwd": "/workspace", "type": "system", ...
+ …
+ 8 | claude_event    | {"type": "rate_limit_event", ...
+10 | claude_event    | {"type": "result", ...
+11 | stage_completed | {"result": {"ok": true, "checked": "sandbox"}, "outcome": "SUCCEEDED", ...
+12 | run_done        | {"exit_code": 0}
+```
+
+### Where a job's pieces live
+
+| Path | Contents |
+|---|---|
+| `/srv/repos/<repo>` | host template clone; each job gets a standalone `git clone --local` off it (#33 — a worktree's `.git` links at a host path the sandbox can't see) |
+| `/srv/worktrees/ma-run-<id>-<attempt>` | the job's standalone clone, `origin` pointed at GitHub, mounted at the SAME path inside the container (#43 — the host daemon resolves bind mounts against its own filesystem, so a container-only `/workspace` made repo tooling that mounts the repo into a sibling container silently mount empty dirs; directory keeps its worktree-era name) |
+| `/srv/jobs/ma-run-<id>-<attempt>` | `prompt.txt` (and, for PIC jobs, `mcp.json` with `${VAR}` placeholders only, #80) in, `result.json` out, mounted at `/work` |
+
+The prompt lives outside the repo on purpose, so a job cannot commit its own
+instructions. Prompts reference the workspace as `/workspace`; the runner
+rewrites that to the real per-attempt path when it writes `prompt.txt`. The
+workspace is always deleted when the run finishes — a job's work reaches the
+world by being pushed to origin from inside the sandbox, never by surviving
+on disk.
+
+## Dreaming (#15, weekly since #60)
+
+`orchestrator.dream` is a cron one-shot, **Mondays**, with the default
+`--days 7` lookback. Per repo it enqueues one `memory_dream` run (at most one
+per repo per day, by subject) whose payload is the evidence the auditor sees:
+
+- the orchestrator's own runs on that repo in the window (newest 40; any
+  beyond that are counted as `runs_omitted`, never dropped silently), and
+- every pull request **merged** in the window, whoever wrote it — title,
+  number, author, `merged_at` and a changed-files summary, read through the
+  GitHub App. This is how interactive and epic-runner work reaches the audit.
+  A repo with merges but no runs still dreams; one with neither is skipped.
+
+Which repos: `ORCHESTRATOR_DREAM_REPOS` (comma list) when set; otherwise every
+repo with orchestrator runs in the window. `--repo NAME` overrides both.
+
+The run's base is the repo's **default branch as GitHub reports it**, recorded
+as `base_branch` in the payload: the sandbox cuts the dream branch from
+`origin/<base>` and the draft PR targets it (atelier-new-cli is on `master`).
+If the App is unusable the dream falls back to `main` and logs a warning; for a
+non-`main` repo the sandbox fetch then fails loudly rather than auditing the
+wrong history.
+
+The brief's evidence (runs + merged PRs) is bounded to 64 KB, oldest entries
+trimmed first and counted as `runs_omitted` / `prs_omitted`. The bound is the
+argv limit: the entrypoint passes the whole prompt as one `claude -p` argument,
+and Linux refuses a single argument over 128 KiB ("Argument list too long", on
+every retry). Do not raise `MAX_EVIDENCE_BYTES` without changing how the
+entrypoint hands over the prompt.
+
+**CLAUDE.md size guard (#61).** Every dream keeps CLAUDE.md at or under
+`ORCHESTRATOR_DREAM_CLAUDE_MD_MAX_CHARS` (default 40,000 characters), even
+when it has nothing else to change: over it, the dreamer moves subsystem detail
+verbatim into `docs/claude/<topic>.md` and leaves a stub (heading, "read it
+first", the main traps) — the panama-in-context pattern — keeping
+cross-cutting rules in CLAUDE.md. Those files are the only thing besides
+CLAUDE.md a dream may edit. The check is also code: after the run the runner
+measures CLAUDE.md as committed at the workspace's HEAD (`claude_md_chars`)
+and at `origin/<base>` (`claude_md_chars_base`), and counts the run's
+non-merge commits ahead of `origin/<base>` (`commits_ahead`) and on no
+remote-tracking ref (`commits_unpushed`), all written into the result (the base
+is recorded in the clone's git config as `orchestrator.base`). What counts is
+what landed: HEAD's size when a PR carries the commits (`pr_url`, or the open
+memory PR the run reused), the base's otherwise. Still over the limit parks the
+run AWAITING_HUMAN (email subject "CLAUDE.md still N chars, over the limit"),
+whatever the outcome, CLEAN and NO_CHANGE included.
+
+**Commits that went nowhere (#67).** A split committed at HEAD but whose push
+or `gh pr create` failed used to pass the guard and complete as CLEAN, leaving
+the base over the limit and nobody told. Now any unpushed commit, or commits
+ahead of the base with no PR to carry them, park the run whatever the outcome
+("N dream commit(s) never reached GitHub" / "... pushed but no pull request
+carries them"). Merge commits are not counted: an open-PR dream merges
+`origin/<base>` in first, and a NO_CHANGE run then pushes nothing by design.
+The unpushed count trusts `origin/<branch>`, which only a `git push origin`
+moves — a push to a bare URL would look unpushed and park (safe side).
+
+Where 40,000 comes from: Claude Code's own "Large CLAUDE.md will impact
+performance (N chars > LIMIT)" warning. In the CLI bundle (2.1.289) the
+per-file limit is `max(40000, context window x 0.05 x chars-per-token)`
+(3 or 4 chars per token by model), so 40,000 is where it warns on a
+200K-context model; a 1M-context session tolerates more. The CLI counts
+JavaScript string length, Python counts code points: identical unless the
+file holds characters outside the Basic Multilingual Plane (emoji).
+
+The dream runs on Opus 5.5 (`claude-opus-5-5`, `ORCHESTRATOR_DREAM_MODEL`); the
+other kinds stay on `claude-opus-5`. The API refuses that id from an older CLI
+— on 2.1.220 the run ends at once with `API Error: 400 Claude Code 2.1.220
+does not support this model; version 2.1.280 or newer is required` — so the
+image pins 2.1.289 (#69). The host's own `claude` is installed separately and
+can lag the image (it was still 2.1.220 when the image was bumped), so test
+the **image** after every rebuild and before the first Monday run, with the
+same credential mount the runner uses:
+
+```bash
+ssh wanderindev@159.223.174.185
+docker run --rm --init \
+    --volume /home/wanderindev/.claude/.credentials.json:/home/agent/.claude/.credentials.json \
+    --env AGENT_MODEL=claude-opus-5-5 \
+    --env AGENT_PROMPT='Reply with exactly: SMOKE OK' \
+    managed-agents/sandbox:latest
+```
+
+The stream's `system` init line should name `claude-opus-5-5` and the result
+should be `SMOKE OK`. If the model is refused, set
+`ORCHESTRATOR_DREAM_MODEL=claude-opus-5` and restart the loop (the loop reads
+config once at startup, so an env edit alone changes nothing), or bump
+`CLAUDE_CODE_VERSION` and rebuild the image. Once the image passes again,
+remove that override and restart the loop to go back to Opus 5.5.
+
+### Adding a repo to the dream list
+
+1. **GitHub App** → Install App → *Only select repositories* → add the repo
+   (keep the selection explicit, never "All repositories").
+2. **Host clone**: `/srv/repos/<repo>`, owned by `wanderindev`. The name is the
+   GitHub repo name; it is the directory the job's `git clone --local` reads.
+3. **`/srv/orchestrator.env`**: append the name to `ORCHESTRATOR_DREAM_REPOS`.
+4. **Check reach**: `python -m orchestrator.github` lists what the App can see
+   and warns about anything outside feliu-dev, panama-in-context and the dream
+   list. A dream repo it cannot see means a failed clone fetch.
+5. **Dry run**: `python -m orchestrator.dream --repo <repo> --dry-run` logs the
+   run and merged-PR counts and the base branch it resolved, without
+   enqueuing. `base main` for a repo that is not on `main` means the App
+   lookup failed.
+
+## Sentry work source
+
+```bash
+python -m orchestrator.poll            # fetch, filter, enqueue
+python -m orchestrator.poll --dry-run  # same, but enqueue nothing
+```
+
+A separate command from the loop rather than a step inside a tick, so scheduling
+is the operating system's job and there is no "when did I last poll" state to
+keep anywhere. Hourly is the intended cadence. Running it twice by accident is
+harmless: the dedup and the unique index both hold.
+
+### The token is a manual step
+
+Create a Sentry auth token by hand (there is no API for minting one) with
+**`event:read`** and **`org:read`**, and add it to `/srv/orchestrator.env`:
+
+```
+ORCHESTRATOR_SENTRY_TOKEN=...
+```
+
+The org is `javier-feliu` and it lives in the **US region**, so the base URL is
+`https://us.sentry.io`, not `sentry.io`. Sending to the wrong region fails.
+
+### Which projects, and which are deliberately excluded
+
+The map is `PROJECT_REPOS` in `orchestrator/sources/sentry.py`.
+
+| Sentry project | Repo | Base | Verified by |
+|---|---|---|---|
+| `trd-python`, `trd-javascript-react` | `feliu-dev` | `main` | pytest + coverage floor |
+| `pic-python-fastapi`, `pic-javascript-react` | `panama-in-context` | `main` | pytest, frontend lint/build |
+| `atelier-loyalty-app` | `atelier-loyalty-app` | `main` | typecheck, lint, build, vitest on a throwaway Postgres 17 |
+| `atelier-theme` | **`atelier-new-cli`** | `master` | theme-check diff + an uncommitted reproduction (no test suite) |
+
+The `atelier-theme` *project* is the live storefront theme, whose code is in
+`atelier-new-cli`; the `atelier-theme` *repo* is its unreleased replacement and
+gets no Sentry runs. `pic-cert-watcher` is deliberately absent: there is no
+clone of it here, so an agent could only ever report that it cannot help.
+
+**The base branch is resolved, not assumed** (#68). The poll asks GitHub for
+each repo's default branch (once per poll, through the App) and stores it as
+`base_branch` in the triage payload; the sandbox cuts and fetches from it, the
+prompts name it (`--base`, `git diff <base>...HEAD`) and it rides the whole
+chain. A change-request revision takes the PR's own base. When a repo's base
+cannot be read (App unusable, or GitHub did not answer), its issues are **not**
+enqueued: they are tallied as "base branch unresolved; retried next poll" and
+no cooldown starts, because a guessed `main` would fail the sandbox's fetch on
+`atelier-new-cli` and then cost the issue a week. Sentry itself is still polled
+and repos whose base resolved enqueue as usual. Only runs queued before #68,
+whose payload has no base, fall back to `main`.
+
+**Containers a sandbox starts.** The docker socket lets a job start sibling
+containers on the host daemon (the loyalty app's throwaway Postgres). The runner
+hands each sandbox `AGENT_SIBLING_LABEL=managed-agents.run=<container name>`,
+the loyalty gate starts its Postgres with `--rm --label "$AGENT_SIBLING_LABEL"`,
+and `finish()` removes exactly the containers carrying that label, however the
+sandbox ended. A sibling started without the label is not reaped:
+`docker ps --filter label=managed-agents.run` versus `docker ps` shows strays.
+
+**What "verified" means per repo** lives in `_REPO_GATES` in
+`orchestrator/jobs.py`, quoted into every triage, revision and change-request
+prompt. A repo without one gets "mirror its CI". A repo in `_REPRO_REPOS` has no
+test suite: the fail-before/pass-after evidence is an uncommitted reproduction
+script in the PR body that loads the shipped file, and the adversarial review
+re-runs it instead of a test. The sandbox has Node 22, Python 3, git, gh and the
+docker CLI; anything else a gate needs is fetched at run time (the theme runs
+CI's pinned `@shopify/cli@3.94.3` through `npx`) and must need no login.
+
+### Adding a project
+
+1. **Repo reach**: GitHub App installed on the repo and a clone at
+   `/srv/repos/<repo>` (steps 1–2 of *Adding a repo to the dream list*).
+2. **Map it**: add `"<sentry-project>": "<repo>"` to `PROJECT_REPOS`, and
+   `wanderindev/<repo>` to `GITHUB_EXPECTED_REPOS` in `config.py` (a test fails
+   until both agree; the change-request poll walks that list).
+3. **Gate**: add the repo to `_REPO_GATES`, quoting its CI exactly and saying
+   how its tests reach any service they need from inside a sandbox (`localhost`
+   there is not the docker host). No test suite: add it to `_REPRO_REPOS`.
+4. **The repo's CLAUDE.md** must say how to run its checks and that PRs go
+   through `gh pr create`; the agent reads it first.
+5. **Noise**: list the project's unresolved issues and add an
+   `IGNORE_PATTERNS` entry (or a `PROJECT_IGNORE_PATTERNS` one, when the
+   judgement only holds for that project) for each real noise issue, with a
+   test that quotes it. Then `python -m orchestrator.poll --dry-run` and read
+   the drop tally: the cooldown means a bad first poll costs a week.
+6. Copy the code to `/srv/orchestrator` and restart the loop; the next hourly
+   poll picks the project up.
+
+### Tuning the filters
+
+`--dry-run` prints the same drop tally without enqueuing, which is how a filter
+change gets evaluated before anyone lives with it. Every drop is counted **by
+reason**, because a source that filters silently reads as "nothing was wrong"
+when it actually means "I decided none of this was worth your time".
+
+`min_events` defaults to **1**, not 2. These are low-traffic personal sites, so a
+single occurrence is already signal rather than noise. A floor of 2 was tried
+first and threw away 10 of 25 issues, including `PIC-PYTHON-FASTAPI-1H`, a real
+missing-column error that had happened exactly once. Raise it with
+`ORCHESTRATOR_SENTRY_MIN_EVENTS` if the volume ever justifies it.
+
+At a floor of 1 the ungroupable-issue filter starts earning its keep: an issue
+with no usable title *and* no culprit gives an agent nothing to start from, so
+it is dropped rather than turned into a run that can only conclude the same.
+
+The storefront theme throws a different class of noise from the React apps:
+in-app browsers, third-party app scripts (PushDaddy, reCAPTCHA, Shopify's own
+web pixels and telemetry) and an app embed that clobbers jQuery. On 2026-10-05
+the filters dropped 39 of its 42 unresolved issues and kept the three in the
+theme's own code. The jQuery-shaped judgements are scoped to `atelier-theme` in
+`PROJECT_IGNORE_PATTERNS` and mirror the `ignoreErrors` list the theme added to
+`snippets/sentry.liquid` on 2026-09-20; when that list changes, change these.
+
+### Closing the loop back to Sentry
+
+The GitHub integration is installed, which means a commit message containing
+`Fixes PIC-PYTHON-FASTAPI-1Q` **resolves that issue automatically when the PR
+merges**. #7 should put the short id in every commit it writes. The orchestrator
+therefore never needs write access to Sentry: resolution is a side effect of a
+human merging, which is exactly where the decision belongs.
+## GitHub App (#11)
+
+A GitHub App, not a personal access token. Per job the orchestrator mints an
+**installation token**: one hour, scoped to the two installed repos, limited to
+the two permissions granted. A PAT would carry the whole account and never
+expire; a Claude connector would not help at all, because `git clone` and
+`git push` need a credential in the git transport rather than an API tool.
+
+### Creating it, by hand
+
+There is no API for creating an App, so this part is a browser job.
+
+1. github.com/settings/apps → **New GitHub App**.
+2. Name it something recognisable in a PR author line, e.g. `wanderindev-agents`.
+   Homepage URL can be the repo. Uncheck **Webhook → Active**; nothing listens.
+3. Repository permissions, and nothing else:
+   - **Contents: Read and write** (push a branch)
+   - **Pull requests: Read and write** (open and update a PR)
+4. Create, then **Generate a private key**. A `.pem` downloads once.
+5. **Install App** → *Only select repositories* → `feliu-dev` and
+   `panama-in-context`. Not "All repositories".
+
+### Putting it on the droplet
+
+The key goes in a file rather than an environment variable: it is multi-line, and
+a file can be `chmod 600` while an env var is readable by anything that can see
+`/proc` for the process.
+
+```bash
+ssh root@159.223.174.185 'install -d -o wanderindev -g wanderindev -m 700 /srv/secrets'
+scp your-app.private-key.pem wanderindev@159.223.174.185:/srv/secrets/github-app.pem
+ssh wanderindev@159.223.174.185 'chmod 600 /srv/secrets/github-app.pem'
+```
+
+Then add the App id to `/srv/orchestrator.env`:
+
+```
+ORCHESTRATOR_GITHUB_APP_ID=<from the App settings page>
+```
+
+### Finding the installation id, and checking the blast radius
+
+```bash
+python -m orchestrator.github
+```
+
+Prints every installation with its id and whether it is scoped to `selected` or
+`all` repositories. Add the id as `ORCHESTRATOR_GITHUB_APP_INSTALLATION_ID` and
+run it again: it then lists the repositories the App can actually reach and
+**warns if that is more than the intended two**. Installing on "all repositories"
+is one careless click during setup and it would hand every sandbox far more reach
+than this is meant to give.
+
+### How the token reaches the work
+
+`JobSpec.needs_github` is opt-in, so a job with no business pushing never
+receives a credential at all. When set, the runner mints a token at container
+launch (so the sandbox gets the full hour, not the remains of an earlier one) and
+injects it as `GH_TOKEN`.
+
+Inside the container the entrypoint configures a git credential helper that reads
+`GH_TOKEN` from the environment, rather than writing it into a remote URL. That
+matters because the clone's `.git/config` lives on the host, and a token baked
+into it would outlive the container that was supposed to contain it. The runner's
+own host-side fetch passes its tokenized URL per command for the same reason.
+
+## PIC MCP (#80)
+
+Sandboxes working on `panama-in-context` (the Sentry chain, change-request
+revisions, the research experiment: `jobs.PIC_MCP_KINDS`; not the dream) can
+read PIC's production state through its MCP server (PIC #638-#640): the
+`mcp__pic__*` tools `pipeline_status`, `explain_stuck_goal`, `get_article`,
+`search_knowledge`, `find_related`, `check_claim`. The prompt gets an addendum
+naming them and when to reach for them (`orchestrator/pic_mcp.py`).
+
+- **The token** is `ORCHESTRATOR_PIC_MCP_READ_TOKEN` in `/srv/orchestrator.env`,
+  minted in PIC as `orchestrator-sandbox-read` with the `read` scope only
+  (minting is a browser step, so a rotation goes to the operator). Unset, PIC
+  jobs run with no MCP config at all.
+- **How it travels**: the runner writes `/work/mcp.json` with the header as the
+  literal `Bearer ${PIC_MCP_READ_TOKEN}` (that directory is on the host) and
+  passes the value as the `PIC_MCP_READ_TOKEN` env var. The entrypoint
+  substitutes it into a file in the container's `/dev/shm` and runs
+  `claude --mcp-config <that> --strict-mcp-config`. Resolved there rather than
+  left to the CLI's own `${VAR}` expansion, so it does not hang on the pinned
+  CLI version; `--strict-mcp-config` keeps PIC's own `.mcp.json` (which names a
+  `pic` server read from `PIC_MCP_TOKEN`) out of the session. An unset variable
+  or a config that will not parse skips MCP with a warning on stderr.
+- **Redaction**: `orchestrator/redact.py` replaces the token's exact value with
+  `[REDACTED]` in every payload `log.append` / `create_run` writes (before
+  truncation, so not even a preview survives) and in every email's subject and
+  body. Emails also scrub text logged before the token was configured, but the
+  log is append-only: a token that got in some other way must be rotated.
+- **Audit**: every call lands in PIC's `mcp_tool_calls` under the token's name.
+
+Checking a run used it, from the droplet with the env sourced (`psql
+"$ORCHESTRATOR_DATABASE_URL"`): its `claude_event`s show `mcp__pic__` tool
+calls, and no event carries the token:
+
+```sql
+SELECT count(*) FROM agent_events WHERE run_id = <id> AND payload::text LIKE '%mcp__pic__%';
+SELECT count(*) FROM agent_events WHERE strpos(payload::text, :'tok') > 0;  -- 0
+```
+
+with `psql -v tok="$ORCHESTRATOR_PIC_MCP_READ_TOKEN"`, so the value never
+appears on a command line you type.
+
+## Pipeline supervisor (#81)
+
+`python -m orchestrator.supervisor` scans the drive sessions' summaries in
+the log for stuck PIC goals and enqueues one `pipeline_supervise` run per new
+incident (at most `ORCHESTRATOR_SUPERVISOR_MAX_PER_SCAN`, oldest first). The
+loop dispatches each run to a sandbox that reads PIC through its MCP server
+and writes a diagnosis: cause, evidence, and one of `retry`, `skip`,
+`operator_work_needed` or `none`. The diagnosis is logged as an `artifact`
+event and emailed, and the run ends DONE. The sandbox changes nothing in PIC;
+when auto-retry is on, the orchestrator itself carries out a `retry`
+recommendation (#84, below).
+
+- **Triggers**: `driver_failed` fires when the latest session that touched a
+  goal parked rows on it within `ORCHESTRATOR_SUPERVISOR_RECENT_HOURS`.
+  `stalled` fires when a goal's per-goal counts have not changed for more than
+  `ORCHESTRATOR_SUPERVISOR_STALL_DAYS` (within `_LOOKBACK_DAYS`). `--goal KEY`
+  asks for one goal by hand. Each incident's `trigger_key` is stored in its
+  run's payload, so it is diagnosed once. That includes a parked row that
+  never moves: once its `driver_failed` incident is diagnosed, the same state
+  does not come back as `stalled`. It also includes a diagnosis run that
+  failed or was abandoned, whose incident is not retried by the scan; ask
+  again with `--goal KEY`. `--dry-run` lists the incidents without enqueuing
+  anything.
+- **Read-only, three layers**: the read-scope token; `--permission-mode dontAsk`
+  with an allow list of `Write` plus `pic_mcp.READ_TOOLS`, so any other tool is
+  refused, including one PIC adds later; and `--disallowedTools` with
+  `pic_mcp.WRITE_TOOLS` plus `--tools Write`, so there is no Bash or WebFetch.
+  The entrypoint maps the env vars `AGENT_TOOLS`, `AGENT_ALLOWED_TOOLS` and
+  `AGENT_DISALLOWED_TOOLS` to those flags.
+- **Trap: the image.** Those env vars need the entrypoint from #81. An image
+  built before it ignores them, and the session then runs dontAsk with no
+  allow list: it fails closed, with no tools and no result. Rebuild the image
+  after deploying.
+- **Trap: old drive sessions.** Sessions before #62 recorded one goal each,
+  so a goal another session finished can look stalled in the log. The
+  diagnosis checks PIC and answers `none`. Those sessions leave the 30-day
+  lookback by 2026-10-20.
+- **Auto-retry (#84)**: after a diagnosis whose `recommended_action` is
+  `retry`, the loop (`orchestrator/auto_retry.py`, in the same tick, before
+  the email) calls PIC's `retry_agent_task` for each task the diagnosis marks
+  `retry`, with the diagnosis's `why` as the reason PIC stores on
+  `agent_task_actions` (clipped to 200 characters, so PIC's `mcp_tool_calls`
+  audit keeps it inline rather than as a digest). The model never holds the tool: the sandbox stays
+  read-only as above, and the host's MCP client (`orchestrator/mcp_client.py`)
+  is allowed exactly `retry_agent_task`. Limits, enforced by the orchestrator:
+  one call per task per **rolling 24 hours** across all runs (read from the
+  log; a `calling` event is committed under a per-task advisory lock before
+  the call, so a crash mid-call still counts), at most
+  `ORCHESTRATOR_SUPERVISOR_MAX_RETRIES_PER_RUN` (3) calls per diagnosis, never
+  a skip, never a publish-path kind (`APPROVE_ARTICLE`, `SET_PUBLISH_DATE`,
+  `APPROVE_IG_POST`, `SCHEDULE_IG_POST`; PIC refuses them too, its #686).
+  Every attempt is a `task_action` event on the diagnosis run (`calling`,
+  then `executed` / `refused_pic` / `error`; or `refused_limit` /
+  `refused_cap` / `refused_kind` with no call), and the email lists them.
+  **Trap: the tick is one transaction.** The loop's connection has
+  autocommit off and its first statement is a bare SELECT, so every
+  `conn.transaction()` in a tick is only a savepoint until the tick ends.
+  `auto_retry.execute` therefore commits the open transaction before each
+  claim and outcome (making the run's completion and artifact durable a
+  little early). Without that, a later failure in the same tick would roll
+  back the `calling` row after PIC had already retried the task.
+- **Auto-retry switch and token**: `ORCHESTRATOR_SUPERVISOR_AUTO_RETRY=1` and
+  `ORCHESTRATOR_PIC_MCP_PIPELINE_TOKEN` (PIC token
+  `orchestrator-supervisor-pipeline-2`, scopes `read,pipeline`) must both be
+  set in `/srv/orchestrator.env`; either missing keeps diagnoses read-only.
+  To turn it off: remove the flag (or set `0`) and restart the loop; no
+  deploy. The token is redacted from the log and emails like the read token.
+  Checking a retry landed in PIC: its `mcp_tool_calls` row (tool
+  `retry_agent_task`, token name `orchestrator-supervisor-pipeline-2`,
+  outcome `OK`) and its `agent_task_actions` row (action `retry`, actor
+  `mcp:orchestrator-supervisor-pipeline-2`, reason starting
+  `managed-agents supervisor run <id>`). Orchestrator side:
+
+  ```sql
+  SELECT run_id, created_at, payload->>'task_id' AS task, payload->>'outcome' AS outcome
+  FROM agent_events WHERE type = 'task_action' ORDER BY created_at DESC LIMIT 20;
+  ```
+- **Measure**: `python -m orchestrator.report supervisor` prints time from
+  failure to diagnosis per incident. The operator's own call goes in
+  `docs/results/pipeline-supervisor.md` (also kept in PIC
+  `docs/portfolio/mcp/results/`).
+
+## Log database
+
+Managed cluster `d699bab0-c322-4b58-b90b-98bae0632b30`, PostgreSQL **17.10**,
+2GB / 50 connections, shared with `feliudev` and `loyalty`.
+
+```bash
+C=d699bab0-c322-4b58-b90b-98bae0632b30
+doctl databases db create       $C orchestrator
+doctl databases user create     $C orchestrator
+doctl databases firewalls append $C --rule droplet:587510123
+```
+
+### Traps
+
+- **The firewall rule is mandatory, not hardening.** The cluster uses a
+  trusted-sources allowlist. Without the rule the droplet cannot reach Postgres
+  at all.
+- **PostgreSQL 15 removed the default `CREATE` privilege on schema `public` for
+  non-owner roles.** A freshly created managed user connects fine and then fails
+  on the first `CREATE TABLE`. Run once, as `doadmin`, against the new database
+  only:
+
+  ```sql
+  GRANT CREATE, USAGE ON SCHEMA public TO orchestrator;
+  ```
+
+- **Use the private connection host** (`doctl databases connection <id>
+  --private`) so traffic stays inside the VPC.
+- Keep `ORCHESTRATOR_DB_POOL_MAX` small. The instance is 50 connections total
+  and feliu-dev and PIC were already trimmed to 2 and 3 to fit.
+
+### Environment
+
+`/srv/orchestrator.env`, chmod 600, owned by `wanderindev`:
+
+```
+ORCHESTRATOR_DATABASE_URL=postgresql://orchestrator:<pw>@<private-host>:25060/orchestrator?sslmode=require
+ORCHESTRATOR_DB_POOL_MAX=2
+ORCHESTRATOR_MAX_CONCURRENT_RUNS=1
+ORCHESTRATOR_WORKER_ID=agents-1
+```
+
+### Migrations
+
+```bash
+ssh wanderindev@159.223.174.185
+cd /srv/orchestrator
+set -a; . /srv/orchestrator.env; set +a
+.venv/bin/python -m orchestrator.migrate
+```
+
+Idempotent; a second run reports `nothing to apply`.
+
+### Smoke-testing the log by hand
+
+`agent_events` is append-only, so **a test row cannot be deleted afterwards**.
+Only ever exercise it inside a transaction that rolls back:
+
+```sql
+BEGIN;
+INSERT INTO agent_runs (kind, subject, status) VALUES ('smoke', 'smoke:1', 'QUEUED');
+-- ...
+ROLLBACK;
+```

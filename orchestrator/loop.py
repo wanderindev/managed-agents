@@ -1,0 +1,657 @@
+"""The stateless orchestrator loop: reconcile, then dispatch.
+
+Stateless is the whole point. The loop keeps nothing between ticks and nothing
+between processes: every decision is made from ``agent_runs`` and ``agent_events``
+as they are right now. Killing this process at any instant and starting a new one
+must be indistinguishable from it having run continuously, which is what makes
+#12's kill-and-resume demo possible at all.
+
+Two consequences worth knowing before reading the code:
+
+* The sandbox handle lives in the ``sandbox_started`` event payload, not in an
+  attribute. A restarted orchestrator finds its containers by reading the log.
+* A tick is idempotent and self-healing, so there is no separate boot path. The
+  first tick after a restart reconciles whatever it inherits.
+"""
+
+import logging
+import random
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import psycopg
+
+from orchestrator import auth, config, db, log, queue
+from orchestrator.enums import EventType, Outcome
+from orchestrator.queue import Run
+from orchestrator.runner import Runner
+
+logger = logging.getLogger(__name__)
+
+#: How much of a sandbox's stderr to keep on the stage_completed event. The tail
+#: is what matters: a crash prints its reason last.
+_STDERR_TAIL = 4000
+
+#: How much of the computed backoff jitter may shave off. Applied downward so
+#: the ceiling stays a ceiling; at MAX_CONCURRENT_RUNS=1 jitter buys nothing,
+#: but it costs nothing either and stops a thundering herd if the cap rises.
+_JITTER_FRACTION = 0.1
+
+
+def backoff_delay(
+    attempts: int,
+    *,
+    base: int,
+    ceiling: int,
+    jitter: Callable[[], float] = random.random,
+) -> timedelta:
+    """How long an abandoned run should wait before it is claimable again.
+
+    Exponential in the attempts already burned: the first retry waits ``base``,
+    the second twice that, capped at ``ceiling``. This is a guess about how long
+    a transient problem takes to clear; when a better number is known (a rate
+    limit's reset time), ``Orchestrator._abandon`` takes it explicitly and this
+    function is not consulted.
+    """
+    delay = min(base * (2 ** max(attempts - 1, 0)), ceiling)
+    return timedelta(seconds=delay * (1 - _JITTER_FRACTION * jitter()))
+
+
+def _rate_limit_reset(payload: dict[str, Any]) -> datetime | None:
+    """The usable reset time carried by a rejected rate-limit event, if any."""
+    if payload.get("type") != "rate_limit_event":
+        return None
+    info = payload.get("rate_limit_info") or {}
+    if info.get("status") == "allowed":
+        return None
+    resets_at = info.get("resetsAt")
+    if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
+        return datetime.fromtimestamp(resets_at, tz=UTC)
+    return None
+
+
+@dataclass
+class TickResult:
+    """What one tick did. Returned for logging and asserted on in tests."""
+
+    leased: list[int] = field(default_factory=list)
+    heartbeated: list[int] = field(default_factory=list)
+    abandoned: list[int] = field(default_factory=list)
+    finished: list[int] = field(default_factory=list)
+    #: Queued runs coalescing cancelled as superseded (#59).
+    cancelled: list[int] = field(default_factory=list)
+    #: Set when dispatch refused to lease because the Claude login is dead.
+    paused: str | None = None
+
+    @property
+    def idle(self) -> bool:
+        return not (
+            self.leased
+            or self.heartbeated
+            or self.abandoned
+            or self.finished
+            or self.cancelled
+        )
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        runner: Runner,
+        *,
+        worker_id: str | None = None,
+        max_concurrent: int | None = None,
+        lease_seconds: int | None = None,
+        max_attempts: int | None = None,
+        tick_seconds: int | None = None,
+        backoff_base_seconds: int | None = None,
+        backoff_ceiling_seconds: int | None = None,
+        jitter: Callable[[], float] = random.random,
+        followups: Callable[[Run, dict[str, Any] | None], Any] | None = None,
+        notify: Callable[[psycopg.Connection], int] | None = None,
+        task_retry: Callable[[psycopg.Connection, Run, tuple[dict, ...]], Any]
+        | None = None,
+        credentials: str | Path | None = None,
+        coalesce: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        self.runner = runner
+        #: The Claude credential the sandbox mounts. Only fingerprinted here,
+        #: never read: it decides whether dispatch may resume after a login
+        #: failure (see orchestrator.auth).
+        self.credentials = Path(credentials or config.CLAUDE_CREDENTIALS)
+        self._paused_for: str | None = None
+        self.worker_id = worker_id or config.WORKER_ID
+        self.max_concurrent = (
+            config.MAX_CONCURRENT_RUNS if max_concurrent is None else max_concurrent
+        )
+        self.lease_seconds = (
+            config.LEASE_SECONDS if lease_seconds is None else lease_seconds
+        )
+        self.max_attempts = (
+            config.MAX_ATTEMPTS if max_attempts is None else max_attempts
+        )
+        self.tick_seconds = (
+            config.TICK_SECONDS if tick_seconds is None else tick_seconds
+        )
+        self.backoff_base_seconds = (
+            config.BACKOFF_BASE_SECONDS
+            if backoff_base_seconds is None
+            else backoff_base_seconds
+        )
+        self.backoff_ceiling_seconds = (
+            config.BACKOFF_CEILING_SECONDS
+            if backoff_ceiling_seconds is None
+            else backoff_ceiling_seconds
+        )
+        self.jitter = jitter
+        #: Called after a run completes successfully to decide what happens
+        #: next (jobs.followups is the production one). The loop applies the
+        #: decision but knows nothing about what any kind of run means.
+        self.followups = followups
+        #: Called at the end of every tick (notify.pass_once in production) so
+        #: outcome emails go out promptly. Guarded like followups: a mail
+        #: outage must never cost a tick.
+        self.notify = notify
+        #: Carries out the PIC task retries a decision asks for
+        #: (auto_retry.execute in production, #84). Runs after the decision's
+        #: artifacts and before the tick's notify pass, so the email says what
+        #: was done. None: retries are never made.
+        self.task_retry = task_retry
+        #: ``(kind, payload key)`` pairs whose queued runs collapse to the
+        #: newest per key before anything is leased (jobs.COALESCED in
+        #: production). Done even while paused, so a backlog shrinks as it
+        #: builds rather than all at once on resume.
+        self.coalesce = coalesce
+
+    # --- one tick ------------------------------------------------------------
+
+    def tick(self, conn: psycopg.Connection) -> TickResult:
+        """Reconcile what exists, then fill any free slots.
+
+        Reconcile runs first on purpose: it is what frees the slots that dispatch
+        then uses. The other order lets one dead lease block the queue for a whole
+        tick.
+        """
+        result = TickResult()
+        self._reconcile(conn, result)
+        self._dispatch(conn, result)
+        if self.notify is not None:
+            try:
+                self.notify(conn)
+            except Exception:  # a mail outage must never cost a tick
+                logger.exception("notify pass failed; retrying next tick")
+        return result
+
+    # --- reconcile -----------------------------------------------------------
+
+    def _reconcile(self, conn: psycopg.Connection, result: TickResult) -> None:
+        now = datetime.now(UTC)
+        for run in queue.active_runs(conn):
+            if run.worker_id == self.worker_id:
+                self._reconcile_own(conn, run, result)
+            elif run.lease_expired(now):
+                # Someone else's run, and its orchestrator is not renewing the
+                # lease. We cannot ask its container anything, so the expired
+                # lease is the only evidence available and it is enough.
+                self._abandon(
+                    conn, run, f"lease expired (worker {run.worker_id})", result
+                )
+
+    def _reconcile_own(
+        self, conn: psycopg.Connection, run: Run, result: TickResult
+    ) -> None:
+        handle = self._handle_for(conn, run)
+        if handle is None:
+            # Leased but never started: this process died between committing the
+            # lease and launching the container. Nothing ran, so requeueing is
+            # exactly right and cannot duplicate work.
+            self._abandon(conn, run, "sandbox never started", result)
+        elif self.runner.is_alive(handle):
+            self._heartbeat(conn, run, handle, result)
+        else:
+            self._finish(conn, run, handle, result)
+
+    def _finish(
+        self, conn: psycopg.Connection, run: Run, handle: str, result: TickResult
+    ) -> None:
+        """Collect a stopped sandbox and decide what its stopping meant.
+
+        "Not running any more" covers three different things, and conflating them
+        was the gap in #4 that only became visible with a real runner: a container
+        that succeeded, one whose work failed, and one that was lost. Only the
+        third deserves a retry.
+        """
+        sandbox = self.runner.finish(run, handle)
+        rate_limit_reset = self._drain(conn, run, sandbox.events)
+
+        if sandbox.outcome is Outcome.GONE:
+            # If the transcript showed a rate limit, its reset time is a better
+            # wait than any computed backoff: retrying sooner is guaranteed to
+            # fail, and three instant retries would just burn the attempt budget.
+            # A truly vanished container hands back no events at all, so the
+            # limit is usually one a heartbeat drained earlier — check the log.
+            if rate_limit_reset is None:
+                rate_limit_reset = self._stored_rate_limit_reset(conn, run)
+            self._abandon(
+                conn,
+                run,
+                f"sandbox vanished ({handle})",
+                result,
+                not_before=rate_limit_reset,
+            )
+            return
+
+        succeeded = sandbox.outcome is Outcome.SUCCEEDED
+        terminal: dict[str, Any] = {"exit_code": sandbox.exit_code}
+        if not succeeded and auth.failed_auth(sandbox.events):
+            # Not this run's fault and not the next run's either: until someone
+            # logs in again on the host every sandbox dies the same way. Name
+            # it, and pin the credential version so dispatch can wait for the
+            # file to change rather than burning one run per schedule.
+            terminal[auth.REASON_KEY] = auth.REASON_AUTH
+            terminal[auth.FINGERPRINT_KEY] = auth.fingerprint(self.credentials)
+            logger.error(
+                "run %s: Claude login expired on the host and could not refresh;"
+                " dispatch pauses until %s is rewritten (claude auth login)",
+                run.id,
+                self.credentials,
+            )
+        with conn.transaction():
+            log.append(
+                conn,
+                run.id,
+                EventType.STAGE_COMPLETED,
+                {
+                    "container": handle,
+                    "exit_code": sandbox.exit_code,
+                    "outcome": sandbox.outcome.value,
+                    "result": sandbox.result,
+                    "stderr": sandbox.stderr[-_STDERR_TAIL:] if sandbox.stderr else "",
+                },
+            )
+            log.append(
+                conn,
+                run.id,
+                EventType.RUN_DONE if succeeded else EventType.RUN_FAILED,
+                terminal,
+                worker_id=None,
+                lease_expires_at=None,
+            )
+        result.finished.append(run.id)
+        logger.info(
+            "run %s finished: %s (exit %s)", run.id, sandbox.outcome, sandbox.exit_code
+        )
+        if succeeded:
+            self._apply_followups(conn, run, sandbox.result)
+
+    def _apply_followups(
+        self, conn: psycopg.Connection, run: Run, job_result: dict[str, Any] | None
+    ) -> None:
+        """Apply the chain decision for a completed run.
+
+        Guarded: the run's own completion is already committed, so a follow-up
+        failure must not fail the tick — but it does stall the chain, so it is
+        logged at exception level where an operator will see it.
+        """
+        if self.followups is None:
+            return
+        try:
+            decision = self.followups(run, job_result)
+            refused: list[dict[str, Any]] = []
+            for new_run in decision.enqueue:
+                try:
+                    with conn.transaction():
+                        created = log.create_run(
+                            conn, new_run.kind, new_run.subject, new_run.payload
+                        )
+                    logger.info(
+                        "run %s chained: %s %s -> run %s",
+                        run.id,
+                        new_run.kind,
+                        new_run.subject,
+                        created,
+                    )
+                except psycopg.errors.UniqueViolation:
+                    # An open run for this (kind, subject) already exists, so
+                    # the partial unique index refused the chain. The index is
+                    # doing its job, but the *consequence* — this run's work
+                    # (often a fresh PR) now has no follow-up that owns it —
+                    # must not vanish into an INFO line (#51): the refusal is
+                    # collected and parks this run AWAITING_HUMAN below, so
+                    # the notifier says it out loud.
+                    blocking = queue.open_run(conn, new_run.subject, kind=new_run.kind)
+                    refused.append(
+                        {
+                            "kind": new_run.kind,
+                            "subject": new_run.subject,
+                            "pr_url": (new_run.payload or {}).get("pr_url"),
+                            "blocking_run": blocking.id if blocking else None,
+                            "blocking_status": (
+                                blocking.status.value if blocking else None
+                            ),
+                        }
+                    )
+                    logger.warning(
+                        "run %s: %s %s already open (run %s), not chaining;"
+                        " parking for a human",
+                        run.id,
+                        new_run.kind,
+                        new_run.subject,
+                        blocking.id if blocking else "?",
+                    )
+            if refused:
+                with conn.transaction():
+                    log.append(
+                        conn,
+                        run.id,
+                        EventType.HUMAN_GATE,
+                        {
+                            "why": (
+                                "duplicate work produced: a follow-up was"
+                                " refused because an earlier run for this"
+                                " subject is still open"
+                            ),
+                            "refused": refused,
+                            "pr_url": refused[0].get("pr_url"),
+                        },
+                    )
+            for payload in getattr(decision, "artifacts", ()):
+                with conn.transaction():
+                    log.append(conn, run.id, EventType.ARTIFACT, payload)
+            retries = getattr(decision, "task_retries", ())
+            if retries and self.task_retry is not None:
+                self.task_retry(conn, run, retries)
+            if decision.human_gate is not None:
+                with conn.transaction():
+                    log.append(conn, run.id, EventType.HUMAN_GATE, decision.human_gate)
+                logger.info(
+                    "run %s parked for a human: %s",
+                    run.id,
+                    decision.human_gate.get("why"),
+                )
+        except Exception:
+            logger.exception("run %s: follow-up failed; the chain is stalled", run.id)
+
+    def _drain(
+        self, conn: psycopg.Connection, run: Run, events: list[dict[str, Any]]
+    ) -> datetime | None:
+        """Append the transcript, skipping whatever is already stored.
+
+        The runner hands back every event from the beginning of the *container*,
+        so the skip is anchored at the current attempt's ``sandbox_started`` and
+        counts only the events stored after it. Anchoring at the run instead
+        swallows a retry's transcript whenever the killed predecessor stored
+        more events than the retry has emitted yet. Within the attempt this is
+        idempotent: a crash part way through a drain costs nothing, and a
+        harvest after a restart picks up exactly where the last one stopped.
+
+        Returns the reset time of the last rate limit seen, if any, so the
+        abandon path can wait until then instead of guessing.
+        """
+        reset_at: datetime | None = None
+        started = log.latest_event(conn, run.id, EventType.SANDBOX_STARTED)
+        already = log.count_events(
+            conn,
+            run.id,
+            EventType.CLAUDE_EVENT,
+            after_seq=started.seq if started else 0,
+        )
+        for payload in events[already:]:
+            with conn.transaction():
+                log.append(conn, run.id, EventType.CLAUDE_EVENT, payload)
+            reset_at = self._warn_on_rate_limit(run, payload) or reset_at
+        return reset_at
+
+    def _warn_on_rate_limit(self, run: Run, payload: dict[str, Any]) -> datetime | None:
+        """Surface a rate limit rather than letting it look like a random failure.
+
+        Provisioning the host showed the stream carries `rate_limit_event` with a
+        five-hour window. It is invisible unless something reads for it, and it is
+        the one failure where retrying immediately is guaranteed to be useless.
+        Returns the reset time when the event carries a usable one.
+        """
+        if payload.get("type") != "rate_limit_event":
+            return None
+        info = payload.get("rate_limit_info") or {}
+        if info.get("status") == "allowed":
+            return None
+        logger.warning(
+            "run %s hit a rate limit (%s, resets at %s)",
+            run.id,
+            info.get("rateLimitType"),
+            info.get("resetsAt"),
+        )
+        return _rate_limit_reset(payload)
+
+    def _stored_rate_limit_reset(
+        self, conn: psycopg.Connection, run: Run
+    ) -> datetime | None:
+        """The reset time of the last rate limit already banked in the log.
+
+        The drain returns a reset only for events it just appended, so a limit
+        harvested by an earlier heartbeat is invisible to the GONE-path drain.
+        The log still has it, and it is still the best wait available — unless
+        it has already passed (a limit banked by a *previous* attempt), where a
+        not_before in the past would disable the backoff outright and the
+        computed guess is the honest fallback.
+        """
+        now = datetime.now(UTC)
+        for event in reversed(log.load_events(conn, run.id)):
+            if event.type is not EventType.CLAUDE_EVENT:
+                continue
+            reset = _rate_limit_reset(event.payload)
+            if reset is not None:
+                return reset if reset > now else None
+        return None
+
+    def _handle_for(self, conn: psycopg.Connection, run: Run) -> str | None:
+        event = log.latest_event(conn, run.id, EventType.SANDBOX_STARTED)
+        if event is None:
+            return None
+        return event.payload.get("container")
+
+    def _heartbeat(
+        self, conn: psycopg.Connection, run: Run, handle: str, result: TickResult
+    ) -> None:
+        """Push the lease out, then bank the transcript emitted so far.
+
+        Deliberately appends no *heartbeat* event. A heartbeat every tick for
+        every active run would bury the actual narrative under thousands of rows,
+        and the lease is operational metadata that replay never derives. The log
+        stays the source of truth for *status*; the lease is just how long this
+        worker's claim is good for.
+
+        The drain, though, is the load-bearing half of #12: before it, transcript
+        events were only harvested at finish(), so a container that vanished took
+        its whole history with it and a resume had nothing to read. Draining
+        every heartbeat means a kill can only lose one tick's worth of narrative.
+        The lease extension commits first and the drain is guarded, so a logs
+        hiccup never costs the claim.
+        """
+        with conn.transaction():
+            queue.extend_lease(conn, run.id, self.worker_id, self.lease_seconds)
+        result.heartbeated.append(run.id)
+        try:
+            self._drain(conn, run, self.runner.logs(handle))
+        except Exception:
+            logger.exception(
+                "run %s: mid-flight drain failed; the next tick retries", run.id
+            )
+
+    def _abandon(
+        self,
+        conn: psycopg.Connection,
+        run: Run,
+        reason: str,
+        result: TickResult,
+        *,
+        not_before: datetime | None = None,
+    ) -> None:
+        """Give up on this attempt: requeue with a backoff, or stop for good.
+
+        ``not_before`` lets a caller with a known-better wait (a rate limit's
+        reset time) override the computed backoff. It is recorded in the event
+        payload as well as the column, or reading the log would tell you a run
+        was requeued but not why it then sat still for ten minutes.
+        """
+        requeued = run.attempts < self.max_attempts
+        # `requeued` is always written explicitly. A missing key folds to
+        # terminal (see log.apply_event), so omitting it would silently
+        # strand a run that had retries left.
+        payload: dict[str, Any] = {
+            "requeued": requeued,
+            "reason": reason,
+            "attempts": run.attempts,
+        }
+        run_fields: dict[str, Any] = {"worker_id": None, "lease_expires_at": None}
+        if requeued:
+            if not_before is None:
+                # From the database's clock, not the host's: the claim query
+                # compares against now() in SQL, and a clock skew between the
+                # two would silently stretch or shrink every window.
+                not_before = queue.db_now(conn) + backoff_delay(
+                    run.attempts,
+                    base=self.backoff_base_seconds,
+                    ceiling=self.backoff_ceiling_seconds,
+                    jitter=self.jitter,
+                )
+            payload["not_before"] = not_before.isoformat()
+            run_fields["not_before"] = not_before
+        with conn.transaction():
+            log.append(conn, run.id, EventType.RUN_ABANDONED, payload, **run_fields)
+        result.abandoned.append(run.id)
+        logger.warning(
+            "run %s abandoned after attempt %s (%s); %s",
+            run.id,
+            run.attempts,
+            reason,
+            f"requeued, claimable after {not_before}" if requeued else "giving up",
+        )
+
+    # --- dispatch ------------------------------------------------------------
+
+    def _dispatch(self, conn: psycopg.Connection, result: TickResult) -> None:
+        for kind, key in self.coalesce:
+            result.cancelled.extend(queue.coalesce(conn, kind, key))
+        result.paused = self._auth_pause(conn)
+        if result.paused is not None:
+            return
+        slots = self.max_concurrent - len(queue.active_runs(conn))
+        for _ in range(max(slots, 0)):
+            run = self._lease_one(conn)
+            if run is None:
+                return
+            result.leased.append(run.id)
+            if not self._start(conn, run, result):
+                # Something is wrong with the host, not with this run. Stop
+                # dispatching for now rather than marching the whole queue
+                # through the same failure. Also stops a requeued run from being
+                # picked straight back up inside this same tick.
+                return
+
+    def _auth_pause(self, conn: psycopg.Connection) -> str | None:
+        """Why nothing should be leased right now, or None.
+
+        Stateless like everything else: the evidence is the most recent
+        ``run_failed`` that named a dead login, and the credential file's
+        fingerprint it recorded. While the file on disk still matches, the
+        login is still dead and leasing a run would only burn it. A re-login
+        rewrites the file, the fingerprint moves, and the queue drains on the
+        next tick with nothing to reset. Logged once per pause, not per tick.
+        """
+        stamped = auth.paused(conn, self.credentials)
+        if stamped is None:
+            if self._paused_for is not None:
+                logger.info("Claude credential changed; resuming dispatch")
+                self._paused_for = None
+            return None
+        reason = (
+            f"Claude login expired; run `claude auth login` on the host"
+            f" (waiting for {self.credentials} to change)"
+        )
+        if self._paused_for != stamped:
+            logger.warning("dispatch paused: %s", reason)
+            self._paused_for = stamped
+        return reason
+
+    def _lease_one(self, conn: psycopg.Connection) -> Run | None:
+        """Claim the oldest queued run. Claim and lease share one transaction.
+
+        ``claim_next_queued`` holds a row lock that only means something until the
+        transaction ends, so the ``run_leased`` append has to happen inside it.
+        """
+        with conn.transaction():
+            run = queue.claim_next_queued(conn)
+            if run is None:
+                return None
+            attempt = run.attempts + 1
+            expires = datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
+            log.append(
+                conn,
+                run.id,
+                EventType.RUN_LEASED,
+                {"worker_id": self.worker_id, "attempt": attempt},
+                worker_id=self.worker_id,
+                lease_expires_at=expires,
+                attempts=attempt,
+            )
+            logger.info("run %s leased (attempt %s)", run.id, attempt)
+            return replace(
+                run,
+                attempts=attempt,
+                worker_id=self.worker_id,
+                lease_expires_at=expires,
+            )
+
+    def _start(self, conn: psycopg.Connection, run: Run, result: TickResult) -> bool:
+        try:
+            handle = self.runner.start(run)
+        except Exception as exc:  # any failure to start is infrastructural
+            logger.exception("run %s failed to start a sandbox", run.id)
+            self._abandon(conn, run, f"sandbox failed to start: {exc}", result)
+            return False
+        with conn.transaction():
+            log.append(conn, run.id, EventType.SANDBOX_STARTED, {"container": handle})
+        return True
+
+    # --- forever -------------------------------------------------------------
+
+    def run_forever(
+        self,
+        *,
+        dsn: str | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Tick until told to stop.
+
+        A fresh connection per tick, on purpose. Managed Postgres drops idle
+        connections, and a 15-second tick makes connection setup irrelevant next
+        to the robustness of never holding one across a nap. It also means a
+        transient database outage costs one tick instead of the process.
+        """
+        while not (should_stop is not None and should_stop()):
+            try:
+                with db.connect(dsn) as conn:
+                    self.report(self.tick(conn))
+            except Exception:  # never let one bad tick kill the loop
+                logger.exception("tick failed; retrying next tick")
+            sleep(self.tick_seconds)
+
+    def report(self, result: TickResult) -> None:
+        """Log a tick that did something. Silent when idle, or a quiet weekend
+        fills the log with thousands of lines saying nothing happened."""
+        if result.idle:
+            return
+        logger.info(
+            "tick: leased=%s heartbeated=%s finished=%s abandoned=%s cancelled=%s",
+            result.leased,
+            result.heartbeated,
+            result.finished,
+            result.abandoned,
+            result.cancelled,
+        )
