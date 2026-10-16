@@ -132,6 +132,8 @@ def abandon_bucket(reason: str | None) -> str:
         return "sandbox failed to start"
     if text.startswith("superseded"):
         return "superseded"
+    if text.startswith("pr closed"):
+        return "pr closed"
     return "other"
 
 

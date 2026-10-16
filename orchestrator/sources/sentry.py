@@ -405,6 +405,14 @@ def poll(
                 )
                 continue
 
+            # The cooldown runs from the end of the chain, not the triage
+            # (#90): a review closed because its PR just merged must give the
+            # fix the same time to show in Sentry that a triage gets, or the
+            # next poll re-triages an issue whose fix is still deploying.
+            if queue.has_recent_run(conn, None, issue.subject, cooldown):
+                report.drop("its fix chain closed recently")
+                continue
+
             base = resolve_base(PROJECT_REPOS[issue.project])
             if base is None:
                 # Not enqueued, so no cooldown starts: the next poll retries.

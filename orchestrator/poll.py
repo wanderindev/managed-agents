@@ -120,10 +120,11 @@ def _base_branch_resolver(
 
 
 def _poll_prs(conn, pulls: github_prs.PullsClient | None, *, dry_run: bool) -> None:
-    """The change-request source (#10)."""
+    """The change-request source (#10), then the parked-run sweep (#90)."""
     if pulls is None:
         return
     github_prs.poll(conn, pulls, dry_run=dry_run)
+    github_prs.close_decided(conn, pulls, dry_run=dry_run)
 
 
 if __name__ == "__main__":

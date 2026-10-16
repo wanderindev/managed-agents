@@ -6,7 +6,7 @@ Code in disposable sandboxes on a personal DigitalOcean droplet.
 **Outer harness only.** Claude Code stays the inner harness. Rebuilding that part
 is the collision risk, so this repo does not try.
 
-The build log lives in [issues #1–#15](https://github.com/wanderindev/managed-agents/issues?q=is%3Aissue) (all closed; the epic is complete). The design write-up, with the live record and the lessons, is at [feliu.dev/projects/managed-agents](https://feliu.dev/projects/managed-agents).
+This repo is a periodic public snapshot (as of October 16, 2026) of a private working repo, so the issue numbers cited in code and docs (#NN) refer to that private tracker. The design write-up, with the live record and the lessons, is at [feliu.dev/projects/managed-agents](https://feliu.dev/projects/managed-agents).
 
 ## The idea
 
@@ -20,14 +20,17 @@ work source  ->  agent_runs (queue)  ->  sandbox container  ->  artifact  ->  ad
                        +----- agent_events (append-only log) ----+--------------------+
 ```
 
-Three workloads run through the loop today. Sentry triage polls unresolved
+Five workloads run through the loop today. Sentry triage polls unresolved
 issues on `feliu-dev`, `panama-in-context`, `atelier-loyalty-app` and the
 storefront theme (`atelier-new-cli`), investigates in a sandbox, and
-lands one of three verdicts: a fix with a failing-then-passing test and a draft
-PR, `NOT_A_BUG` with evidence, or `NEEDS_HUMAN` with a brief. Every FIX is
+lands one of four verdicts: a fix with a failing-then-passing test and a draft
+PR, a `MITIGATION` that ships a self-contained partial change and leaves the
+issue open, `NOT_A_BUG` with evidence, or `NEEDS_HUMAN` with a brief. Every FIX is
 attacked by a fresh-context adversarial reviewer that must return STANDS before
 the PR leaves draft. The change-request loop turns human review comments on the
-orchestrator's own PRs into guarded revision runs. A weekly dreaming job
+orchestrator's own PRs into guarded revision runs, and the same hourly poll
+closes a parked run once a human merges or closes its PR, so a regression of a
+fixed issue is triaged again after the cooldown. A weekly dreaming job
 audits each repo's memory file against the week's runs and merged pull
 requests, accumulating its findings onto one open pull request until a human
 merges it. Every day a
@@ -35,13 +38,17 @@ driver works PIC's agent-task queue through its article series (one a day or
 one a week, as PIC's cadence says), reporting steps that wait on the operator
 (deep research, Grammarly) as WAITING and emailing what they wait for, with a
 rubric verifier grading output against a rubric written at planning time.
-Nothing merges without a person.
+When a goal fails or stalls, an hourly pipeline supervisor diagnoses it in a
+read-only sandbox through PIC's MCP server and emails the diagnosis; behind a
+kill switch, the orchestrator host can carry out a recommended retry within
+limits written in code. Nothing merges without a person.
 
 ## Layout
 
 ```
 migrations/          numbered plain SQL, applied in filename order
 orchestrator/
+  auth.py            dead-login detection: pauses the queue instead of burning runs
   auto_retry.py      supervisor phase 2: host-side PIC task retries, limited
   config.py          environment, read once
   db.py              psycopg3 connection helper
@@ -56,8 +63,11 @@ orchestrator/
   mcp_client.py      minimal host-side MCP client (initialize + tools/call)
   migrate.py         migration runner
   notify.py          outcome email; every silence explains itself
+  pic_mcp.py         read-only PIC MCP config for PIC jobs' sandboxes
   poll.py            work-source poll: Sentry issues, PR change requests
   queue.py           queue reads, the lease write, `cancel` CLI, coalescing
+  redact.py          keeps the orchestrator's own secrets out of the log and email
+  report.py          read-only Markdown reports over the log (`baseline`, `supervisor`)
   research_gate.py   research-gate experiment: write, rubric-verify, revise
   runner.py          Runner protocol, the seam to container mechanics
   sandbox.py         the Docker runner
@@ -66,6 +76,7 @@ orchestrator/
 docker/sandbox/      the disposable sandbox image
 scripts/             host provisioning, sandbox launch
 docs/runbook.md      how the host and database were built, and what bit
+docs/results/        published report output (baseline.md, pipeline-supervisor.md)
 tests/               real PostgreSQL via testcontainers
 ```
 
@@ -78,16 +89,18 @@ reconciles whatever it inherits.
 ## Deliberate non-choices
 
 - **No Kubernetes.** Pods buy isolation from untrusted code. This runs our own
-  repos with our own Claude Code, so Docker plus a systemd timer is enough. If
+  repos with our own Claude Code, so Docker plus a crontab is enough. If
   concurrent sandboxes ever become the bottleneck, revisit.
 - **No ORM.** Two tables and a fold do not need a mapper.
-- **No Alembic.** Numbered SQL files and a 60-line runner.
+- **No Alembic.** Numbered SQL files and a 70-line runner.
 - **No headless browser on the droplet.** Automating claude.ai or
   gemini.google.com from a datacenter IP is fragile and would force a long-lived
   session cookie into a sandbox. Those steps get replaced with APIs or stay
   attended.
-- **No secrets vault.** Short-lived, repo-scoped GitHub App installation tokens
-  minted per job (issue #11) beat a vault for a two-credential system.
+- **No secrets vault.** The credentials are few, and each is short-lived or
+  narrowly scoped: GitHub App installation tokens minted per job and expiring
+  in an hour, plus scoped Sentry and PIC tokens. The one that cannot be scoped
+  down is Claude's own login.
 
 ## Development
 
@@ -100,7 +113,7 @@ pytest --cov              # enforces fail_under in .coveragerc
 ruff check . && ruff format --check .
 ```
 
-Tests need a working Docker daemon; testcontainers starts `postgres:16`.
+Tests need a working Docker daemon; testcontainers starts `postgres:17`.
 
 ### Migrations
 
@@ -138,6 +151,9 @@ python -m orchestrator.report baseline [--since YYYY-MM-DD]
 ```
 
 The latest output is kept in `docs/results/baseline.md`.
+`python -m orchestrator.report supervisor` reports the pipeline supervisor's
+time to diagnosis and its agreement with the operator; its latest output is in
+`docs/results/pipeline-supervisor.md`.
 
 ## Configuration
 
@@ -160,7 +176,7 @@ the full set (loop, sandbox, Sentry poll, GitHub App, notifier, PIC driver);
 | `ORCHESTRATOR_PIC_MCP_URL` | `https://api.panamaincontext.com/mcp` | PIC's MCP endpoint |
 | `ORCHESTRATOR_PIC_MCP_PIPELINE_TOKEN` | empty | `read,pipeline` PIC MCP token held by the orchestrator process only (never a sandbox), for the supervisor's auto-retry; redacted from the log and emails (runbook: "Pipeline supervisor") |
 | `ORCHESTRATOR_PIC_MCP_TIMEOUT_SECONDS` | `30` | HTTP timeout for one host-side MCP request (the auto-retry's `retry_agent_task` calls) |
-| `ORCHESTRATOR_SUPERVISOR_AUTO_RETRY` | `0` | kill switch: `1` lets the orchestrator carry out a diagnosis's `retry` via `retry_agent_task` (one per task per rolling 24h, `_MAX_RETRIES_PER_RUN` (3) per diagnosis, never skip or publish). Needs the pipeline token; off = read-only |
+| `ORCHESTRATOR_SUPERVISOR_AUTO_RETRY` | off | kill switch: `1` lets the orchestrator carry out a diagnosis's `retry` via `retry_agent_task` (one per task per rolling 24h, `_MAX_RETRIES_PER_RUN` (3) per diagnosis, never skip or publish). Needs the pipeline token; off = read-only |
 | `ORCHESTRATOR_DRIVER_CADENCE` | `daily` | goal-key shape `driver --dry-run` lists (`daily_series:` or `weekly_series:`); mirror PIC's `WEEKLY_PLAN_DAILY_CADENCE`. A real drive takes goal keys from PIC |
 | `ORCHESTRATOR_SUPERVISOR_STALL_DAYS` | `3` | days a PIC goal's counts may sit unchanged in the log before `orchestrator.supervisor` diagnoses it (runbook: "Pipeline supervisor"); also `_RECENT_HOURS` (48), `_LOOKBACK_DAYS` (30), `_MAX_PER_SCAN` (3), `_MAX_TURNS` (15), `_MODEL` |
 | `ORCHESTRATOR_DREAM_REPOS` | empty | comma list of repos the weekly dream audits; empty = every repo with orchestrator runs in the window. Each needs the App installed and a `/srv/repos` clone (runbook: "Dreaming") |

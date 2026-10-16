@@ -1,7 +1,7 @@
 # managed-agents
 
 A durable-log orchestrator that runs Claude Code in disposable sandboxes on a
-dedicated DigitalOcean droplet (`agents`, 159.223.174.185 — **not** the prod
+dedicated DigitalOcean droplet (`agents`, <agents-droplet-ip> — **not** the prod
 `pic` droplet). This repo is **public**: never commit secrets, tokens, DSNs or
 anything from `/srv/orchestrator.env`.
 
@@ -40,9 +40,9 @@ from that directory.
 **Deploy / verify** — compare the droplet's copy with the repo, and check the loop:
 
 ```bash
-ssh wanderindev@159.223.174.185 'cd /srv/orchestrator && md5sum orchestrator/*.py orchestrator/sources/*.py migrations/*.sql' | LC_ALL=C sort -k2
+ssh wanderindev@<agents-droplet-ip> 'cd /srv/orchestrator && md5sum orchestrator/*.py orchestrator/sources/*.py migrations/*.sql' | LC_ALL=C sort -k2
 md5sum orchestrator/*.py orchestrator/sources/*.py migrations/*.sql | LC_ALL=C sort -k2   # compare
-ssh wanderindev@159.223.174.185 'pgrep -af orchestrator.main; tail -n 30 ~/logs/orchestrator-main.log'
+ssh wanderindev@<agents-droplet-ip> 'pgrep -af orchestrator.main; tail -n 30 ~/logs/orchestrator-main.log'
 ```
 
 After a merge, do it yourself in this order: copy the changed files to the
@@ -56,7 +56,7 @@ pattern: a bare `pkill -f orchestrator.main` also matches the remote shell
 running this very command, whose text names the module (#72).
 
 ```bash
-ssh wanderindev@159.223.174.185 'P="^([^ ]*/)?python[0-9.]*( -[^ ]+)* -m orchestrator\.main( |$)"; pkill -f "$P"; while pgrep -f "$P" >/dev/null; do sleep 1; done; ~/bin/orch-loop-keepalive.sh'
+ssh wanderindev@<agents-droplet-ip> 'P="^([^ ]*/)?python[0-9.]*( -[^ ]+)* -m orchestrator\.main( |$)"; pkill -f "$P"; while pgrep -f "$P" >/dev/null; do sleep 1; done; ~/bin/orch-loop-keepalive.sh'
 ```
 
 Say in the report which files were copied, which migrations ran, and that the
@@ -68,7 +68,7 @@ The DB is reachable only from the droplet (VPC + trusted-sources firewall), so
 copy the merged files first, then apply the migrations from the droplet:
 
 ```bash
-ssh wanderindev@159.223.174.185 'cd /srv/orchestrator && set -a && . /srv/orchestrator.env && set +a && .venv/bin/python -m orchestrator.migrate'
+ssh wanderindev@<agents-droplet-ip> 'cd /srv/orchestrator && set -a && . /srv/orchestrator.env && set +a && .venv/bin/python -m orchestrator.migrate'
 ```
 
 Never hand-write rows into `agent_events` — it is append-only by trigger.

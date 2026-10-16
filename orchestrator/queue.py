@@ -213,7 +213,7 @@ def open_run(
 
 
 def has_recent_run(
-    conn: psycopg.Connection, kind: str, subject: str, cooldown: timedelta
+    conn: psycopg.Connection, kind: str | None, subject: str, cooldown: timedelta
 ) -> bool:
     """Whether this subject is already queued, running, or recently finished.
 
@@ -225,14 +225,19 @@ def has_recent_run(
     The partial unique index on ``(kind, subject)`` is the backstop if this is
     ever wrong; this exists so the normal path does not rely on catching an
     integrity error.
+
+    ``kind=None`` asks about the subject's runs of every kind: how the Sentry
+    poll starts the cooldown when the whole fix chain ends (#90), not when
+    the triage that began it did.
     """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT 1 FROM agent_runs"
-            " WHERE kind = %s AND subject = %s"
+            " WHERE (%s::text IS NULL OR kind = %s) AND subject = %s"
             "   AND (status <> ALL(%s) OR updated_at > now() - %s::interval)"
             " LIMIT 1",
             (
+                kind,
                 kind,
                 subject,
                 [s.value for s in TERMINAL_STATUSES],

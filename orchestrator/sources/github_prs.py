@@ -26,6 +26,9 @@ Boundaries, stated up front because each one is a guard against a real failure:
   A PR that cannot converge in three rounds is a design disagreement, not a
   code problem, and the poll stops enqueueing and says so.
 
+It also closes parked runs whose pull request a human has already decided
+(#90): see :func:`close_decided`.
+
 Read-only against GitHub. The revision sandbox is what pushes.
 """
 
@@ -40,7 +43,8 @@ from typing import Any
 
 import psycopg
 
-from orchestrator import config, queue
+from orchestrator import config, log, queue
+from orchestrator.enums import EventType, RunStatus
 from orchestrator.log import create_run
 from orchestrator.queue import Run, get_run
 from orchestrator.sandbox import DEFAULT_BRANCH
@@ -67,6 +71,21 @@ _NO_COOLDOWN = timedelta(seconds=0)
 #: and a token; it can read the full threads itself. The payload is the brief,
 #: not the archive.
 _MAX_COMMENT_CHARS = 1000
+
+#: The Sentry fix chain (#90): kinds that park AWAITING_HUMAN on a pull request
+#: a human is meant to merge or close. Literals because ``jobs`` imports this
+#: module; a test keeps them in step with ``jobs.REVIEW_KIND`` and friends. An
+#: allowlist, like the revision poll's: a dream's or a research run's park
+#: means something else, and closing it on a merge is not this loop's call.
+CHAIN_KINDS = (TRIAGE_KIND, "adversarial_review", "fix_revision", RUN_KIND)
+
+#: ``html_url`` of a pull request, which is what every gate's ``pr_url`` holds.
+_PR_URL = re.compile(r"^https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)/?$")
+
+#: ``run_done`` / ``run_abandoned`` payload ``reason`` for a run closed because
+#: its pull request was decided. ``report.abandon_bucket`` keys on the prefix.
+REASON_MERGED = "pr merged"
+REASON_CLOSED = "pr closed without merging"
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +154,10 @@ class PullsClient:
 
     def commits(self, full_repo: str, number: int) -> list[dict]:
         return self._get(f"/repos/{full_repo}/pulls/{number}/commits?per_page=100")
+
+    def pull(self, full_repo: str, number: int) -> dict:
+        """One pull request, open or not; ``merged`` says how it closed."""
+        return self._get(f"/repos/{full_repo}/pulls/{number}")
 
     # --- for the dreaming job (#60) --------------------------------------------
 
@@ -400,4 +423,171 @@ def poll(
     logger.info("pr poll: saw %s, enqueued %s", report.seen, len(report.enqueued))
     for reason, count in sorted(report.dropped.items(), key=lambda kv: -kv[1]):
         logger.info("  dropped %s: %s", count, reason)
+    return report
+
+
+# --- closing parked runs whose PR was decided (#90) ---------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Parked:
+    """An AWAITING_HUMAN chain run and the pull request its gate names."""
+
+    run_id: int
+    kind: str
+    subject: str
+    pr_url: str
+
+
+def parse_pr_url(url: str) -> tuple[str, int] | None:
+    """``https://github.com/o/r/pull/7`` -> ``("o/r", 7)``; None otherwise."""
+    match = _PR_URL.match(url or "")
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def parked_runs(conn: psycopg.Connection) -> list[Parked]:
+    """Chain runs parked AWAITING_HUMAN on a pull request, oldest first.
+
+    The PR is the newest ``human_gate``'s ``pr_url``, falling back to the run's
+    own ``run_queued`` payload: the gate is what the human was asked about, and
+    a revision or review always carries the PR it worked on in its payload.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.id, r.kind, r.subject,"
+            " coalesce("
+            "   (SELECT e.payload->>'pr_url' FROM agent_events e"
+            "     WHERE e.run_id = r.id AND e.type = %s"
+            "     ORDER BY e.seq DESC LIMIT 1),"
+            "   (SELECT e.payload->>'pr_url' FROM agent_events e"
+            "     WHERE e.run_id = r.id AND e.type = %s"
+            "     ORDER BY e.seq LIMIT 1)"
+            " ) AS pr_url"
+            " FROM agent_runs r"
+            " WHERE r.status = %s AND r.kind = ANY(%s)"
+            " ORDER BY r.id",
+            (
+                EventType.HUMAN_GATE.value,
+                EventType.RUN_QUEUED.value,
+                RunStatus.AWAITING_HUMAN.value,
+                list(CHAIN_KINDS),
+            ),
+        )
+        return [
+            Parked(row["id"], row["kind"], row["subject"], row["pr_url"] or "")
+            for row in cur.fetchall()
+        ]
+
+
+def _close(conn: psycopg.Connection, parked: Parked, pull: dict) -> str | None:
+    """Close one parked run for a decided PR; the reason, or None if not closed.
+
+    Locks the run and re-reads its status in the same transaction as the
+    append, so a run a human or another poll moved since :func:`parked_runs`
+    read it is left alone. No ``email_sent`` marker is needed: the park was
+    already emailed, and the notifier mails a run once, ever.
+    """
+    merged = bool(pull.get("merged") or pull.get("merged_at"))
+    facts = {
+        "pr_url": parked.pr_url,
+        "pr_state": pull.get("state"),
+        "merged_at": pull.get("merged_at"),
+        "closed_at": pull.get("closed_at"),
+        "merge_commit_sha": pull.get("merge_commit_sha") if merged else None,
+    }
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status FROM agent_runs WHERE id = %s FOR UPDATE",
+                (parked.run_id,),
+            )
+            row = cur.fetchone()
+        if row is None or row["status"] != RunStatus.AWAITING_HUMAN.value:
+            return None
+        if merged:
+            log.append(
+                conn,
+                parked.run_id,
+                EventType.RUN_DONE,
+                {"reason": REASON_MERGED, **facts},
+            )
+            return REASON_MERGED
+        log.append(
+            conn,
+            parked.run_id,
+            EventType.RUN_ABANDONED,
+            # requeued written explicitly: the fold reads a missing key as
+            # terminal, but every abandon says so out loud (see log.apply_event).
+            {"requeued": False, "reason": REASON_CLOSED, **facts},
+        )
+        return REASON_CLOSED
+
+
+def close_decided(
+    conn: psycopg.Connection,
+    client: PullsClient,
+    *,
+    repos: tuple[str, ...] | None = None,
+    dry_run: bool = False,
+) -> PollReport:
+    """Close every parked chain run whose pull request a human has decided.
+
+    A review that returns STANDS parks AWAITING_HUMAN for the human to merge,
+    and nothing else ever moves it on (#90). Left open, it holds the subject:
+    the Sentry poll will not re-triage an issue an open chained run owns, so a
+    regression — the expected case after a MITIGATION — would never be seen
+    again. A merged PR ends the run ``run_done``; a PR closed unmerged ends it
+    ``run_abandoned``; an open PR, or one this poll cannot read, leaves it
+    parked until the next poll. The event carries the PR's state and times, so
+    the log says why the run closed.
+    """
+    repos = repos if repos is not None else config.GITHUB_EXPECTED_REPOS
+    report = PollReport(window="parked runs")
+    for parked in parked_runs(conn):
+        report.seen += 1
+        target = parse_pr_url(parked.pr_url)
+        if target is None:
+            report.drop("no pull request on the gate")
+            continue
+        full_repo, number = target
+        if full_repo not in repos:
+            report.drop("pull request outside the expected repos")
+            continue
+        try:
+            pull = client.pull(full_repo, number)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            logger.warning(
+                "could not read %s for parked run %s: %s",
+                parked.pr_url,
+                parked.run_id,
+                exc,
+            )
+            report.drop("pull request unreadable; retried next poll")
+            continue
+        if pull.get("state") != "closed":
+            report.drop("pull request still open")
+            continue
+        merged = bool(pull.get("merged") or pull.get("merged_at"))
+        if dry_run:
+            reason = REASON_MERGED if merged else REASON_CLOSED
+        else:
+            reason = _close(conn, parked, pull)
+            if reason is None:
+                report.drop("no longer parked")
+                continue
+        report.enqueued.append(f"run {parked.run_id}")
+        logger.info(
+            "%s parked %s run %s (%s): %s %s",
+            "would close" if dry_run else "closed",
+            parked.kind,
+            parked.run_id,
+            parked.subject,
+            reason,
+            parked.pr_url,
+        )
+    logger.info(
+        "parked-run sweep: saw %s, closed %s", report.seen, len(report.enqueued)
+    )
+    for reason, count in sorted(report.dropped.items(), key=lambda kv: -kv[1]):
+        logger.info("  kept %s: %s", count, reason)
     return report

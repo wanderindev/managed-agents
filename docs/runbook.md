@@ -7,8 +7,8 @@ cost time the first time. Issue #2.
 
 | | |
 |---|---|
-| Droplet | `agents`, id 587510123 |
-| Address | 159.223.174.185, private 10.136.109.229 |
+| Droplet | `agents`, id <droplet-id> |
+| Address | <agents-droplet-ip>, private <private-ip> |
 | Size | `s-2vcpu-4gb`, 80GB, $24/mo |
 | Region / VPC | nyc1, `default-nyc1` |
 | Operator user | `wanderindev` (in the `docker` group) |
@@ -22,14 +22,14 @@ single nginx entry point for every site, with SSL at `/opt/letsencrypt`. Keep
 this cluster entirely separate.
 
 ```bash
-scp scripts/provision-droplet.sh root@159.223.174.185:/root/
-ssh root@159.223.174.185 'bash /root/provision-droplet.sh'
+scp scripts/provision-droplet.sh root@<agents-droplet-ip>:/root/
+ssh root@<agents-droplet-ip> 'bash /root/provision-droplet.sh'
 ```
 
 Then, once, by hand:
 
 ```bash
-ssh wanderindev@159.223.174.185
+ssh wanderindev@<agents-droplet-ip>
 claude          # interactive OAuth, cannot be automated
 ```
 
@@ -47,7 +47,7 @@ claude          # interactive OAuth, cannot be automated
 ### Verifying the host
 
 ```bash
-ssh wanderindev@159.223.174.185
+ssh wanderindev@<agents-droplet-ip>
 cd /tmp && claude -p "Reply with exactly: SMOKE OK" \
     --model claude-opus-5 --output-format stream-json --verbose
 ```
@@ -108,7 +108,7 @@ for that run says **"Claude login EXPIRED"** in the subject, and dispatch
 wait instead of each burning a daily failure. Fix, by hand:
 
 ```bash
-ssh -t wanderindev@159.223.174.185 claude auth login
+ssh -t wanderindev@<agents-droplet-ip> claude auth login
 ```
 
 That rewrites the file; the next tick sees the new fingerprint and drains the
@@ -131,7 +131,7 @@ The queue is drained **all at once** on the tick after the re-login, so clear
 what is stale *before* logging in. Look, then cancel:
 
 ```bash
-ssh wanderindev@159.223.174.185
+ssh wanderindev@<agents-droplet-ip>
 cd /srv/orchestrator && set -a && . /srv/orchestrator.env && set +a
 .venv/bin/python -m orchestrator.queue cancel --older-than 1d --dry-run
 .venv/bin/python -m orchestrator.queue cancel --older-than 1d --reason "stale after login expiry"
@@ -163,7 +163,7 @@ Runtime limits are set in `scripts/run-sandbox.sh`: 3g memory, 4g with swap,
 ## Running the orchestrator
 
 ```bash
-ssh wanderindev@159.223.174.185
+ssh wanderindev@<agents-droplet-ip>
 cd /srv/orchestrator
 set -a; . /srv/orchestrator.env; set +a
 .venv/bin/python -m orchestrator.main
@@ -320,7 +320,7 @@ the **image** after every rebuild and before the first Monday run, with the
 same credential mount the runner uses:
 
 ```bash
-ssh wanderindev@159.223.174.185
+ssh wanderindev@<agents-droplet-ip>
 docker run --rm --init \
     --volume /home/wanderindev/.claude/.credentials.json:/home/agent/.claude/.credentials.json \
     --env AGENT_MODEL=claude-opus-5-5 \
@@ -500,9 +500,9 @@ a file can be `chmod 600` while an env var is readable by anything that can see
 `/proc` for the process.
 
 ```bash
-ssh root@159.223.174.185 'install -d -o wanderindev -g wanderindev -m 700 /srv/secrets'
-scp your-app.private-key.pem wanderindev@159.223.174.185:/srv/secrets/github-app.pem
-ssh wanderindev@159.223.174.185 'chmod 600 /srv/secrets/github-app.pem'
+ssh root@<agents-droplet-ip> 'install -d -o wanderindev -g wanderindev -m 700 /srv/secrets'
+scp your-app.private-key.pem wanderindev@<agents-droplet-ip>:/srv/secrets/github-app.pem
+ssh wanderindev@<agents-droplet-ip> 'chmod 600 /srv/secrets/github-app.pem'
 ```
 
 Then add the App id to `/srv/orchestrator.env`:
@@ -669,7 +669,7 @@ Managed cluster `d699bab0-c322-4b58-b90b-98bae0632b30`, PostgreSQL **17.10**,
 C=d699bab0-c322-4b58-b90b-98bae0632b30
 doctl databases db create       $C orchestrator
 doctl databases user create     $C orchestrator
-doctl databases firewalls append $C --rule droplet:587510123
+doctl databases firewalls append $C --rule droplet:<droplet-id>
 ```
 
 ### Traps
@@ -705,7 +705,7 @@ ORCHESTRATOR_WORKER_ID=agents-1
 ### Migrations
 
 ```bash
-ssh wanderindev@159.223.174.185
+ssh wanderindev@<agents-droplet-ip>
 cd /srv/orchestrator
 set -a; . /srv/orchestrator.env; set +a
 .venv/bin/python -m orchestrator.migrate
